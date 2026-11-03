@@ -201,7 +201,7 @@ A url from a local include, or from your own file, needs no approval.
 - **[`[ui] font_size`](settings:ui#font_size)**: the text's size in
   pixels, 8 to 40 (17 by default). The View menu's zoom scales it until Prospero exits.
 - **[`[ui] theme`](settings:ui#theme)**: `system`, `dark`, `light` or
-  `gruvbox` (Gruvbox's dark colors), also in View → Theme.
+  `gruvbox` (Gruvbox's dark colors, hard contrast), also in View → Theme.
 - **`[ui] thinking`** and **`[ui] tools`**: whether reasoning and tool
   output show folded or open in the transcript.
 - **`[ui] count`**: whether folded reasoning's line counts `words` (the

@@ -1,4 +1,5 @@
 // Color themes: the GUI's dark and light palettes, Gruvbox's dark one,
+// at hard contrast,
 // and the choice between them
 //
 // A palette holds every color the GUI draws itself: the transcript's
@@ -191,20 +192,21 @@ static Palette themelight = {
     .stale     = rgb(180,  40,  20),
 };
 
-// Gruvbox's dark palette at medium contrast (github.com/morhetz/gruvbox):
-// bg0 for panels, fg1 for text, and its bright accents, which read on
-// its dark backgrounds. Where one does not, by the measure above, it is
-// lightened as little as it takes: red (#fb4934) for states, which must
-// read on bg1, and blue (#83a598) for links and running states, while
-// code keeps them both on its darker background; gray (#928374) for
-// comments. Rows selected and under the mouse take bg1 and bg0_s, as
+// Gruvbox's dark palette at hard contrast (github.com/morhetz/gruvbox):
+// bg0_h for panels, bg0 for code blocks, fg1 for text, and its bright
+// accents, which read on its dark backgrounds. Where one does not, by
+// the measure above, it is lightened as little as it takes: red
+// (#fb4934), much for states, which must read on bg1, barely for code;
+// blue (#83a598) for links and running states, while code keeps it;
+// gray (#928374) for comments. Rows selected and under the mouse take
+// bg1 and bg0_s, as
 // bg2 is too light for the accents on it, and dim text fg3. ImGui's own
 // blue accents give way to bg2 for title bars and tabs, yellow for the
 // rest.
 static Palette themegruvbox = {
     .dark      = 1,
-    .clear     = rgb( 29,  32,  33),  // bg0_h
-    .panel     = rgb( 40,  40,  40),  // bg0
+    .clear     = rgb( 40,  40,  40),  // bg0
+    .panel     = rgb( 29,  32,  33),  // bg0_h
     .paneltext = rgb(235, 219, 178),  // fg1
     .paneldim  = rgb(189, 174, 147),  // fg3
     .frame     = rgb( 60,  56,  54),  // bg1
@@ -223,7 +225,7 @@ static Palette themegruvbox = {
     .link      = rgb(136, 169, 156),  // blue, lightened
     .code      = rgb(254, 128,  25),  // orange
     .codetext  = rgb(235, 219, 178),  // fg1
-    .codebg    = rgb( 29,  32,  33),  // bg0_h
+    .codebg    = rgb( 40,  40,  40),  // bg0
     .headerbg  = rgb( 60,  56,  54),  // bg1
     .quote     = rgb(102,  92,  84),  // bg3
     .rule      = rgb( 80,  73,  69),  // bg2
@@ -236,8 +238,8 @@ static Palette themegruvbox = {
     .summary   = rgb(213, 196, 161),  // fg2
     .hl = {
         0,
-        rgb(147, 132, 117),  // comment: gray, lightened
-        rgb(251,  73,  52),  // keyword: red
+        rgb(154, 140, 126),  // comment: gray, lightened
+        rgb(251,  83,  63),  // keyword: red, lightened
         rgb(250, 189,  47),  // type: yellow
         rgb(184, 187,  38),  // string: green
         rgb(211, 134, 155),  // number: purple
@@ -245,7 +247,7 @@ static Palette themegruvbox = {
         rgb(131, 165, 152),  // variable: blue
         rgb(184, 187,  38),  // function: green
         rgb(184, 187,  38),  // diff inserted: green
-        rgb(251,  73,  52),  // diff deleted: red
+        rgb(251,  83,  63),  // diff deleted: red, lightened
         rgb(131, 165, 152),  // diff header: blue
     },
     .ok        = rgb(184, 187,  38),  // green
