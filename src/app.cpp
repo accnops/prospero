@@ -12223,6 +12223,7 @@ enum : i32 {
     CHK_ROQUIET,
     CHK_LIGHT,
     CHK_DARK,
+    CHK_GRUVBOX,
     CHK_THEMEQUIET,
     CHK_TITLEBAR,
     CHK_LONGFIELD,
@@ -12521,6 +12522,7 @@ static Str chknames[] = {
     "adding a section that exists changed nothing",
     "a read-only session's turn runs elsewhere, with no clock here",
     "the light theme is in effect", "the dark theme is in effect",
+    "the Gruvbox theme is in effect",
     "the theme changed in a few frames, then none",
     "the window's frame follows the theme",
     "a setting longer than a field's slack is in its field whole",
@@ -14585,6 +14587,17 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 500, "dark"},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_THEMEITEM, 0, 0, 100, "gruvbox"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_GRUVBOX, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 500, "gruvbox"},
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
     {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -19048,6 +19061,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_LIGHT: return themeshown(g, &themelight);
     case CHK_DARK:  return themeshown(g, &themedark);
+    case CHK_GRUVBOX: return themeshown(g, &themegruvbox);
     case CHK_THEMEQUIET: {
         // Two frames recolor (docked windows take their background a
         // frame late), one settles; with the probe's, the overlay's new

@@ -1,5 +1,5 @@
-// Color themes: the GUI's dark and light palettes, and the choice
-// between them
+// Color themes: the GUI's dark and light palettes, Gruvbox's dark one,
+// and the choice between them
 //
 // A palette holds every color the GUI draws itself: the transcript's
 // text, links, code spans and code blocks with their highlight classes
@@ -17,9 +17,10 @@
 // backgrounds it is drawn on, by the WCAG's measure: a contrast ratio of
 // at least 4.5 (AA for normal text).
 //
-// The setting, [ui] theme, is dark, light, or system, the default, which
-// follows the operating system's preference as the platform reports it,
-// at startup and whenever it changes (gui_systheme).
+// The setting, [ui] theme, is dark, light, gruvbox, or system, the
+// default, which follows the operating system's preference as the
+// platform reports it, at startup and whenever it changes (gui_systheme),
+// between dark and light.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -27,10 +28,11 @@ enum : i32 {
     THEME_SYSTEM,
     THEME_DARK,
     THEME_LIGHT,
+    THEME_GRUVBOX,
     THEME_COUNT,
 };
 
-static Str themenames[] = {"system", "dark", "light"};
+static Str themenames[] = {"system", "dark", "light", "gruvbox"};
 static_assert(countof(themenames) == THEME_COUNT);
 
 struct Palette {
@@ -48,6 +50,11 @@ struct Palette {
     u32 btnhover;
     u32 btnpress;
     u32 bar;        // progress bars, under paneltext
+    // ImGui's accents, the stock style's where 0: the focused window's
+    // title bar and selected tab, under paneltext; and checks, sliders,
+    // a selected tab's overline, separators dragged, the docking preview
+    u32 title;
+    u32 accent;
     // The transcript, on panel
     u32 text;
     u32 dim;        // headers and secondary text
@@ -184,6 +191,70 @@ static Palette themelight = {
     .stale     = rgb(180,  40,  20),
 };
 
+// Gruvbox's dark palette at medium contrast (github.com/morhetz/gruvbox):
+// bg0 for panels, fg1 for text, and its bright accents, which read on
+// its dark backgrounds. Where one does not, by the measure above, it is
+// lightened as little as it takes: red (#fb4934) for states, which must
+// read on bg1, and blue (#83a598) for links and running states, while
+// code keeps them both on its darker background; gray (#928374) for
+// comments. Rows selected and under the mouse take bg1 and bg0_s, as
+// bg2 is too light for the accents on it, and dim text fg3. ImGui's own
+// blue accents give way to bg2 for title bars and tabs, yellow for the
+// rest.
+static Palette themegruvbox = {
+    .dark      = 1,
+    .clear     = rgb( 29,  32,  33),  // bg0_h
+    .panel     = rgb( 40,  40,  40),  // bg0
+    .paneltext = rgb(235, 219, 178),  // fg1
+    .paneldim  = rgb(189, 174, 147),  // fg3
+    .frame     = rgb( 60,  56,  54),  // bg1
+    .selrow    = rgb( 60,  56,  54),  // bg1
+    .rowhover  = rgb( 50,  48,  47),  // bg0_s
+    .rowpress  = rgb( 60,  56,  54),  // bg1
+    .btn       = rgb( 80,  73,  69),  // bg2
+    .btnhover  = rgb(102,  92,  84),  // bg3
+    .btnpress  = rgb( 60,  56,  54),  // bg1
+    .bar       = rgb(  7, 102, 120),  // faded blue
+    .title     = rgb( 80,  73,  69),  // bg2
+    .accent    = rgb(250, 189,  47),  // yellow
+    .text      = rgb(235, 219, 178),  // fg1
+    .dim       = rgb(189, 174, 147),  // fg3
+    .reasoning = rgb(168, 153, 132),  // fg4
+    .link      = rgb(136, 169, 156),  // blue, lightened
+    .code      = rgb(254, 128,  25),  // orange
+    .codetext  = rgb(235, 219, 178),  // fg1
+    .codebg    = rgb( 29,  32,  33),  // bg0_h
+    .headerbg  = rgb( 60,  56,  54),  // bg1
+    .quote     = rgb(102,  92,  84),  // bg3
+    .rule      = rgb( 80,  73,  69),  // bg2
+    .marker    = rgb(168, 153, 132),  // fg4
+    .sel       = rgb( 80,  73,  69),  // bg2
+    .seltext   = rgb(251, 241, 199),  // fg0
+    .userbg    = rgb( 60,  56,  54),  // bg1
+    .toolbg    = rgb( 50,  48,  47),  // bg0_s
+    .askbg     = rgb( 60,  52,  36),  // bg1 toward yellow
+    .summary   = rgb(213, 196, 161),  // fg2
+    .hl = {
+        0,
+        rgb(147, 132, 117),  // comment: gray, lightened
+        rgb(251,  73,  52),  // keyword: red
+        rgb(250, 189,  47),  // type: yellow
+        rgb(184, 187,  38),  // string: green
+        rgb(211, 134, 155),  // number: purple
+        rgb(142, 192, 124),  // preprocessor: aqua
+        rgb(131, 165, 152),  // variable: blue
+        rgb(184, 187,  38),  // function: green
+        rgb(184, 187,  38),  // diff inserted: green
+        rgb(251,  73,  52),  // diff deleted: red
+        rgb(131, 165, 152),  // diff header: blue
+    },
+    .ok        = rgb(184, 187,  38),  // green
+    .bad       = rgb(252, 123, 108),  // red, lightened
+    .amber     = rgb(250, 189,  47),  // yellow
+    .active    = rgb(136, 169, 156),  // blue, lightened
+    .stale     = rgb(254, 128,  25),  // orange
+};
+
 // The setting's value from its name, or -1 if it names none.
 static i32 themeparse(Str s)
 {
@@ -201,6 +272,7 @@ static Palette *themepalette(i32 setting, b32 sysdark)
     switch (setting) {
     case THEME_DARK:  return &themedark;
     case THEME_LIGHT: return &themelight;
+    case THEME_GRUVBOX: return &themegruvbox;
     }
     return sysdark ? &themedark : &themelight;
 }

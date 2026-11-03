@@ -43,6 +43,9 @@ static void test_theme(Test *t)
     expect(t, "theme.system.dark", istr(&a, themepalette(THEME_SYSTEM, 1)->dark), "1");
     expect(t, "theme.system.light", istr(&a, themepalette(THEME_SYSTEM, 0)->dark), "0");
     expect(t, "theme.forced", istr(&a, themepalette(THEME_LIGHT, 1)->dark), "0");
+    expect(t, "theme.parse.gruvbox", istr(&a, themeparse("gruvbox")), istr(&a, THEME_GRUVBOX));
+    expect(t, "theme.gruvbox", istr(&a, themepalette(THEME_GRUVBOX, 0)==&themegruvbox), "1");
+    expect(t, "theme.gruvbox.dark", istr(&a, themepalette(THEME_GRUVBOX, 0)->dark), "1");
 
     // The ratio of a known pair: white on black is 21
     Buf k(&a, 16);
@@ -72,16 +75,22 @@ static void test_theme(Test *t)
         P(text, rowpress), P(dim, rowpress), P(ok, rowpress),
         P(bad, rowpress), P(amber, rowpress), P(active, rowpress),
         P(paneltext, rowhover), P(paneltext, btn), P(paneltext, btnhover),
-        P(paneltext, btnpress),
+        P(paneltext, btnpress), P(paneltext, title),
         #undef P
     };
-    Palette *pals[] = {&themedark, &themelight};
+    struct { Palette *pal; Str name; } pals[] = {
+        {&themedark, "theme.dark "}, {&themelight, "theme.light "},
+        {&themegruvbox, "theme.gruvbox "},
+    };
     for (iz p = 0; p < countof(pals); p++) {
-        Palette *pal  = pals[p];
-        Str      name = pal->dark ? Str("theme.dark ") : Str("theme.light ");
+        Palette *pal  = pals[p].pal;
+        Str      name = pals[p].name;
         for (iz i = 0; i < countof(pairs); i++) {
             u32 fg = *(u32 *)((byte *)pal + pairs[i].fg);
             u32 bg = *(u32 *)((byte *)pal + pairs[i].bg);
+            if (!bg) {
+                continue;  // ImGui's stock color, not the palette's
+            }
             f64 r  = contrast(fg, bg);
             Buf b(&a, 16);
             if (r < 4.5) {

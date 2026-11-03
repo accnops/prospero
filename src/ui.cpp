@@ -503,6 +503,36 @@ static void themestyle(ImGuiStyle *st, Palette *p)
     c[ImGuiCol_PlotHistogram] = ImGui::ColorConvertU32ToFloat4(p->bar);
     c[ImGuiCol_TextLink]      = ImGui::ColorConvertU32ToFloat4(p->link);
     c[ImGuiCol_PopupBg]       = ImGui::ColorConvertU32ToFloat4(p->panel);
+    if (p->title) {
+        ImVec4 title = ImGui::ColorConvertU32ToFloat4(p->title);
+        ImVec4 clear = ImGui::ColorConvertU32ToFloat4(p->clear);
+        c[ImGuiCol_TitleBg]           = clear;
+        c[ImGuiCol_TitleBgCollapsed]  = clear;
+        c[ImGuiCol_TitleBgActive]     = title;
+        c[ImGuiCol_Tab]               = ImGui::ColorConvertU32ToFloat4(p->rowhover);
+        c[ImGuiCol_TabSelected]       = title;
+        c[ImGuiCol_TabDimmed]         = clear;
+        c[ImGuiCol_TabDimmedSelected] = ImGui::ColorConvertU32ToFloat4(p->frame);
+        c[ImGuiCol_FrameBgHovered]    = ImGui::ColorConvertU32ToFloat4(p->btn);
+        c[ImGuiCol_FrameBgActive]     = ImGui::ColorConvertU32ToFloat4(p->btnhover);
+    }
+    if (p->accent) {
+        ImVec4 accent = ImGui::ColorConvertU32ToFloat4(p->accent);
+        auto   alpha  = [&](f32 a) { return ImVec4{accent.x, accent.y, accent.z, a}; };
+        c[ImGuiCol_CheckMark]           = accent;
+        c[ImGuiCol_SliderGrab]          = alpha(0.8f);
+        c[ImGuiCol_SliderGrabActive]    = accent;
+        c[ImGuiCol_TabSelectedOverline] = accent;
+        c[ImGuiCol_SeparatorHovered]    = alpha(0.8f);
+        c[ImGuiCol_SeparatorActive]     = accent;
+        c[ImGuiCol_ResizeGrip]          = alpha(0.2f);
+        c[ImGuiCol_ResizeGripHovered]   = alpha(0.67f);
+        c[ImGuiCol_ResizeGripActive]    = alpha(0.95f);
+        c[ImGuiCol_DockingPreview]      = alpha(0.7f);
+        c[ImGuiCol_DragDropTarget]      = accent;
+        c[ImGuiCol_NavCursor]           = accent;
+        c[ImGuiCol_TextSelectedBg]      = ImGui::ColorConvertU32ToFloat4(p->sel);
+    }
 }
 
 // Put the theme in effect: the one configured, or the system's. A change
@@ -12430,7 +12460,7 @@ static void drawmenubar(Gui *g)
         }
         ImGui::Separator();
         if (ImGui::BeginMenu("Theme")) {
-            static char const *labels[] = {"System", "Dark", "Light"};
+            static char const *labels[] = {"System", "Dark", "Light", "Gruvbox"};
             static_assert(countof(labels) == THEME_COUNT);
             for (i32 i = 0; i < THEME_COUNT; i++) {
                 if (ImGui::MenuItem(labels[i], 0, g->themeset==i) && g->themeset!=i) {

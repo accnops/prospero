@@ -556,7 +556,7 @@ static CfgKey cfgschema[] = {
      "once, back to images: the prompt cache then hits between those "
      "steps; 0 leaves one out at each new image"},
 
-    {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
+    {"ui", "theme", CFG_ENUM, "system", {}, "system dark light gruvbox", "ui",
      "Colors: dark, light, or system to follow the operating system"},
     {"ui", "thinking", CFG_ENUM, "fold", {}, "fold open hide", "ui",
      "Reasoning in the transcript: fold to a line that counts it as it "
