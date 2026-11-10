@@ -73,6 +73,9 @@ enum : i32 {
     EV_RELAYDATA, // the response to a relay.call, part by part
     EV_OFFER,     // what this engine's models are, for a thin engine
     EV_RELIST,    // the sessions changed by no command: list them again
+    EV_TERM,      // a terminal's output (ptyhost.cpp)
+    EV_TERMEND,   // a terminal's shell exited, its output all sent
+    EV_TERMBUSY,  // a job of the shell's has the terminal, or no longer
     EV_COUNT,
 };
 
@@ -136,6 +139,9 @@ static EvInfo evinfo[] = {
     {"relay.data", 0, 0},
     {"offer",      0, 0},
     {"relist",     0, 0},
+    {"term",       0, 0},
+    {"term.end",   0, 0},
+    {"term.busy",  0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 
@@ -191,11 +197,19 @@ enum : i32 {
     CMD_RELAYCALL,   // a thin engine's call, for this engine to make
     CMD_OFFER,       // this engine's models as relay.offer gives them
     CMD_ASKTOUCH,    // the user works on a waiting ask's answer
+    CMD_ASKHOLD,     // the user chose to keep a waiting ask waiting, no deadline
     CMD_SHELLENV,    // a session's shell's environment, to open it by hand
     CMD_CALLSTOP,    // the running command stopped, while the turn goes on
     CMD_CUT,         // the conversation rewound to before a turn
     CMD_UNCUT,       // the latest such rewind undone
     CMD_APPROVE,     // credentials for urls of web includes: listed, approved
+    CMD_EPAUTH,      // sign in to ChatGPT for an endpoint: the browser's URL, late
+    CMD_EPLOGOUT,    // an endpoint's ChatGPT tokens forgotten
+    CMD_TERMOPEN,    // a terminal: a shell on a pseudo-terminal (ptyhost.cpp)
+    CMD_TERMINPUT,   // bytes typed into it
+    CMD_TERMRESIZE,  // its new size
+    CMD_TERMACK,     // its output taken, up to an offset
+    CMD_TERMCLOSE,   // hung up, or killed
     CMD_COUNT,
 };
 
@@ -208,8 +222,9 @@ static Str cmdnames[] = {
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
-    "relay.call", "offer", "ask.touch", "shell.env", "call.stop", "cut",
-    "uncut", "approve",
+    "relay.call", "offer", "ask.touch", "ask.hold", "shell.env", "call.stop", "cut",
+    "uncut", "approve", "endpoint.auth", "endpoint.logout", "term.open",
+    "term.input", "term.resize", "term.ack", "term.close",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -303,6 +318,11 @@ static Str capnames[] = {
                        // which ask.touch {sid, req} starts again as the
                        // user answers, and ask.deadline {req, deadline}
                        // records change (0 for none)
+    "ask.deadline",    // ask.touch {sid, req} starts any waiting ask's
+                       // deadline again, as the user writes a denial's note
+    "ask.hold",        // ask.hold {sid, req}: a waiting ask keeps waiting
+                       // until answered, its deadline dropped (ask.deadline
+                       // 0), touches arming none again
     "shell.env",       // shell.env {sid}: the environment, and distro, to
                        // open the session's shell in by hand
     "call.stop",       // call.stop {sid, call}: the running command killed,
@@ -316,6 +336,41 @@ static Str capnames[] = {
                        // approve, answers by "shared" for every session
                        // waiting, mcp's approve and the server state
                        // "approve"
+    "files.path",      // upload {kind:"file", path}: a file in the session's
+                       // working directory attached where it is, read by
+                       // the engine, with kind on the reply (an '@' mention
+                       // from a frontend on another machine)
+    "sessions.mention", // prompt and steer {sessions: [sid]}: sessions the
+                       // message mentions, each a line before its text in
+                       // requests, and the user record's sessions: [{sid,
+                       // title}]
+    "fork.cwd",        // fork {cwd}: a fork that works in another folder,
+                       // moved_from on its session record, notices of
+                       // kind "moved"
+    "endpoint.auth",   // endpoint kinds responses and chatgpt; endpoint.auth
+                       // and endpoint.logout, a chatgpt endpoint signed in
+                       // to (finished by mcp.code {endpoint:1}) and out,
+                       // and models' signedin, email and plan; the session
+                       // state "auth"
+    "endpoint.copilot", // endpoint kind copilot: endpoint.auth with no
+                       // redirect replies with a GitHub code (url, code),
+                       // and mcp.code {endpoint:1} with none waits for it
+                       // to be entered; models' login
+    "term",            // term.open, term.input, term.resize, term.ack and
+                       // term.close: a shell on a pseudo-terminal, its
+                       // output in term records, acked, then term.end;
+                       // term.busy; hello's pty, whether the system can
+                       // run one at all
+    "term.host",       // a host relays term commands and records to and
+                       // from its clients by peer, and term.close {all}
+                       // hangs up all of a client's terminals; a client's
+                       // terminals wait while its link is down, and keep
+                       // the host from exiting idle
+    "pdf",            // upload {kind:"file"} of a PDF: kept as
+                       // files/N-NAME.pdf, its text extracted beside it as
+                       // files/N-NAME.pdf.txt, which the reply names; a
+                       // model with vision gets its images too, as the
+                       // message's own (img/N, with a label)
 };
 
 static Str evname(i32 ev)
@@ -338,6 +393,16 @@ static b32 evdurable(i32 ev)
 {
     assert(ev>=0 && ev<EV_COUNT);
     return evinfo[ev].durable;
+}
+
+// Whether a record is the session's activity, which orders the sidebar
+// by default: a message sent, a turn begun, a turn ended. Not the
+// turn.end of a crash, which opening the session writes later
+// ("interrupted"), nor anything else: opening, renaming, moving or
+// archiving a session never counts, nor do the steps of a turn.
+static b32 evactivity(i32 ev, Str why)
+{
+    return ev==EV_USER || ev==EV_TURN || (ev==EV_TURNEND && why!="interrupted");
 }
 
 static Str cmdname(i32 cmd)
@@ -368,6 +433,32 @@ static b32 validsid(Str sid)
     return ok;
 }
 
+// When a session was made, as its id says (YYYYMMDD-HHMMSS-..., in UTC),
+// in epoch milliseconds to the second, or 0 if the id holds no time.
+static i64 sidms(Str sid)
+{
+    static i32 const at[]  = {0, 4, 6, 9, 11, 13};
+    static i32 const len[] = {4, 2, 2, 2, 2, 2};
+    if (sid.len<15 || sid[8]!='-') {
+        return 0;
+    }
+    i64 f[6] = {};
+    for (i32 i = 0; i < 6; i++) {
+        for (i32 k = 0; k < len[i]; k++) {
+            u8 c = sid[at[i] + k];
+            if (!digit(c)) {
+                return 0;
+            }
+            f[i] = f[i]*10 + (c - '0');
+        }
+    }
+    if (f[1]<1 || f[1]>12 || f[2]<1 || f[2]>31 || f[3]>23 || f[4]>59 || f[5]>60) {
+        return 0;
+    }
+    i64 days = epochdays(f[0], f[1], f[2]);
+    return ((days*24 + f[3])*60 + f[4])*60000 + f[5]*1000;
+}
+
 
 // Records
 
@@ -376,6 +467,7 @@ struct EvOut {
     JsonOut json;
     iz      start;  // offset of the record in the buffer
     i32     ev;     // EV_NONE for commands
+    i64     ts;     // as the record has it
 };
 
 // Begin an event record. The seq is written only for durable events, and
@@ -387,6 +479,7 @@ static EvOut evbegin(Buf *b, Str sid, i64 seq, i64 ts, i32 ev)
     r.json.b = b;
     r.start  = b->len;
     r.ev     = ev;
+    r.ts     = ts;
     putobject(&r.json);
     if (sid.data) {
         putkey(&r.json, "sid");
@@ -1154,6 +1247,7 @@ enum : i32 {
     COPY_FORK,
     COPY_IMPORT,
     COPY_SIDE,
+    COPY_MOVE,
 };
 
 struct LogCopy {
@@ -1268,14 +1362,43 @@ static Str sidenotice(Arena *a, Str from, Str title)
     return finish(&b);
 }
 
+// The notice that begins a fork into another folder (COPY_MOVE), from
+// the folder from to the folder to, and again after each compaction,
+// which may have left it out.
+static Str movenotice(Arena *a, Str from, Str to)
+{
+    Buf b(a, 512 + 4*from.len + to.len);
+    print(&b, "This conversation has moved to another folder: until now you "
+              "worked in ");
+    print(&b, from);
+    print(&b, ", and from here on you work in ");
+    print(&b, to);
+    print(&b, ". Paths earlier in this conversation, relative ones too, named "
+              "files under ");
+    print(&b, from);
+    print(&b, ", which may not exist here, or may differ: read a file again "
+              "before you rely on it. The instructions for ");
+    print(&b, to);
+    print(&b, " apply now, in place of those for ");
+    print(&b, from);
+    print(&b, ". This session is a fork of one that goes on working in ");
+    print(&b, from);
+    print(&b, ": do not change files there unless the user asks you to.");
+    return finish(&b);
+}
+
 // A side chat in a worktree of its own (worktree.cpp): its working
 // directory and worktree for its session record, the original's
 // checkout, whose paths in snapshot, grant and instruction records name
-// the same files in the worktree, path, and what it is told.
+// the same files in the worktree, path, and what it is told. For a fork
+// into another folder (COPY_MOVE), cwd is the new folder, src the old as
+// its session record has it, alt the old for real, and record and path
+// are null.
 struct CopyWt {
     Str cwd;
     Str record;  // the worktree object, as JSON
     Str src;     // the original's checkout
+    Str alt;
     Str path;    // the worktree
     Str notice;
 };
@@ -1360,6 +1483,26 @@ static Str copyremapped(Arena *a, Arena scratch, EvRec *rec, CopyWt *wt, Str to,
     return any ? finish(&b) : Str{};
 }
 
+// Whether a fork into another folder leaves out a record: its prefix,
+// instructions, memory and snapshots, and grants of paths in the old
+// folder (wt->src, or wt->alt).
+static b32 movedrops(Arena scratch, EvRec *rec, CopyWt *wt, b32 win)
+{
+    switch (rec->ev) {
+    case EV_PREFIX:
+    case EV_INSTRUCTIONS:
+    case EV_MEMORY:
+    case EV_SNAP:
+        return 1;
+    case EV_GRANT: {
+        Str p = jsonstr(jsonget(rec->root, "path"));
+        return p.len && (copyremap(&scratch, p, wt->src, wt->src, win).len ||
+                         (wt->alt.len && copyremap(&scratch, p, wt->alt, wt->alt, win).len));
+    }
+    }
+    return 0;
+}
+
 // An id and the call it goes with, as raw JSON text, while copying.
 struct CopyRef {
     Str id;
@@ -1371,12 +1514,22 @@ struct CopyRef {
 // by news[k] in every line, and a title record at now. With win, each in
 // either separator too. An import's copy (COPY_IMPORT) says so instead,
 // and a side chat's (COPY_SIDE) is whole and closes its open turn.
+//
+// A fork into another folder (COPY_MOVE, wt) works in wt->cwd: its
+// session record says so, with moved_from, and keeps only the roots
+// outside the old folder, and memory:1 if memory was on, to be decided
+// anew. Of the records that describe or act on the old folder, none
+// come along: its prefix, instructions and memory, which the new
+// folder's replace when it opens, its snapshots, which a rewind would
+// write back there, and its grants of paths there. A notice of kind
+// "moved" tells its agent, last.
 static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                        Str to, Slice<Str> olds, Slice<Str> news, i64 turn,
                        i64 now, b32 win, i32 kind = COPY_FORK, CopyWt *wt = 0)
 {
     b32 imported = kind == COPY_IMPORT;
     b32 side     = kind == COPY_SIDE;
+    b32 moved    = kind==COPY_MOVE && wt;
     turn = side ? -1 : turn;
     LogCopy r = {};
     if (!lines.len || evparse(&scratch, lines[0]).ev!=EV_SESSION) {
@@ -1436,6 +1589,7 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
     // text of their ids, which point into lines: each push follows the
     // last use of that line's parse, as in logopen
     b32            bypass   = 0;
+    b32            memory   = 0;
     Str            planfile = {};
     Str            cwd      = {};  // raw, from the session record
     Slice<Str>     tools    = {};  // started, not ended
@@ -1511,6 +1665,9 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             break;
         case EV_MODEL:
             r.model = clone(a, jsonstr(jsonget(rec.root, "model")));
+            break;
+        case EV_MEMORY:
+            memory |= jsonstr(jsonget(rec.root, "dir")).len > 0;
             break;
         case EV_MODE:
             bypass   = jsonstr(jsonget(rec.root, "mode")) == "bypass";
@@ -1608,7 +1765,13 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                     putstrkey(&w.json, "side_of", from);
                 }
             }
-            if (wt) {
+            if (moved) {
+                putstrkey(&w.json, "cwd", wt->cwd);
+                putstrkey(&w.json, "moved_from", wt->src);
+                if (memory) {
+                    putintkey(&w.json, "memory", 1);
+                }
+            } else if (wt) {
                 putstrkey(&w.json, "cwd", wt->cwd);
                 putkey(&w.json, "worktree");
                 putraw(&w.json, wt->record);
@@ -1617,14 +1780,38 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                 if (m->key=="sid" || m->key=="seq" || m->key=="ts" || m->key=="ev" ||
                         m->key=="forked_from" || m->key=="fork_turn" ||
                         m->key=="side_of" ||
-                        (wt && (m->key=="cwd" || m->key=="worktree"))) {
+                        (wt && (m->key=="cwd" || m->key=="worktree")) ||
+                        (moved && (m->key=="moved_from" || m->key=="memory" ||
+                                   m->key=="nofolder"))) {
+                    continue;
+                } else if (moved && m->key=="roots") {
+                    // Those outside the old folder mean the same places still
+                    Slice<Str> keep = {};
+                    for (Json *k = m->child; k; k = k->next) {
+                        Str p = jsonstr(k);
+                        if (p.len && !copyremap(&t, p, wt->src, wt->src, win).len &&
+                                !(wt->alt.len && copyremap(&t, p, wt->alt, wt->alt, win).len)) {
+                            keep = push(&t, keep, p);
+                        }
+                    }
+                    if (keep.len) {
+                        putkey(&w.json, "roots");
+                        putarray(&w.json);
+                        for (iz k = 0; k < keep.len; k++) {
+                            putstr(&w.json, keep[k]);
+                        }
+                        putend(&w.json);
+                    }
                     continue;
                 }
                 putkey(&w.json, m->key);
                 putjson(&w.json, m);
             }
             line = evend(&w);
-        } else if (wt && (re = copyremapped(&t, carve(&t, 1<<16), &rec, wt, to, win)).len) {
+        } else if (moved && movedrops(t, &rec, wt, win)) {
+            continue;  // of the old folder
+        } else if (wt && !moved &&
+                   (re = copyremapped(&t, carve(&t, 1<<16), &rec, wt, to, win)).len) {
             line = re;  // its paths in the original's checkout, in the worktree's
         } else if (startswith(line, head)) {
             line = concat(&t, newhead, cuthead(line, head.len));
@@ -1732,18 +1919,18 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         putstrkey(&w.json, "path", planfile);
         printreplaced(&out, evend(&w), o, n);
     }
-    if (side) {
+    if (side || moved) {
         // What it is, durable, so that its first request has it
         Str   text = wt ? wt->notice : sidenotice(&scratch, from, title);
         Buf   b(&scratch, 256 + text.len + text.len/8);
         EvOut w = evbegin(&b, to, ++last, now, EV_NOTICE);
-        putstrkey(&w.json, "kind", wt ? Str("worktree") : Str("side"));
+        putstrkey(&w.json, "kind", moved ? Str("moved") : wt ? Str("worktree") : Str("side"));
         putstrkey(&w.json, "text", text);
         print(&out, evend(&w));
     }
     {
         // A worktree's, untitled, is titled by its first prompt
-        r.title = wt ? Str{} : r.title;
+        r.title = wt && !moved ? Str{} : r.title;
         Buf   b(&scratch, 256 + r.title.len);
         EvOut w = evbegin(&b, to, last+1, now, EV_TITLE);
         putstrkey(&w.json, "text", r.title);
@@ -1808,11 +1995,11 @@ static b32 importkeeps(i32 ev)
 }
 
 // Whether an import drops a field: of a tool result, one naming a file
-// or a session of the old state directory (spill, image, child, a
-// message's target), or describing one; of a message's notice, its
-// sender, whose title and text stay; of a user record, its images and
-// files. The
-// URLs one session vouched for to another (urls) go too, as grants do.
+// or a session of the old state directory (spill, image, images, pdf,
+// child, a message's target), or describing one; of a message's notice,
+// its sender, whose title and text stay; of a user record, its images,
+// files and the sessions it mentioned. The URLs one session vouched for
+// to another (urls) go too, as grants do.
 static b32 importdrops(i32 ev, Str key)
 {
     if (key == "urls") {
@@ -1821,11 +2008,12 @@ static b32 importdrops(i32 ev, Str key)
     if (ev == EV_NOTICE) {
         return key == "from";
     } else if (ev == EV_USER) {
-        return key=="images" || key=="files";
+        return key=="images" || key=="files" || key=="sessions";
     }
-    return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
-           key=="height" || key=="shot" || key=="child" || key=="host" ||
-           key=="job" || key=="to";
+    return key=="spill" || key=="bytes" || key=="image" || key=="images" ||
+           key=="width" || key=="height" || key=="shot" || key=="pdf" ||
+           key=="pages" || key=="child" || key=="host" || key=="job" ||
+           key=="to";
 }
 
 // A tool result, notice or user record without the fields an import

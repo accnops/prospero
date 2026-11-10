@@ -102,6 +102,78 @@ system prompt and the conversation carry cache breakpoints, so cache
 reads grow turn over turn. A `[model NAME]` section sets `thinking`
 (adaptive by default), `thinking_display`, `effort` and `max_tokens`.
 
+`kind = responses` speaks OpenAI's Responses API (whose whole URL ends
+in `/responses`), with its key, at OpenAI or at a server that serves
+it, as llama-server does:
+
+    [endpoint openai]
+    kind = responses
+    url = https://api.openai.com/v1
+    key = env:OPENAI_API_KEY
+
+Nothing is stored at the server: each request carries the whole
+conversation, its reasoning going back encrypted as the server gave
+it, so the prompt cache keeps hitting, with the session as its key.
+`[model NAME] effort` sets the reasoning effort (`none` through
+`xhigh`), and `max_tokens` the output's limit.
+
+`kind = chatgpt` is the same API at ChatGPT's Codex backend, billed to
+a ChatGPT subscription rather than by the token. It takes no key: you
+sign in once with your ChatGPT account, on the endpoint's page in
+Settings (Sign in), or with `prospero endpoint auth NAME`, which
+prints the page to visit. The browser comes back to this computer at
+`localhost:1455` (else 1457), as for OpenAI's own Codex CLI, so sign
+in on the computer that runs the engine. The tokens are kept in the
+state directory's `endpoints/auth`, readable only by you, refreshed as
+they expire, and forgotten by Sign out or `prospero endpoint logout
+NAME`. Its URL is filled in for you:
+
+    [endpoint chatgpt]
+    kind = chatgpt
+    url = https://chatgpt.com/backend-api/codex/responses
+
+The models are those your plan includes, such as `gpt-5-codex`. A
+usage limit reached ends the turn, saying when it resets, rather than
+waiting hours in retries, or moves to a `fallback` if the model has
+one. In Settings, adding an endpoint asks its kind first, and fills in
+the kind's URL; changing the kind later moves a URL that is still
+another kind's own, but keeps one you typed.
+
+`kind = copilot` is GitHub Copilot, billed to your Copilot plan
+(Copilot Free included). It takes no key either: Sign in, or
+`prospero endpoint auth NAME`, shows a code to enter at GitHub's page,
+github.com/login/device, in any browser on any computer, so it suits
+an engine over ssh as well. The token is kept as ChatGPT's is, needs no
+refreshing, and is forgotten the same ways. Its URL is filled in:
+
+    [endpoint copilot]
+    kind = copilot
+    url = https://api.githubcopilot.com
+
+While the URL is that one, requests go to the API your account's
+sign-in names (such as `api.individual.githubcopilot.com`); a URL you
+typed is used as it is. Copilot serves each model by one of three
+APIs, and Prospero speaks to each in the one its listing names:
+Anthropic's Messages API for Claude, the Responses API for newer GPT
+models, Chat Completions for the rest. Each request says whether you
+or the agent began it (a tool's results, compaction, a subagent), as
+Copilot bills only the first as a premium request.
+
+GitHub gives each app that signs in its own set of models. Prospero
+signs in as its own GitHub app, which GitHub gives only its older
+models (such as `gpt-4o`, `gpt-4o-mini` and `gpt-4.1`, as
+`gpt-41-copilot`), not those of your plan's model picker. `client_id`
+in the endpoint's section signs in as another OAuth app instead, at
+your own risk: GitHub's terms are for you to weigh, and a token for
+another app is kept apart, so changing it asks for a new sign-in. For
+kind chatgpt it likewise replaces the Codex CLI's client.
+
+Copilot may refuse a model with "not available for integrator", as it
+takes requests for the product (the integration) of the app signed in
+as, or of the request's `Copilot-Integration-Id`. `integration_id` in
+the endpoint's section sends that header, naming the product, likewise
+at your own risk. Prospero sends none of its own.
+
 For an OpenAI-compatible server, `template.NAME = VALUE` in a
 `[model NAME]` section is an argument of the model's chat template,
 sent in `chat_template_kwargs` (as llama.cpp and vLLM take it): `true`
@@ -125,6 +197,31 @@ discovery, context limits and the places on a router are OTHER's:
 
 A variant is chosen as any model is, for a session, a role, a
 fallback or a compactor.
+
+`effort` works on an OpenAI-compatible server too. By default it goes
+in the request's own `reasoning_effort` field, which llama.cpp and vLLM
+pass on to the chat template, so `effort = high` is often all a model
+needs. `effort_as` sends it elsewhere instead: `reasoning.effort`, as
+OpenRouter takes it; `template.NAME`, an argument of the chat template;
+or `none`. A template with words of its own takes them through
+`effort_map`, as `EFFORT:VALUE` pairs, numbers sent as numbers. The
+variants above, with effort:
+
+    [model large]
+    template.thinking = true
+    effort_as = template.reasoning_effort
+    effort_map = low:25 high:100
+
+    [model large-quick]
+    like = large
+    effort = low
+
+    [model large-deep]
+    like = large
+    effort = high
+
+A `template.NAME` set by hand for the same argument (`reasoning_effort`,
+or effort_as's NAME) wins over `effort`.
 
 A `[model NAME]` section applies wherever an endpoint lists NAME. Where
 two endpoints list the same model, `[model ENDPOINT/MODEL]` sets it on
@@ -183,7 +280,12 @@ skill's name and description, loads one with its skill tool, which
 also lets it read the skill's directory, and hears of skills added or
 changed as it works. `/NAME args` in the prompt box uses a skill
 directly, and one with `disable-model-invocation: true` is for that
-alone. `[skills] enabled = false` turns them off.
+alone. `[skills] enabled = false` turns them off. Without editing a
+`SKILL.md`, `[skills] hidden = NAME…` makes skills the user's alone in
+the same way, and `[skills] disabled = NAME…` leaves them out
+altogether, from the agent and from `/NAME`; each takes names
+separated by blanks, and covers every skill of a name, so none further
+away takes its place. Either may name `prospero`.
 
 One skill is built in: `prospero`, Prospero's Help and every setting,
 served by the engine itself, so that the agent can answer questions
@@ -215,7 +317,10 @@ runs without a shell. Begin it with `'`, since a value beginning with
 started for the sessions that use it, and stops a minute after the
 last one has gone. Its standard error is logged in the state
 directory's `mcp/logs`. `tools` keeps only some of a server's tools,
-`trust = yes` runs them without asking, and a role with a tools list
+read left to right (`-NAME` leaves one out, and a list beginning with
+one starts from all), which the server's page in Settings edits with a
+checkbox each, and `prospero mcp tools NAME` lists; a tool left out
+mid-session is refused. `trust = yes` runs them without asking, and a role with a tools list
 names them as `mcp__NAME` or `mcp__NAME__TOOL`. Otherwise each call
 asks first, with an "always" for all of that server's tools, which for
 a server over HTTP holds only while its url stays the same. An included
@@ -232,7 +337,10 @@ folder up to the repository's root. Its servers start only once you
 allow them, for the session or always for that project until their
 definitions change. A call to one may also trust its server in that
 project, from then on, under the same condition. Your own section of
-the same name wins.
+the same name wins if it has a `command` or `url`. One with neither
+adjusts projects' servers of that name instead, with `tools`,
+`enabled`, `timeout` and `startup_timeout` only: never `trust`, a
+`token`, headers, `cwd`, `env.NAME` or the sign-in's client keys.
 
 A server over HTTP may take a bearer `token` (as `env:NAME`) or
 `header.NAME` values, or want you to sign in with OAuth. Settings, on
@@ -253,7 +361,7 @@ one. `prospero mcp logout NAME`, or Sign out, forgets them.
 `web_search` sends a query to a search service and returns titles,
 links, dates and excerpts; `web_fetch` reads one https page as text,
 with scripts, navigation and hidden elements dropped and links made
-absolute. Neither is offered until `[web]` turns it on:
+absolute, and a PDF as its text. Neither is offered until `[web]` turns it on:
 
     [web]
     search = searxng
@@ -261,7 +369,8 @@ absolute. Neither is offered until `[web]` turns it on:
 
 `search` is `searxng` (your own instance, with `json` in its
 `search.formats`), `exa` (Exa's keyless MCP endpoint, or with `key`),
-or `anthropic` (a side request to an Anthropic model with Anthropic's
+`keenable` (Keenable's keyless search API, or with `key`), or
+`anthropic` (a side request to an Anthropic model with Anthropic's
 web search tool: `model = ENDPOINT/MODEL`, by default
 `claude-haiku-5-5` on the first endpoint of kind `anthropic`).
 `fetch = no` leaves out `web_fetch`, `results` caps a search's

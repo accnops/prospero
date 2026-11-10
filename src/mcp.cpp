@@ -69,6 +69,7 @@ struct McpTool {
     Str desc;
     Str schema;  // parameters, as raw JSON
     b32 ro;      // readOnlyHint
+    Str origin;  // a session's: whose server it came from (McpServer)
 };
 
 enum : i32 {
@@ -108,11 +109,15 @@ struct McpPending {
 struct McpServer {
     McpServer        *next;
     Str               name;
-    Str               cwd;       // where it runs: its key, with name
+    Str               cwd;       // where it runs, or an HTTP server's
+                                 // url: its key, with name
+    Str               origin;    // "config", or a project's key
+                                 // (mcpprojkey): calls hold to it
+    Str               def;       // what it was defined as: a change
+                                 // starts it afresh (mcpserver)
     Slice<Str>        argv;
     Slice<Str>        env;       // NAME=value, added to the engine's
     b32               trust;
-    Str               only;      // its section's tools, null for all
     i64               startms;   // startup_timeout
     i64               callms;    // timeout
     i32               state;     // MCP_*
@@ -130,6 +135,8 @@ struct McpServer {
     Str               version;   // the protocol it answered
     Str               cursor;    // tools/list's next page
     i32               pages;
+    b32               truncated; // more pages than MCP_PAGES: some unlisted
+    b32               forlist;   // started to list its tools, by no session
     i64               startedat; // ticks
     i64               readyby;   // ticks: failed if not ready then
     i64               lastuse;   // ticks: a session offered it
@@ -218,23 +225,110 @@ static b32 mcpallowed(Str list, Str server, Str fname)
 }
 
 // Whether a server's own tools key offers a tool, by the server's name
-// for it: all when null.
+// for it, read left to right as a role's list is: a word keeps a tool,
+// "-word" takes it away again, and a first word that takes away starts
+// from all of them. All when null, or when it has no words.
 static b32 mcponly(Str only, Str tool)
 {
-    if (!only.data) {
-        return 1;
-    }
+    b32 have  = 1;
+    b32 first = 1;
     for (Str rest = only; rest.len;) {
         iz i = 0;
         for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
         rest = cuthead(rest, i);
         for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
-        if (takehead(rest, i) == tool) {
-            return 1;
+        Str word = takehead(rest, i);
+        rest     = cuthead(rest, i);
+        if (!word.len) {
+            break;
         }
-        rest = cuthead(rest, i);
+        b32 less = word.len>1 && word[0]=='-';
+        if (first) {
+            have  = less;
+            first = 0;
+        }
+        if ((less ? cuthead(word, 1) : word) == tool) {
+            have = !less;
+        }
     }
-    return 0;
+    return have;
+}
+
+// A tools key's value with one tool turned on or off, as Settings'
+// checkbox writes it. The value is first put plainly, with its meaning
+// kept: a list of tools taken away ("-a -b") when it is unset or starts
+// by taking one away, else the tools it keeps, unknown names too, each
+// named once in the order first named. Drop when nothing is taken away
+// any more, so the key can go; if an included file sets it too, it is
+// "", which counts as unset, with drop clear. An error when the last
+// tool a list keeps would go, which would mean all of them.
+struct McpToggle {
+    Str value;
+    b32 drop;
+    Str err;
+};
+
+static McpToggle mcptoggle(Arena *a, Str cur, Str tool, b32 on, b32 incl)
+{
+    McpToggle r = {};
+    Slice<Str> names = {};
+    b32 less = 0;  // a list of those taken away
+    b32 first = 1;
+    for (Str rest = cur; rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
+        rest = cuthead(rest, i);
+        for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
+        Str word = takehead(rest, i);
+        rest     = cuthead(rest, i);
+        if (!word.len) {
+            break;
+        }
+        b32 minus = word.len>1 && word[0]=='-';
+        less  = first ? minus : less;
+        first = 0;
+        Str name = minus ? cuthead(word, 1) : word;
+        b32 seen = 0;
+        for (iz k = 0; k < names.len; k++) {
+            seen |= names[k] == name;
+        }
+        if (!seen) {
+            names = push(a, names, name);
+        }
+    }
+    if (first) {
+        less = 1;  // unset: all, so far none taken away
+    }
+
+    // Those named the list keeps (or with less, takes away), then tool
+    Slice<Str> out = {};
+    for (iz k = 0; k < names.len; k++) {
+        b32 kept = mcponly(cur, names[k]);
+        if (names[k]!=tool && kept!=less) {
+            out = push(a, out, names[k]);
+        }
+    }
+    if (on != less) {
+        out = push(a, out, tool);
+    }
+
+    if (!out.len && !less) {
+        r.err = "it is the last tool the list keeps: to turn off the server, "
+                "set enabled = no";
+        return r;
+    } else if (!out.len) {
+        r.drop  = !incl;
+        r.value = "";
+        return r;
+    }
+    Buf b(a, 64);
+    for (iz k = 0; k < out.len; k++) {
+        print(&b, k ? Str(" ") : Str(""));
+        print(&b, less ? Str("-") : Str(""));
+        print(&b, out[k]);
+    }
+    r.value = finish(&b);
+    return r;
 }
 
 
@@ -761,15 +855,26 @@ enum : i32 {
     MCPAUTH_WAIT,     // the user signs in, in the browser
     MCPAUTH_TOKEN,    // the code exchanged for tokens
     MCPAUTH_REFRESH,  // a refresh token exchanged for new ones
+    MCPAUTH_DEVICE,   // GitHub's device flow (kind copilot): a code asked for
+    MCPAUTH_POLL,     // GitHub asked, every few seconds, if it was entered
+    MCPAUTH_USER,     // and then about the account
+    MCPAUTH_DONE,     // ended, err saying how, kept for mcp.code a while
 };
 
-// A sign-in under way, or a refresh: in a region of its own.
+// A sign-in under way, or a refresh: in a region of its own. Its
+// target is an MCP server, or an endpoint of kind chatgpt, which signs
+// in to ChatGPT as the Codex CLI does: a fixed issuer and client, no
+// resource parameter, and the account's id from the id_token.
 struct McpAuth {
     McpAuth   *next;
     Region    *mem;
     Arena      arena;
-    Str        name;      // the server's
+    Str        name;      // the server's, or the endpoint's
     Str        resource;  // and its URL
+    b32        ep;        // an endpoint's, not a server's
+    Str        account;   // the endpoint's, refreshing: kept unless replaced
+    Str        email;
+    Str        plan;
     i32        stage;     // MCPAUTH_*
     Slice<Str> tries;     // metadata URLs to try, in order
     i32        at;
@@ -783,6 +888,11 @@ struct McpAuth {
     Str        clientname;  // registering
     Str        secret;
     Str        refresh;   // the refresh token, refreshing
+    Str        device;    // the device flow's: GitHub's device code,
+    Str        access;    // the token it gave,
+    i64        every;     // ticks between polls,
+    i64        pollat;    // the next poll, 0 while one is under way,
+    Str        err;       // and how it ended (MCPAUTH_DONE), null if well
     Str        verifier;  // PKCE
     Str        state;
     i64        cmd;       // the command that waits for it, 0 if none
@@ -803,6 +913,28 @@ static Str base64url(Arena *a, Str s)
         r[i] = r[i]=='+' ? (u8)'-' : r[i]=='/' ? (u8)'_' : r[i];
     }
     return r;
+}
+
+// A JSON Web Token's claims, its payload unchecked (it came from the
+// issuer itself, over TLS), or null.
+static Json *jwtclaims(Arena *a, Str jwt)
+{
+    Cut head = cut(jwt, '.');
+    Cut body = cut(head.tail, '.');
+    if (!head.ok || !body.ok || !body.head.len) {
+        return 0;
+    }
+    Buf b(a, body.head.len + 4);
+    for (iz i = 0; i < body.head.len; i++) {
+        u8 c = body.head[i];
+        putbyte(&b, c=='-' ? (u8)'+' : c=='_' ? (u8)'/' : c);
+    }
+    while (b.len % 4) {
+        putbyte(&b, '=');
+    }
+    Unbase64 d = unbase64(a, finish(&b));
+    Json    *j = d.ok ? jsonparse(a, d.data).root : 0;
+    return j && j->type==JSON_OBJECT ? j : 0;
 }
 
 static i32 hexval(u8 c)  // -1 if not one
@@ -983,13 +1115,41 @@ static Str mcpauthurl(Arena *a, McpAuth *x, Str challenge)
     print(&b, challenge);
     print(&b, "&code_challenge_method=S256&state=");
     print(&b, pctencode(a, x->state));
-    print(&b, "&resource=");
-    print(&b, pctencode(a, x->resource));
+    if (x->ep) {
+        // As the Codex CLI asks, for a token the Codex backend takes
+        print(&b, "&id_token_add_organizations=true&codex_cli_simplified_flow=true");
+        print(&b, "&originator=");
+        print(&b, chatgptoriginator);
+    } else {
+        print(&b, "&resource=");
+        print(&b, pctencode(a, x->resource));
+    }
     if (x->scope.len) {
         print(&b, "&scope=");
         print(&b, pctencode(a, x->scope));
     }
     return finish(&b);
+}
+
+// Listen for the browser's return from ChatGPT's sign-in, which takes
+// only the Codex CLI's redirects: localhost at port 1455, else 1457.
+// With the test hook (PROSPERO_TEST_CHATGPT_AUTH) any port does, at
+// 127.0.0.1. The redirect, or null if neither port is free.
+static Str chatgptloopback(Os *os, Arena *a, Mailbox *mbox, u32 type, u64 id)
+{
+    b32 test    = os_getenv(os, a, "PROSPERO_TEST_CHATGPT_AUTH").len > 0;
+    i32 ports[] = {1455, 1457};
+    for (i32 i = 0; i < (test ? 1 : 2); i++) {
+        i32 port = test ? 0 : ports[i];
+        if (os_loopback(os, mbox, type, id, 10*60*1000, "/auth/callback", &port)) {
+            Buf b(a, 64);
+            print(&b, test ? Str("http://127.0.0.1:") : Str("http://localhost:"));
+            print(&b, (i64)port);
+            print(&b, "/auth/callback");
+            return finish(&b);
+        }
+    }
+    return {};
 }
 
 // The loopback listener's (os_loopback): the target of a request for

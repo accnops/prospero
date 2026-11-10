@@ -31,6 +31,7 @@ on this machine's LAN address instead.
 
 import argparse
 import base64
+import calendar
 import concurrent.futures
 import hashlib
 import json
@@ -866,6 +867,22 @@ def pings(t):
     t.check(r.text() == "Prefill finished.", f"text {r.text()!r}")
 
 
+@scenario(bound=20)
+def prefill_rate(t):
+    """Prompt processing's rate, as the output's: the tokens computed since
+    the first progress event, the cache's left out, over the server's
+    time_ms, or this side's clock where it gives none."""
+    for turn in range(2):
+        r = t.run()
+        t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+        got = [e.get("tps") for e in r.all("progress")]
+        t.check(len(got) == 5 and got[0] is None, f"no rate before a batch: {got}")
+        if turn == 0:
+            t.check(got[1:] == [2000.0]*4, f"the server's clock: {got}")
+        else:
+            t.check(all(x and 3000 <= x <= 4100 for x in got[1:]), f"this clock: {got}")
+
+
 @scenario(conf={"first_byte_timeout": 2}, bound=10)
 def stall_head(t):
     r = t.run()
@@ -1187,6 +1204,61 @@ def job_tools(t):
 
 
 @scenario(bound=10)
+def job_announce(t):
+    """An agent that says it will wait for its job and stops is not nudged
+    on: the job's end starts its next turn (#32)."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    start = r.all("tool.end")[0]["text"]
+    t.check("a new one starts for it" in start and "end your turn" in start,
+            f"it is told it may end its turn: {start!r}")
+    t.check(not r.all("nudge"), f"no nudge: {r.all('nudge')}")
+    t.seq(r, ["job.start", "tool.end", "assistant", "turn.end", "job.end", "turn",
+              "notice", "attempt", "assistant", "turn.end"])
+    t.check("Saw: Background job 1 ended" in r.text(), f"text {r.text()!r}")
+
+
+@scenario(bound=10)
+def job_poll(t):
+    """Reading a running job again with nothing new, or sleeping while a
+    job runs, is answered plainly: end the turn instead (#32)."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok"] * 6, f"statuses {[e['status'] for e in ends]}")
+    first, second = ends[1]["text"], ends[2]["text"]
+    t.check("in a new turn if yours has ended: do not poll it" in first and
+            "Stop polling" not in first, f"first read: {first!r}")
+    t.check("job 1 is still running, with no new output since you last read "
+            "it. Stop polling it: if there is nothing else to do, end your turn "
+            "now" in second, f"second read: {second!r}")
+    t.check("instead of sleeping" in ends[3]["text"], f"sleep: {ends[3]['text']!r}")
+    t.check("instead of sleeping" not in ends[4]["text"] and "hi" in ends[4]["text"],
+            f"sleep, then work: {ends[4]['text']!r}")
+    t.check(t.gone(t.pids("jobpid")), "the job's process is gone")
+
+
+@scenario(conf={"_tools": {"auto_resume": 0}}, bound=10)
+def job_poll_noresume(t):
+    """With no turns of its own, polling is still answered, but the agent
+    is not told a new turn starts, and sleeping goes unremarked (#32)."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check("a new one starts" not in ends[0]["text"] and
+            "at your next request" in ends[0]["text"], f"start: {ends[0]['text']!r}")
+    t.check(ends[1]["text"].endswith("[you are told when the job ends: do not poll it]"),
+            f"first read: {ends[1]['text']!r}")
+    t.check("Stop polling it: you are told when it ends, at your next request"
+            in ends[2]["text"], f"second read: {ends[2]['text']!r}")
+    t.check("instead of sleeping" not in ends[3]["text"], f"sleep: {ends[3]['text']!r}")
+    reqs = t.requests()
+    shell = [x for x in reqs[0]["body"]["tools"] if x["function"]["name"] == "shell"]
+    t.check(shell and "a new turn starts" not in shell[0]["function"]["description"],
+            "the shell tool does not promise a turn")
+
+
+@scenario(bound=10)
 def job_busy(t):
     """A job that ends while its turn still runs is told at the next step
     of that turn."""
@@ -1407,8 +1479,9 @@ def bg_shell(t):
         t.check(end["status"] == "background" and end.get("job") == 1 and
                 "started" in end["text"] and end["ms"] < 3000, f"the call ended: {end}")
         t.check(re.search(r"\[the user moved it to the background after [12](\.[0-9])? s, so "
-                          r"it continues as job 1\. You will be told when it ends: do not "
-                          r"poll it or wait for it\.", end["text"]), f"its text: {end['text']!r}")
+                          r"it continues as job 1\. You will be told when it ends, and if "
+                          r"your turn has ended by then, a new one starts for it: do not "
+                          r"poll it, sleep, or wait for it", end["text"]), f"its text: {end['text']!r}")
         js = h.all("job.start", sid)
         t.check(js and js[0]["call"] == start["call"], f"job.start {js}")
         h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
@@ -2256,6 +2329,35 @@ def todo_job(t):
 
 
 @scenario(bound=10)
+def todo_ops(t):
+    """The list goes with other calls, then changes by name: done starts
+    the next item, and a name that matches none fails and changes
+    nothing."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    lists = [[(i["content"], i["status"]) for i in x["items"]] for x in r.all("todo")]
+    t.check(lists == [
+        [("write a", "in_progress"), ("write b", "pending")],
+        [("write a", "done"), ("write b", "in_progress")],
+        [("write a", "done"), ("write b", "done"), ("check", "in_progress")],
+        [("write a", "done"), ("write b", "done")],
+        [("write a", "done"), ("write b", "in_progress")],
+        [("write a", "done"), ("write b", "done")],
+    ], f"lists {lists}")
+    ends = [(e["status"], e["text"]) for e in r.all("tool.end")]
+    t.check(ends[2] == ("ok", "Todo list, 1 of 2 done, left:\n[>] write b (in progress)\n"),
+            f"after done {ends[2]!r}")
+    t.check(ends[4][0] == "error" and 'no item "write z"' in ends[4][1], f"bad name {ends[4]!r}")
+    t.check(ends[-1] == ("ok", "Todo list, 2 of 2 done.\n"), f"the end {ends[-1]!r}")
+    hint = "Next time, send todo_write in the same response"
+    t.check(hint not in ends[0][1] and hint in ends[5][1],
+            "the hint only for a list alone in its response, with items left")
+    t.check(ends[7][1].endswith("Next time, mark items with done and start instead "
+                                "of sending the whole list again."), f"resent {ends[7]!r}")
+    t.check(not r.all("nudge"), "no nudges")
+
+
+@scenario(bound=10)
 def todo_cap(t):
     """Never finishing the list: three nudges, then the turn ends."""
     r = t.run()
@@ -2966,6 +3068,72 @@ def skill_prompt(t):
 
 
 @scenario(bound=20)
+def skills_config(t):
+    """[skills] hidden and disabled, by name: a hidden skill is the
+    user's alone, a disabled one gone everywhere, every one of its name
+    and the built-in one too; a change in the configuration reaches the
+    agent of a running session as a notice."""
+    env = skillhome(t)
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    proj = t.host.join(t.work, ".claude", "skills")
+    skillput(t, proj, "review", "---\ndescription: Review a change\n---\nREVIEW-BODY\n")
+    skillput(t, proj, "old", "---\ndescription: Project old\n---\n")
+    skillput(t, proj, "pdf", "---\ndescription: Read PDFs\n---\n")
+    user = t.host.join(env["XDG_CONFIG_HOME"], "prospero", "skills")
+    skillput(t, user, "old", "---\ndescription: User old\n---\n")
+    t.host.write(t.config, t.host.read(t.config) +
+                 "[skills]\nhidden = review\ndisabled = old, prospero\n")
+    told = "The skills changed"
+    h = t.headless(env)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        sk = h.call("skills", sid=sid)
+        got = [(k["name"], k["hidden"]) for k in sk.get("skills", [])]
+        t.check(got == [("pdf", False), ("review", True)], f"skills {sk}")
+        bad = h.call("prompt", sid=sid, text="x", skill="old")
+        t.check(bad.get("ok") == 0 and "no such skill" in bad.get("err", ""), f"old {bad}")
+
+        h.send("prompt", sid=sid, text="use review")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+        ends = h.all("tool.end", sid)
+        t.check(len(ends) == 1 and ends[0]["status"] == "error" and
+                "No skill is named \"review\"" in ends[0]["text"] and
+                "The skills are: pdf." in ends[0]["text"], f"hidden {ends}")
+        system = fake_provider.system_of(t.requests()[0]["body"])
+        listed = [x for x in system.split("\n") if x.startswith("- ")]
+        t.check("- pdf: Read PDFs" in listed and
+                not [x for x in listed if x.startswith(("- review:", "- old:", "- prospero:"))],
+                f"listed {listed}")
+
+        # /review still works: the user's alone
+        h.send("prompt", sid=sid, text="a.c", skill="review")
+        t.check(ended(h, sid, 2)["why"] == "done", "the skill's turn ends")
+        last = t.requests()[-1]["body"]["messages"][-1]["content"]
+        t.check(isinstance(last, str) and "REVIEW-BODY" in last, f"invoked {last!r}")
+
+        # Hiding pdf too, then enabling the disabled: notices
+        r = h.call("config.set", kind="skills", key="hidden", value="review pdf")
+        t.check(r.get("ok") == 1, f"config.set {r}")
+        h.send("prompt", sid=sid, text="third")
+        t.check(ended(h, sid, 3)["why"] == "done", "the third turn ends")
+        msgs = [str(m.get("content")) for m in t.requests()[-1]["body"]["messages"]
+                if told in str(m.get("content"))]
+        t.check(len(msgs) == 1 and msgs[0].endswith("\n- pdf (removed)"), f"hid {msgs}")
+
+        r = h.call("config.set", kind="skills", key="disabled", value="")
+        t.check(r.get("ok") == 1, f"config.set {r}")
+        h.send("prompt", sid=sid, text="fourth")
+        t.check(ended(h, sid, 4)["why"] == "done", "the fourth turn ends")
+        msgs = [str(m.get("content")) for m in t.requests()[-1]["body"]["messages"]
+                if told in str(m.get("content"))]
+        t.check(len(msgs) == 2 and "\n- old: Project old (new)" in msgs[1] and
+                "\n- prospero: " in msgs[1], f"back {msgs}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
 def prospero_skill(t):
     """The built-in prospero skill, in every session: its instructions
     name this engine's configuration file, its args the Help topics and
@@ -3174,7 +3342,7 @@ def ask_allow(t):
     h = t.headless()
     try:
         sid, ask = asked(t, h)
-        t.check(29000 <= ask["deadline"] - ask["ts"] <= 31000, f"a 30 s deadline: {ask}")
+        t.check(59000 <= ask["deadline"] - ask["ts"] <= 61000, f"a 60 s deadline: {ask}")
         r = h.call("answer", sid=sid, req=ask["req"], decision="allow", note="ok")
         t.check(r.get("ok") == 1, f"answer accepted: {r}")
         end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
@@ -3247,19 +3415,107 @@ def ask_timeout(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={"_guard": {"ask_timeout": 3}}, bound=15)
+def ask_touch(t):
+    """ask.touch, as the user writes a denial's note, starts a permission
+    ask's clock over with its own delay, logged as ask.deadline; left
+    alone again, it times out."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("ask.deadline" in h.all("hello")[0].get("caps", []), "the cap")
+        sid, ask = asked(t, h)
+        time.sleep(2)
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched: {r}")
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched again: {r}")
+        time.sleep(2)  # past the first deadline
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check(len(dls) == 1 and dls[0]["req"] == ask["req"] and
+                dls[0]["deadline"] - ask["deadline"] >= 1500, f"logged once: {dls}")
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid, 10)
+        t.check(ans["by"] == "timeout" and ans["ts"] - ask["ts"] >= 4500,
+                f"then timed out: {ans} after {ans['ts'] - ask['ts']} ms")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"ask_timeout": 0}}, bound=15)
+def ask_wait(t):
+    """ask_timeout = 0: a permission ask has no deadline, a touch arms
+    none, and it waits until answered. (Closed, with nobody left to
+    answer, it is denied at once as ever: ask_close.)"""
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        t.check(ask["deadline"] == 0, f"no deadline: {ask}")
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched: {r}")
+        time.sleep(2)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check(not dls, f"nothing logged: {dls}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(h.all("answer", sid)[0]["by"] == "user", f"answered: {h.all('answer', sid)}")
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"ask_timeout": 2}}, bound=15)
+def ask_hold(t):
+    """ask.hold: the user keeps a permission ask waiting, its deadline
+    dropped and logged as ask.deadline 0, a later touch arming none; it
+    waits past the deadline it had, until answered."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("ask.hold" in h.all("hello")[0].get("caps", []), "the cap")
+        sid, ask = asked(t, h)
+        t.check(ask["deadline"] > 0, f"a deadline first: {ask}")
+        r = h.call("ask.hold", sid=sid, req="nope")
+        t.check(r.get("ok") == 0, f"an unknown request: {r}")
+        r = h.call("ask.hold", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"held: {r}")
+        h.call("ask.touch", sid=sid, req=ask["req"])
+        time.sleep(3)  # past the deadline it had
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check([d["deadline"] for d in dls] == [0] and dls[0]["req"] == ask["req"],
+                f"logged as none, once: {dls}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(h.all("answer", sid)[0]["by"] == "user", f"answered: {h.all('answer', sid)}")
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=10)
 def ask_steer(t):
+    """A steer while an ask waits does not answer it: it waits, queued,
+    and the agent reads it after the user's answer, the denial first."""
     h = t.headless()
     try:
         sid, ask = asked(t, h)
         h.call("steer", sid=sid, text="no, put it in steered.txt")
+        time.sleep(1)
+        t.check(not h.all("answer", sid), f"still asking: {h.all('answer', sid)}")
+        q = h.all("queue", sid)
+        t.check(q and [i["kind"] for i in q[-1]["items"]] == ["steer"], f"queued: {q}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
         end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
         t.check(end["why"] == "done", f"the turn goes on: {end}")
         ans = h.all("answer", sid)[0]
-        t.check(ans["decision"] == "deny" and ans["by"] == "steer", f"answer {ans}")
+        t.check(ans["decision"] == "deny" and ans["by"] == "user", f"answer {ans}")
         deny = h.all("tool.end", sid)[0]
-        t.check(deny["status"] == "denied" and "sent a new message" in deny["text"],
-                f"why: {deny}")
+        t.check(deny["status"] == "denied", f"denied: {deny}")
         users = [e for e in h.all("user", sid) if e.get("via") == "steer"]
         t.check(users and users[0]["text"] == "no, put it in steered.txt", "the steer is logged")
         msgs = t.requests()[1]["body"]["messages"]
@@ -3311,6 +3567,19 @@ def unqueue(t):
         t.check(r.get("ok") == 0 and r.get("err"), f"twice: {r}")
         left = [i["text"] for i in queues(6)[-1]["items"]]
         t.check(left == ["keep this steer", "keep this prompt"], f"left: {left}")
+
+        # A prompt with a PDF comes back with only the images the user
+        # attached: the PDF's come again from its file when it is sent
+        pdf = upfile(t, h, sid, imgpdf(), "img.pdf")["name"]
+        png = attached(t, h, sid, PNG)
+        r = h.call("prompt", sid=sid, text="withdraw this PDF", files=[pdf], images=[png])
+        t.check(r.get("ok") == 1, f"queued with a PDF: {r}")
+        item = [i for i in queues(7)[-1]["items"] if i["text"] == "withdraw this PDF"]
+        t.check(len(item) == 1, f"queued: {item}")
+        r = h.call("unqueue", sid=sid, item=item[0]["id"]) if item else {}
+        t.check(r.get("ok") == 1 and [g["name"] for g in r.get("images", [])] == [png] and
+                r.get("files", [{}])[0].get("name") == pdf, f"its own image back: {r}")
+        queues(8)
 
         # Opened again, as a frontend coming back would: the queue as it is
         n = len(h.all("queue", sid))
@@ -3488,8 +3757,11 @@ def hello_caps(t):
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
                                                    "relay.call", "offer", "ask.touch",
-                                                   "shell.env", "call.stop", "cut", "uncut",
-                                                   "approve"]
+                                                   "ask.hold", "shell.env", "call.stop", "cut", "uncut",
+                                                   "approve", "endpoint.auth",
+                                                   "endpoint.logout", "term.open",
+                                                   "term.input", "term.resize",
+                                                   "term.ack", "term.close"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3499,9 +3771,12 @@ def hello_caps(t):
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
-                 "git", "answer.trust", "trash", "cut"} <= set(caps)
+                 "git", "answer.trust", "trash", "cut", "endpoint.auth",
+                 "endpoint.copilot", "term", "ask.hold"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
+        want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
+        t.check(hello.get("pty") == want, f"pty: {hello.get('pty')}")
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
         local = isinstance(t.host, LocalHost)
@@ -3869,27 +4144,28 @@ def deep_unicode(t):
 
 @scenario(bound=15)
 def steer_tool(t):
-    """A steer sent while a command runs answers an ask later in the same
-    step at once, by steer, rather than at its deadline."""
+    """A steer sent while a command runs does not answer an ask later in
+    the same step, which the user had not seen: the ask waits for its
+    answer, and the agent reads the steer after it."""
     h = t.headless()
     try:
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
         h.send("prompt", sid=sid, text="go")
         h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
-        t0 = time.monotonic()
         h.call("steer", sid=sid, text="no, put it in steered.txt")
         ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
-        t.check(ask["deadline"] - ask["ts"] < 100, f"no wait for an answer: {ask}")
+        t.check(ask["deadline"] - ask["ts"] > 1000, f"waits for an answer: {ask}")
+        time.sleep(1)
+        t.check(not h.all("answer", sid), f"still asking: {h.all('answer', sid)}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
         ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid)
-        waited = time.monotonic() - t0
-        t.check(ans["by"] == "steer" and ans["decision"] == "deny", f"answer {ans}")
-        t.check(waited < 5, f"answered right after the command: {waited:.1f} s")
+        t.check(ans["by"] == "user" and ans["decision"] == "allow", f"answer {ans}")
         end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
         t.check(end["why"] == "done", f"the turn goes on: {end}")
         st = [e["status"] for e in h.all("tool.end", sid)]
-        t.check(st == ["ok", "denied", "ok"], f"statuses {st}")
+        t.check(st == ["ok", "ok", "ok"], f"statuses {st}")
         t.check(t.file("steered.txt") == "no, put it in steered.txt\n", "the steer is acted on")
-        t.check(outside_file(t) is None, "nothing written outside")
+        t.check(outside_file(t) == "outside\n", f"the allowed write: {outside_file(t)!r}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -4189,6 +4465,88 @@ def compact_guard(t):
     t.check(not any(checkpointed(chat(x)) for x in reqs), "no request after it")
 
 
+def compact_unused(t, why, said, retries=0):
+    """A summary the turn ends on, never used: the history intact, and
+    the note saying why, after retries asking again."""
+    bigfiles(t, 8, 160)
+    r = t.run()
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and why in end.get("err", ""),
+            f"turn end: {end}")
+    notes = [n["text"] for n in r.all("note") if n.get("level") == "error"]
+    t.check(any(said in n and "not compacted" in n for n in notes),
+            f"explained: {[n['text'] for n in r.all('note')]}")
+    t.check(not r.all("compact") and len(r.all("retry")) == retries and
+            len(t.compactions()) == 1 + retries,
+            f"no summary, {retries} retries: {r.all('compact')} {r.all('retry')}")
+    t.check(not any(checkpointed(chat(x)) for x in t.requests()), "no checkpoint")
+    return r
+
+
+@scenario(conf=SMALL, bound=20, alone=True)
+def compact_echo(t):
+    """A summarizer that copies the conversation out, with none of the
+    sections it was asked for, ends the turn rather than replace the
+    history with that (issue #17)."""
+    compact_unused(t, "no Goal section", "no Goal")
+
+
+@scenario(conf=SMALL, bound=20, alone=True)
+def compact_long(t):
+    """A summary over its 16384 tokens, twice, ends the turn rather than be
+    cut to fit, which lost its sections, written last after copies of
+    messages as an instruction file asked (issue #17)."""
+    compact_unused(t, "summary was too long", "over the 16384", retries=1)
+    again = json.dumps(t.compactions()[1])
+    t.check("Your last summary" in again and "over the 16384" in again,
+            "asked again, told why")
+    t.check("Your last summary" not in json.dumps(t.compactions()[0]),
+            "not told at first")
+
+
+@scenario(conf=SMALL, bound=20, alone=True)
+def compact_shorter(t):
+    """A summary over its 16384 tokens is asked for again, told how long
+    it was and with fewer words, and the shorter one compacts (issue
+    #17): the turn carries on."""
+    bigfiles(t, 8, 160)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sums = r.all("compact")
+    t.check(sums and all(c["kind"] == "summary" for c in sums), f"compacted: {sums}")
+    rs = r.all("retry")
+    t.check(len(rs) == len(sums) and
+            all(x.get("compact") == 1 and "too long" in x.get("msg", "") for x in rs),
+            f"a retry for each: {rs}")
+    cs = t.compactions()
+    t.check(len(cs) == 2*len(sums), f"each asked twice: {len(cs)}")
+    words = [int(re.findall(r"under (\d+) words", json.dumps(c))[-1]) for c in cs]
+    t.check(all(words[i+1] < words[i] for i in range(0, len(words), 2)),
+            f"fewer words: {words}")
+    t.check(r.text().endswith("All files read."), f"text {r.text()!r}")
+
+
+@scenario(conf={"_listing": {"meta": {"n_ctx": 200000, "n_ctx_train": 262144}}},
+          bound=30, alone=True)
+def compact_prune_short(t):
+    """A prune that saves enough to count, but leaves the prompt well past
+    70% of the threshold, as when calls' arguments fill the context:
+    the summary follows it at once, rather than the next prune coming
+    soon and doing less."""
+    bigfiles(t, 60, 128)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    cps = [(c["kind"], c["before"], c["after"]) for c in r.all("compact")]
+    t.check(cps and cps[0][0] == "prune" and cps[0][2] > 119000,
+            f"a prune that leaves little room: {cps}")
+    t.check(len(cps) >= 2 and cps[1][0] == "summary" and cps[1][2] <= 136000,
+            f"then a summary: {cps}")
+    t.check(len(t.compactions()) == len([c for c in cps if c[0] == "summary"]),
+            f"summarized: {len(t.compactions())}")
+    t.check(r.text().endswith("Read them all."), f"text {r.text()!r}")
+
+
 @scenario(conf={"_listing": {"meta": {"n_ctx": 100000, "n_ctx_train": 262144}}},
           bound=20, alone=True)
 def compact_prune(t):
@@ -4311,6 +4669,52 @@ def template_variant(t):
     with fake_provider.STATE.lock:
         peak = fake_provider.STATE.peak.get("router1-tpl")
     t.check(peak == 1, f"one model at a time: {peak}")
+
+
+@scenario(conf={"_extra": (
+    "[model {model}]\n"
+    "effort = high\n"
+    "template.thinking = true\n"
+    "[model tmpl-{nonce}]\n"
+    "like = {model}\n"
+    "effort_as = template.reasoning_effort\n"
+    "effort_map = low:25 high:100\n"
+    "[model router-{nonce}]\n"
+    "like = {model}\n"
+    "effort = low\n"
+    "effort_as = reasoning.effort\n"
+    "[model said-{nonce}]\n"
+    "like = {model}\n"
+    "template.reasoning_effort = max\n")}, bound=20)
+def effort_chat(t):
+    """[model] effort on an OpenAI-compatible chat endpoint (#30): by
+    default the request's own reasoning_effort; with effort_as a template
+    argument, mapped by effort_map, or OpenRouter's reasoning.effort; and a
+    template.reasoning_effort set by hand wins."""
+    models = [t.model, f"tmpl-{t.nonce}", f"router-{t.nonce}", f"said-{t.nonce}"]
+    h = t.headless()
+    try:
+        for m in models:
+            sid = h.call("new", cwd=t.work, model=m, endpoint="fake")["sid"]
+            h.send("prompt", sid=sid, text="go")
+            end = h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "turn.end")
+            t.check(end["why"] == "done", f"{m}: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [x["body"] for x in t.requests()]
+    t.check(len(reqs) == 4, f"four requests: {len(reqs)}")
+    base, tmpl, router, said = reqs
+    t.check(base.get("reasoning_effort") == "high" and
+            base.get("chat_template_kwargs") == {"thinking": True}, f"by default: {base}")
+    t.check("reasoning_effort" not in tmpl and
+            tmpl.get("chat_template_kwargs") == {"thinking": True, "reasoning_effort": 100},
+            f"a template argument, mapped: {tmpl}")
+    t.check(router.get("reasoning") == {"effort": "low"} and "reasoning_effort" not in router,
+            f"OpenRouter's: {router}")
+    t.check("reasoning_effort" not in said and
+            said.get("chat_template_kwargs") == {"thinking": True, "reasoning_effort": "max"},
+            f"set by hand, it wins: {said}")
 
 
 MINUTE = {"PROSPERO_TEST_MINUTE_MS": "60"}  # a minute in 60 ms
@@ -4756,6 +5160,45 @@ def role_tools(t):
     t.check(report(ends[1]["text"]) == "Fast report.", f"fast {ends[1]}")
     t.check("No role is named \"nope\"" in ends[2]["text"] and "child" not in ends[2],
             f"nope {ends[2]}")
+
+
+PROMPTFILES = """[role filed]
+prompt = Inline first. INLINE-MARK
+prompt_file = roles/filed.md
+[role onlyfile]
+description = Has only a file
+prompt_file = ~/child.md
+"""
+
+
+@scenario(conf={"_extra": PROMPTFILES}, bound=20)
+def role_prompt_file(t):
+    """A role's prompt_file, relative to the configuration file or under
+    ~, follows its prompt in the system prompt, read as each session
+    starts, a subagent's too."""
+    t.host.mkdir(t.host.join(t.base, "roles"))
+    t.host.write(t.host.join(t.base, "roles", "filed.md"), "\nFrom the file. FILE-MARK\n")
+    t.host.write(t.host.join(t.home, "child.md"), "Child's own. CHILD-MARK\n")
+    r = t.run(extra=["-r", "filed"])
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    rec = r.all("session", own)[0]
+    t.check(rec["prompt"] == "Inline first. INLINE-MARK\n\nFrom the file. FILE-MARK",
+            f"record {rec}")
+    t.check(len(kids) == 1 and kids[0]["role"] == "onlyfile", f"kids {kids}")
+    sysps = [fake_provider.system_of(q["body"]) for q in t.requests()]
+    parent = [x for x in sysps if "# Your role: filed" in x]
+    child = [x for x in sysps if "# Your role: onlyfile" in x]
+    t.check(parent and "INLINE-MARK" in parent[0] and "FILE-MARK" in parent[0] and
+            parent[0].index("INLINE-MARK") < parent[0].index("FILE-MARK"), "parent's prompt")
+    t.check(child and "CHILD-MARK" in child[0], "child's prompt")
+
+    t.host.write(t.host.join(t.base, "roles", "filed.md"), "Changed. NEW-MARK")
+    r = t.run(extra=["-r", "filed"])
+    own, _ = r.sessions()
+    rec = r.all("session", own)[0]
+    t.check(rec["prompt"] == "Inline first. INLINE-MARK\n\nChanged. NEW-MARK",
+            f"read again {rec}")
 
 
 PARK = {"PROSPERO_TEST_MINUTE_MS": "20"}  # parked after 140 ms idle
@@ -6604,6 +7047,488 @@ def eval_own(t):
             and "[model" not in out, f"summary:\n{out}")
 
 
+# OpenAI's Responses API (kind responses), against the fake's Responses
+# mode, which refuses (400) any request the API would with nothing stored
+# and answers the scenarios' chunks as Responses events
+
+RS = {"kind": "responses"}
+
+
+def rsok(t, r):
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+
+
+def rsinput(req):
+    return req["body"]["input"]
+
+
+@scenario(conf=RS, bound=5)
+def rs_plain(t):
+    """A plain answer: instructions, the prompt as an input item, nothing
+    stored, reasoning's encrypted content asked for, the session as the
+    cache key, and the usage counted."""
+    r = t.run()
+    rsok(t, r)
+    t.seq(r, ["session", "user", "title", "turn", "attempt", "assistant", "turn.end"])
+    t.check(r.text() == "Hello! This is a plain answer.", f"text {r.text()!r}")
+    t.check(not r.all("retry"), "no retries")
+    reqs = t.requests()
+    t.check(len(reqs) == 1, f"one request: {len(reqs)}")
+    body = reqs[0]["body"]
+    t.check(body["input"] == [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "go"}]}], f"input {body['input']}")
+    t.check(body["instructions"].startswith("You are"), "the system prompt as instructions")
+    t.check(body["store"] is False and body["stream"] is True and
+            body["include"] == ["reasoning.encrypted_content"], "nothing stored")
+    t.check(body["prompt_cache_key"] == r.events[0].get("sid"), "the session as cache key")
+    t.check("messages" not in body and "stream_options" not in body, "no chat fields")
+    t.check(all(x["type"] == "function" and x["strict"] is False and "parameters" in x
+                for x in body["tools"]), "flat tools")
+    u = r.last("assistant").get("usage", {})
+    t.check(u.get("in") == 100 and u.get("out") == 10, f"usage {u}")
+
+
+@scenario(conf=RS, bound=10)
+def rs_read_edit_shell(t):
+    """Tools over the Responses API: calls and their outputs as items, and
+    each request's input extends the last one's."""
+    t.put("hello.txt", "hello world\n")
+    r = t.run()
+    rsok(t, r)
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "ok"],
+            f"statuses {[e['status'] for e in ends]}")
+    t.check(t.file("hello.txt") == "hello there\n", "the edit landed")
+    reqs = [rsinput(x) for x in t.requests()]
+    for a, b in zip(reqs, reqs[1:]):
+        t.check(b[:len(a)] == a, "each request extends the previous one")
+    last = reqs[-1]
+    t.check([x["type"] for x in last[1:3]] == ["function_call", "function_call_output"] and
+            last[1]["call_id"] == last[2]["call_id"], f"a call and its output: {last[1:3]}")
+
+
+@scenario(conf=RS, bound=10)
+def rs_reasoning(t):
+    """Reasoning streams as its summary, and goes back in the next request
+    with the encrypted content the server gave it, before its call."""
+    t.put("hello.txt", "hello world\n")
+    r = t.run()
+    rsok(t, r)
+    t.check(r.text() == "It says hello.", f"text {r.text()!r}")
+    first = r.all("assistant")[0]
+    t.check(any(b.get("t") == "think" and b.get("text") == "Plan: read it."
+                for b in first.get("blocks", [])), f"the reasoning kept: {first}")
+    second = rsinput(t.requests()[1])
+    kinds = [x["type"] for x in second]
+    t.check(kinds[:4] == ["message", "reasoning", "function_call", "function_call_output"],
+            f"items {kinds}")
+    rs = second[1]
+    t.check(rs.get("encrypted_content", "").startswith("enc_") and
+            rs.get("summary") == [{"type": "summary_text", "text": "Plan: read it."}],
+            f"reasoning back: {rs}")
+
+
+@scenario(conf=RS, bound=8)
+def rs_length_think(t):
+    """An incomplete response, stopped at max_output_tokens, is a length
+    stop."""
+    r = t.run()
+    rsok(t, r)
+    t.check([n["kind"] for n in r.all("nudge")] == ["length"], "a length nudge")
+    t.check(r.all("assistant")[0]["finish"] == "length", "the stop is recorded")
+
+
+@scenario(conf=RS, bound=8)
+def rs_midstream_error(t):
+    """A failed response mid-stream is retried."""
+    r = t.run()
+    rsok(t, r)
+    rt = r.last("retry")
+    t.check("Context size has been exceeded" in rt.get("msg", ""), f"retry {rt}")
+    t.check(r.text() == "Second try worked.", f"text {r.text()!r}")
+
+
+@scenario(conf=RS, bound=10)
+def rs_drop_args(t):
+    """A call cut off by a dropped connection runs once, as over Chat
+    Completions."""
+    r = t.run()
+    rsok(t, r)
+    t.check(t.file("count.txt") == "once\n", f"executed exactly once: {t.file('count.txt')!r}")
+    t.check(len(r.all("tool.start")) == 1, "one tool run")
+
+
+@scenario(conf=dict(SMALL, **RS), bound=25, alone=True)
+def rs_compaction(t):
+    """Compaction over the Responses API: the summarizer's request has
+    its system prompt as instructions and no tools, and the checkpoint
+    follows."""
+    bigfiles(t, 8, 150)
+    r = t.run()
+    rsok(t, r)
+    t.check(r.text() == "All files read.", f"text {r.text()!r}")
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0]["kind"] == "summary", f"one summary: {cps}")
+    sreq = t.compactions()
+    t.check(len(sreq) == 1, f"one summary request: {len(sreq)}")
+    body = sreq[0]["body"]
+    t.check("tools" not in body and body["instructions"].startswith("You summarize"),
+            f"the summarizer's request: {str(body)[:300]}")
+    t.check("[tool call: read]" in body["input"][0]["content"][0]["text"],
+            "the conversation to summarize")
+    after = [rsinput(x) for x in t.requests()]
+    t.check(any("<conversation-checkpoint>" in str(x[0]) for x in after),
+            "a request begins at the checkpoint")
+
+
+# ChatGPT (kind chatgpt): signed in through prospero endpoint auth
+# against the fake's issuer, and its Codex backend, which takes only
+# the tokens it gave
+
+CG = {"kind": "chatgpt", "_path": "chatgpt/backend-api/codex/responses"}
+
+
+def cgenv(t):
+    return {"PROSPERO_TEST_CHATGPT_AUTH": t.host.url + "/chatgpt"}
+
+
+def cgfiles(t):
+    d = os.path.join(t.state, "endpoints", "auth")
+    names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+    return [os.path.join(d, n) for n in names]
+
+
+def cgsignin(t):
+    """prospero endpoint auth fake, the browser's part done as a browser
+    would: the tokens kept."""
+    import urllib.request
+    p = t.host.popen(["endpoint", "auth", "fake", "--state", t.state, "-c", t.config],
+                     t.work, env=dict(t.tmpenv, **cgenv(t)))
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        out = []
+        for line in p.stdout:
+            out.append(line)
+            m = re.search(r"(https?://\S+/oauth/authorize\?\S+)", line)
+            if m:
+                urllib.request.urlopen(m.group(1), timeout=10).read()
+                break
+        rest, err = p.communicate()
+    finally:
+        killer.cancel()
+    out = "".join(out) + rest
+    t.check(p.returncode == 0 and "Signed in to fake." in out,
+            f"signed in: {p.returncode} {out} {err}")
+    files = cgfiles(t)
+    t.check(len(files) == 1, f"the tokens kept: {files}")
+    return files[0]
+
+
+def cgcalls(t):
+    """The scenario's model calls, refused or not."""
+    with fake_provider.STATE.lock:
+        return [e for e in fake_provider.STATE.cg["log"]
+                if "_call" in e and e.get("model") == t.model]
+
+
+def cgedit(path, **kv):
+    keep = json.loads(open(path).read())
+    keep.update(kv)
+    with open(path, "w") as f:
+        f.write(json.dumps(keep))
+    return keep
+
+
+@scenario(conf=CG, bound=30)
+def cg_signin(t):
+    """Signing in to ChatGPT for an endpoint: the Codex CLI's client and
+    flow with PKCE, the account read from the id_token, the tokens kept
+    privately; each request with the token, the account's id and the
+    Codex headers, and the backend's listing read; signed out, a turn
+    ends before any request, saying how to sign in."""
+    path = cgsignin(t)
+    if os.name != "nt":
+        mode = os.stat(path).st_mode & 0o777
+        t.check(mode == 0o600, f"privately: {oct(mode)}")
+    keep = json.loads(open(path).read())
+    t.check(keep.get("account_id") == "acct-fake" and keep.get("email") == "me@example.com" and
+            keep.get("plan") == "plus" and keep.get("refresh_token", "").startswith("rt-") and
+            keep.get("expires_at", 0) > time.time(), f"kept {keep}")
+    with fake_provider.STATE.lock:
+        auth = [e for e in fake_provider.STATE.cg["log"]
+                if e.get("_oauth") == "/chatgpt/oauth/authorize"]
+    t.check(auth and auth[-1].get("originator") == "prospero" and
+            auth[-1].get("redirect_uri", "").startswith("http://127.0.0.1:"),
+            f"authorized {auth[-1:]}")
+    r = t.run(env=cgenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    t.check(r.text() == "Hello! This is a plain answer.", f"text {r.text()!r}")
+    reqs = t.requests()
+    t.check(len(reqs) == 1, f"one request {len(reqs)}")
+    h = reqs[0]["headers"]
+    t.check(h.get("authorization") == "Bearer " + keep["access_token"] and
+            h.get("chatgpt-account-id") == "acct-fake" and
+            h.get("openai-beta") == "responses=experimental" and
+            h.get("originator") == "prospero" and
+            h.get("session_id") == r.events[0].get("sid"), f"headers {h}")
+    body = reqs[0]["body"]
+    t.check("max_output_tokens" not in body and "chat_template_kwargs" not in body and
+            body.get("store") is False, f"the Codex request {str(body)[:300]}")
+    with fake_provider.STATE.lock:
+        listed = [e for e in fake_provider.STATE.cg["log"] if "_models" in e]
+    t.check(listed and "client_version=" in listed[-1]["_models"] and
+            listed[-1]["auth"] is None, f"listed {listed[-1:]}")
+
+    rc, out, err = prun(t, ["endpoint", "logout", "fake", "--state", t.state, "-c", t.config],
+                        env=cgenv(t))
+    t.check(rc == 0 and "Signed out of fake." in out, f"signed out: {rc} {out} {err}")
+    t.check(not cgfiles(t), "forgotten")
+    n = len(cgcalls(t))
+    r = t.run(env=cgenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "not signed in to ChatGPT" in end.get("err", "") and
+            "prospero endpoint auth fake" in end.get("err", ""), f"ended {end}")
+    t.check(len(cgcalls(t)) == n, "no request made")
+
+
+@scenario(conf=CG, bound=30)
+def cg_refresh(t):
+    """An access token expired is refreshed before the request, and one
+    the backend refused (401) is refreshed and the request sent again at
+    no cost, once; the refresh tokens rotate, and the file keeps the
+    account a refresh did not name again."""
+    path = cgsignin(t)
+    first = cgedit(path, expires_at=int(time.time()) - 10)
+    r = t.run(env=cgenv(t))
+    t.check(r.rc == 0 and r.text() == "Hello! This is a plain answer.",
+            f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    t.check(not r.all("retry"), f"no retries {r.all('retry')}")
+    second = json.loads(open(path).read())
+    t.check(second["access_token"] != first["access_token"] and
+            second["refresh_token"] != first["refresh_token"] and
+            second.get("account_id") == "acct-fake" and second.get("email") == "me@example.com",
+            f"refreshed {second}")
+    with fake_provider.STATE.lock:
+        grants = [e for e in fake_provider.STATE.cg["log"]
+                  if e.get("refresh_token") == first["refresh_token"]]
+    t.check(len(grants) == 1 and grants[0].get("grant_type") == "refresh_token",
+            f"refreshed once with its refresh token: {grants}")
+    t.check(t.requests()[0]["headers"].get("authorization") == "Bearer " + second["access_token"],
+            "the new token sent")
+
+    fake_provider.cg_revoke(access=second["access_token"])
+    r = t.run(env=cgenv(t))
+    t.check(r.rc == 0 and r.text() == "Hello! This is a plain answer.",
+            f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    rt = r.all("retry")
+    t.check(len(rt) == 1 and "refreshed" in rt[0].get("msg", ""), f"one retry {rt}")
+    third = json.loads(open(path).read())
+    t.check(third["access_token"] != second["access_token"], "refreshed again")
+    calls = cgcalls(t)
+    t.check([c["auth"] is None for c in calls[-2:]] == [False, True], f"calls {calls[-2:]}")
+
+
+@scenario(conf=CG, bound=30)
+def cg_refused(t):
+    """A refresh the issuer refuses forgets the tokens, and the turn ends
+    saying to sign in again, with no model call made."""
+    path = cgsignin(t)
+    keep = cgedit(path, expires_at=int(time.time()) - 10)
+    fake_provider.cg_revoke(access=keep["access_token"], refresh=keep["refresh_token"])
+    n = len(cgcalls(t))
+    r = t.run(env=cgenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "sign in again" in end.get("err", "") and
+            "prospero endpoint auth fake" in end.get("err", ""), f"ended {end}")
+    t.check(not cgfiles(t), f"forgotten: {cgfiles(t)}")
+    t.check(len(cgcalls(t)) == n, "no model call")
+
+
+@scenario(conf=CG, bound=30)
+def cg_limit(t):
+    """ChatGPT's usage limit ends the turn at once, saying when it
+    resets, rather than waiting hours in slow retries."""
+    cgsignin(t)
+    r = t.run(env=cgenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "usage limit was reached" in end.get("err", "") and
+            "2 h 5 min" in end.get("err", ""), f"ended {end}")
+    t.check(len(t.requests()) == 1, f"one request {len(t.requests())}")
+
+
+# GitHub Copilot (kind copilot), against the fake's device flow and API
+
+CP = {"kind": "copilot", "_path": "copilot"}
+
+
+def cpenv(t):
+    return {"PROSPERO_TEST_COPILOT_AUTH": t.host.url + "/copilot-gh"}
+
+
+def cpsignin(t, ok=True):
+    """prospero endpoint auth fake, the code entered as a person would at
+    the page it names: its output, and the token file kept, if any."""
+    import urllib.request
+    p = t.host.popen(["endpoint", "auth", "fake", "--state", t.state, "-c", t.config],
+                     t.work, env=dict(t.tmpenv, **cpenv(t)))
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        out, url = [], None
+        for line in p.stdout:
+            out.append(line)
+            m = re.search(r"(https?://\S+/login/device)\s*$", line)
+            url = m.group(1) if m else url
+            m = re.search(r"^\s+(FAKE-\d+)\s*$", line)
+            if m and url:
+                urllib.request.urlopen(f"{url}?user_code={m.group(1)}", timeout=10).read()
+                break
+        rest, err = p.communicate()
+    finally:
+        killer.cancel()
+    out = "".join(out) + rest + err
+    files = cgfiles(t)
+    if ok:
+        t.check(p.returncode == 0 and "Signed in to fake." in out, f"signed in: {out}")
+        t.check(len(files) == 1, f"the token kept: {files}")
+    return out, files[0] if files else None
+
+
+def cplog(t, kind, model=None):
+    with fake_provider.STATE.lock:
+        return [e for e in fake_provider.STATE.cp["log"] if kind in e and
+                (model is None or e.get("model") == model)]
+
+
+@scenario(conf=CP, bound=40)
+def cp_signin(t):
+    """Signing in to GitHub Copilot for an endpoint: GitHub's device flow
+    as Prospero's own app, polled until the code is entered (slowing down
+    when told), the account asked about, and the token kept privately
+    with its login and the account's API; each request with the token,
+    the API's version, and who began it; the URL written is used, not
+    the account's API; signed out, a turn ends before any request."""
+    out, path = cpsignin(t)
+    t.check("visit this in any browser" in out and "FAKE-" in out, f"told {out}")
+    if os.name != "nt":
+        mode = os.stat(path).st_mode & 0o777
+        t.check(mode == 0o600, f"privately: {oct(mode)}")
+    keep = json.loads(open(path).read())
+    t.check(keep.get("login") == "me" and keep.get("plan") == "individual" and
+            keep.get("client_id") == fake_provider.CP_CLIENT and
+            keep.get("api") == "https://api.example.invalid" and
+            keep.get("access_token", "").startswith("gho_"), f"kept {keep}")
+    dc = keep["access_token"][4:]
+    dev = [e for e in cplog(t, "_device") if e.get("device_code") == dc]
+    polls = [e for e in cplog(t, "_poll") if e.get("device_code") == dc]
+    t.check(dev and dev[-1].get("client_id") == fake_provider.CP_CLIENT and
+            dev[-1].get("scope") == "read:user", f"asked {dev[-1:]}")
+    t.check(len(polls) >= 2, f"polled until entered: {len(polls)}")
+    users = cplog(t, "_user")
+    t.check(users and all(u.get("version") == "2025-04-01" for u in users),
+            f"the account {users[-1:]}")
+
+    r = t.run(env=cpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    t.check(r.text() == "Hello! This is a plain answer.", f"text {r.text()!r}")
+    calls = cplog(t, "_call", t.model)
+    t.check(len(calls) == 1 and calls[0]["_call"] == "/chat/completions",
+            f"one call, Chat Completions: {calls}")
+    h = calls[0]["headers"]
+    t.check(h.get("authorization") == "Bearer " + keep["access_token"] and
+            h.get("x-github-api-version") == "2026-08-01" and
+            h.get("openai-intent") == "conversation-edits" and
+            h.get("x-initiator") == "user" and
+            h.get("x-interaction-type") == "conversation-agent" and
+            h.get("x-interaction-id") == r.events[0].get("sid") and
+            "copilot-vision-request" not in h and
+            "copilot-integration-id" not in h, f"headers {h}")
+    listed = [e for e in cplog(t, "_models")
+              if e["headers"].get("Authorization") == "Bearer " + keep["access_token"]]
+    t.check(listed and listed[-1]["_models"] == fake_provider.CP_CLIENT, "listed, signed in")
+
+    rc, out, err = prun(t, ["endpoint", "logout", "fake", "--state", t.state, "-c", t.config],
+                        env=cpenv(t))
+    t.check(rc == 0 and "Signed out of fake." in out, f"signed out: {rc} {out} {err}")
+    t.check(not cgfiles(t), "forgotten")
+    r = t.run(env=cpenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "not signed in to GitHub Copilot" in end.get("err", "") and
+            "prospero endpoint auth fake" in end.get("err", ""), f"ended {end}")
+    t.check(len(cplog(t, "_call", t.model)) == 1, "no request made")
+
+
+@scenario(conf=CP, bound=40)
+def cp_wire(t):
+    """Each model in the format Copilot's listing says it takes: Messages
+    at /v1/messages, Responses at /responses, Chat Completions, and with
+    no endpoints listed, by its name; the steps after the first, a
+    tool's, are the agent's. Responses comes as Copilot sends it, each
+    event naming its item by a new id: each call runs once."""
+    cpsignin(t)
+    t.put("hello.txt", "hello world\n")
+    want = {"+msg": "/v1/messages", "+rs": "/responses", "+guess": "/chat/completions",
+            "": "/chat/completions"}
+    for suffix, path in want.items():
+        # Messages answered as Anthropic's API answers (an_tools')
+        model = (t.model.replace(":cp_wire:", ":cp_wire_an:") if suffix == "+msg"
+                 else t.model) + suffix
+        fake_provider.STATE.register(model)
+        r = t.run(env=cpenv(t), extra=["-m", model])
+        t.check(r.rc == 0, f"{suffix}: exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+        calls = cplog(t, "_call", model)
+        t.check(calls and all(c["_call"] == path for c in calls),
+                f"{suffix or 'chat'} at {path}: {[c['_call'] for c in calls]}")
+        inits = [c["headers"].get("x-initiator") for c in calls]
+        t.check(inits[:1] == ["user"] and all(i == "agent" for i in inits[1:]),
+                f"{suffix}: who began each: {inits}")
+        if suffix == "+msg":
+            t.check(all(c["headers"].get("anthropic-version") for c in calls),
+                    "Messages with its version")
+        t.check(t.file("hello.txt") == "hello there\n", f"{suffix}: the edit landed")
+        ends = [e["status"] for e in r.all("tool.end")]
+        t.check(ends == ["ok"] * 3, f"{suffix}: the calls, once each: {ends}")
+        t.put("hello.txt", "hello world\n")
+
+
+@scenario(conf=dict(CP, client_id=fake_provider.CP_UNLICENSED), bound=30)
+def cp_unlicensed(t):
+    """An account with no Copilot is not signed in: it is told to sign
+    up for Copilot Free."""
+    out, path = cpsignin(t, ok=False)
+    t.check("sign up for Copilot Free" in out and path is None, f"refused: {out} {path}")
+
+
+@scenario(conf=dict(CP, client_id=fake_provider.CP_OTHER, integration_id="some-chat"),
+          bound=30)
+def cp_clientid(t):
+    """[endpoint] client_id signs in as that client, and its token is
+    kept apart: without it, the endpoint is not signed in. [endpoint]
+    integration_id goes with each request, the listing's too."""
+    out, path = cpsignin(t)
+    keep = json.loads(open(path).read())
+    dev = [e for e in cplog(t, "_device")
+           if e.get("device_code") == keep.get("access_token", "")[4:]]
+    t.check(dev and dev[-1].get("client_id") == fake_provider.CP_OTHER, f"asked as {dev[-1:]}")
+    t.check(keep.get("client_id") == fake_provider.CP_OTHER, f"kept {keep}")
+    r = t.run(env=cpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    calls = cplog(t, "_call", t.model)
+    lists = [{k.lower(): v for k, v in e["headers"].items()} for e in cplog(t, "_models")
+             if e.get("_models") == fake_provider.CP_OTHER]
+    t.check(calls and lists and
+            all(c["headers"].get("copilot-integration-id") == "some-chat" for c in calls) and
+            all(h.get("copilot-integration-id") == "some-chat" for h in lists),
+            f"the integration named: {[c['headers'] for c in calls]} {lists}")
+    conf = t.host.read(t.config).replace(f"client_id = {fake_provider.CP_OTHER}\n", "")
+    t.host.write(t.config, conf)
+    r = t.run(env=cpenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "not signed in" in end.get("err", ""),
+            f"another client's token is not this one's: {end}")
+
+
 # M8: session operations, on a session open here, parked, closed, or
 # held by another process
 
@@ -6625,6 +7550,54 @@ def logged(t, sid):
 def ended(h, sid, turn):
     return h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
                   e.get("turn") == turn)
+
+
+def sidms(sid):
+    """When a session was made, as its id says: epoch ms, to the second."""
+    return calendar.timegm(time.strptime(sid[:15], "%Y%m%d-%H%M%S")) * 1000
+
+
+@scenario(bound=20)
+def sessions_lastact(t):
+    """The listing's lastact, a session's latest activity: its last
+    message, turn begun or turn ended, kept in its lastact sidecar as each
+    is logged, but not a rename or archiving. Never before the time in its
+    id, where a session with no turn starts, and a fork too, which copies
+    its original's records but not that sidecar."""
+    h = t.headless()
+    try:
+        old = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        new = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        en = listentry(h, new)
+        t.check(en and en.get("lastact") == sidms(new) and
+                sidecar(t, new, "lastact") is None, f"no turn yet, its making: {en}")
+
+        h.send("prompt", sid=old, text="slow")
+        turn = h.wait(lambda e: e.get("ev") == "turn" and e.get("sid") == old)
+        user = h.all("user", old)[-1]
+        en = listentry(h, old)
+        t.check(user["ts"] <= turn["ts"] and en.get("lastact") == turn["ts"],
+                f"its turn begun: {en.get('lastact')} {turn['ts']}")
+        end = ended(h, old, 1)
+        en = listentry(h, old)
+        t.check(en.get("lastact") == end["ts"] and sidecar(t, old, "lastact") == str(end["ts"]),
+                f"its turn ended: {en.get('lastact')} {end['ts']}")
+        t.check(en["lastact"] > listentry(h, new)["lastact"], "now after the newer one")
+
+        r = h.call("fork", sid=old)
+        t.check(r.get("ok") == 1, f"fork {r}")
+        en = listentry(h, r["sid"])
+        t.check(en and en.get("lastact") == sidms(r["sid"]) and
+                sidecar(t, r["sid"], "lastact") is None, f"a fork, its making: {en}")
+
+        t.check(h.call("rename", sid=old, title="Renamed").get("ok") == 1, "renamed")
+        t.check(h.call("archive", sid=old, on=1).get("ok") == 1, "archived")
+        en = listentry(h, old)
+        t.check(en.get("lastact") == end["ts"] and en.get("archived") == 1,
+                f"neither counts: {en}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 @scenario(bound=15)
@@ -6930,6 +7903,112 @@ def compact_manual(t):
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=SMALL, bound=40, alone=True)
+def compact_heed_now(t):
+    """A summary at the threshold, mid-turn and in Build mode: the step
+    right after it already has the notices of what it may have left out,
+    rather than learning them a step late."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    bigfiles(t, 8, 150)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first reads")
+        t.put("AGENTS.md", "Rule two, longer.\n")
+        t.host.touch(t.host.join(t.work, "AGENTS.md"), time.time() + 10)
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second reads")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [chat(x) for x in t.requests()]
+    # Where each summary begins: a checkpoint unlike the request before's
+    starts = [k for k in range(1, len(reqs)) if checkpointed(reqs[k]) and
+              (not checkpointed(reqs[k-1]) or reqs[k][1] != reqs[k-1][1])]
+    t.check(len(starts) >= 2, f"summarized in both turns: {starts}")
+    first = reqs[starts[-1]]
+    told = [str(m.get("content")) for m in first[2:] if m.get("role") == "user" and
+            str(m.get("content")).startswith("Your conversation was summarized")]
+    t.check(told and "Rule two, longer." in told[0],
+            f"told at once: {[str(m.get('content'))[:60] for m in first[2:]]}")
+
+
+@scenario(conf=BIG, bound=60, alone=True)
+def compact_heed(t):
+    """A summary may leave out the notices since the system prompt, so
+    the agent is told again what differs from it: a changed instruction
+    file, one loaded for a subdirectory, and its memory, saved by itself.
+    Against the prompt, so a session opened again and summarized again
+    is told again; the prompt stays as it was."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    t.host.mkdir(t.host.join(t.work, "sub"))
+    t.put("sub/AGENTS.md", "Sub rule.\n")
+    t.put("sub/x.txt", "x\n")
+    bigfiles(t, 8, 256)
+    line = f"- [style](style.md) {DASH} Tabs, not spaces"
+
+    def told(msgs):
+        """The notices after the summary's checkpoint, by their opening."""
+        return [str(m.get("content")) for m in msgs[2:] if m.get("role") == "user" and
+                str(m.get("content")).startswith("Your conversation was summarized")]
+
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 1)["why"] == "done", "the reads")
+        t.put("AGENTS.md", "Rule two, longer.\n")
+        t.host.touch(t.host.join(t.work, "AGENTS.md"), time.time() + 10)
+        h.send("prompt", sid=sid, text="again")
+        ended(h, sid, 2)
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "compact")
+        ended(h, sid, 3)
+        h.send("prompt", sid=sid, text="after")
+        ended(h, sid, 4)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [chat(x) for x in t.requests()]
+    system = reqs[0][0]["content"]
+    t.check(all(m[0]["content"] == system for m in reqs), "the system prompt stays")
+    t.check("Rule one." in system and "Sub rule." not in system and
+            system.endswith("MEMORY.md:\n\n(empty: no memories yet)"), "the prompt as it began")
+    last = reqs[-1]
+    t.check(checkpointed(last), "summarized")
+    notes = told(last)
+    t.check(len(notes) == 2, f"two notices: {notes}")
+    ins = [x for x in notes if "instructions you were given" in x]
+    t.check(ins and "AGENTS.md (new version)\n\nRule two, longer." in ins[0] and
+            "sub/AGENTS.md (for the files under sub)\n\nSub rule." in ins[0].replace("\\", "/")
+            and "Rule one." not in ins[0], f"the instructions: {ins}")
+    mem = [x for x in notes if "MEMORY.md now reads" in x]
+    t.check(mem and mem[0].endswith("MEMORY.md now reads:\n\n" + line), f"the memory: {mem}")
+
+    # Opened again: told nothing more until summarized again, then the same
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.send("prompt", sid=sid, text="read them")
+        ended(h, sid, 5)
+        n = len(t.requests())
+        t.check(len(told(chat(t.requests()[-1]))) == 2, "nothing new before")
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "compact again")
+        ended(h, sid, 6)
+        h.send("prompt", sid=sid, text="later")
+        ended(h, sid, 7)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    again = told(chat(t.requests()[-1]))
+    t.check(len(t.requests()) > n and len(again) == 2 and
+            sorted(x.split(".")[0] for x in again) == sorted(x.split(".")[0] for x in notes),
+            f"told again: {again}")
+    t.check([x for x in again if "MEMORY.md now reads" in x][0].endswith(line), "the same memory")
 
 
 @scenario(conf=BIG, bound=25, alone=True)
@@ -8817,6 +9896,63 @@ def attach_text(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=15)
+def attach_path(t):
+    """upload {kind:"file", path}: a file in the session's working
+    directory attached where it is, as a frontend on another machine asks
+    for an '@' mention's: a text file kept as one uploaded is, an image as
+    one, the reply saying which. A binary file is refused as an upload's
+    is; so is a path outside the working directory, by '..', an absolute
+    path, or a link, and a session that is not open."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("files.path" in caps, f"caps: {caps}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        t.host.mkdir(t.host.join(t.work, "notes"))
+        t.host.write(t.host.join(t.work, "notes", "a b.txt"), "one\ntwo\n")
+        r = h.call("upload", kind="file", sid=sid, path="notes/a b.txt")
+        t.check(r.get("ok") == 1 and r.get("kind") == "file" and
+                r.get("name") == "files/1-a_b.txt" and r.get("bytes") == 8 and
+                r.get("lines") == 2, f"a text file: {r}")
+        kept = t.host.join(t.state, "sessions", sid, "files", "1-a_b.txt")
+        t.check(t.host.read(kept) == "one\ntwo\n", "kept as it is")
+        t.host.write(t.host.join(t.work, "pic.png"), PNG)
+        r2 = h.call("upload", kind="file", sid=sid, path="pic.png")
+        t.check(r2.get("ok") == 1 and r2.get("kind") == "image" and
+                r2.get("name") == "img/1.png" and (r2.get("w"), r2.get("h")) == (3, 2),
+                f"an image: {r2}")
+        r3 = h.call("prompt", sid=sid, text="@notes/a b.txt @pic.png", files=[r["name"]],
+                    images=[r2["name"]])
+        t.check(r3.get("ok") == 1, f"prompt: {r3}")
+        ended(h, sid, 1)
+
+        def refused(r, err):
+            t.check(r.get("ok") == 0 and r.get("err", "").startswith(err), f"{err}: {r}")
+
+        t.host.write(t.host.join(t.work, "x.bin"), b"\x7fELF\x00\x01")
+        refused(h.call("upload", kind="file", sid=sid, path="x.bin"),
+                "x.bin is a binary file (6 bytes), so it is not attached")
+        outside = "no such file in the session's working directory"
+        t.host.write(t.host.join(t.state, "secret.txt"), "no\n")
+        refused(h.call("upload", kind="file", sid=sid, path="../state/secret.txt"), outside)
+        refused(h.call("upload", kind="file", sid=sid, path="..\\state\\secret.txt"), outside)
+        refused(h.call("upload", kind="file", sid=sid,
+                       path=t.host.join(t.state, "secret.txt")), outside)
+        refused(h.call("upload", kind="file", sid=sid, path="missing.txt"), outside)
+        if isinstance(t.host, LocalHost) and os.name != "nt":
+            os.symlink(t.host.join(t.state, "secret.txt"), t.host.join(t.work, "link.txt"))
+            refused(h.call("upload", kind="file", sid=sid, path="link.txt"), outside)
+        refused(h.call("upload", kind="image", sid=sid, path="pic.png"),
+                "a path is attached with kind \"file\"")
+        refused(h.call("upload", kind="file", sid="20200101-000000-none", path="pic.png"),
+                "no such session open")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=20)
 def attach_text_long(t):
     """A long file is cut as read cuts it, with where it goes on; the
@@ -8880,6 +10016,64 @@ def attach_text_replay(t):
         t.check(r.get("ok") == 1, f"imported: {r}")
         users = [e for e in logged(t, imp) if e["ev"] == "user"]
         t.check(users and not any("files" in e for e in users), f"stripped: {users}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def mention_sessions(t):
+    """prompt {sessions: [sid]}: the sessions a message mentions by an
+    '@' token, each a line before its text in requests, giving the id
+    send_message takes. The user record keeps each with its title; one
+    unknown, repeated or in the Trash is left out, the message going on.
+    Opened again, the line is in requests still; an import drops them."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("sessions.mention" in caps, f"caps: {caps}")
+        other = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.call("prompt", sid=other, text="Fix the parser")
+        ended(h, other, 1)
+        gone = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        t.check(h.call("trash", sid=gone).get("ok") == 1, "trashed")
+        h.call("list")
+        entry = [s for s in h.all("sessions")[-1]["list"] if s["sid"] == other]
+        title = entry[0].get("title", "") if entry else ""
+        t.check(title, f"its title: {entry}")
+
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        text = f'Please message @"{title}" about it'
+        r = h.call("prompt", sid=sid, text=text,
+                   sessions=[other, "20200101-000000-none", other, gone])
+        t.check(r.get("ok") == 1, f"prompt: {r}")
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check(user["text"] == text and
+                user.get("sessions") == [{"sid": other, "title": title}],
+                f"the user record: {user}")
+        line = f'[The user mentioned session {other} ("{title}"): send_message'
+        said = fake_provider.user_text_all(t.requests()[-1]["body"])
+        t.check(line in said and said.index(line) < said.index(text),
+                f"the request: {said[:400]}")
+        t.check(lastsaid(h, sid) == "1 sessions mentioned.", f"said: {lastsaid(h, sid)}")
+    finally:
+        h.close()
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.call("prompt", sid=sid, text="again")
+        ended(h, sid, 2)
+        said = fake_provider.user_text_all(t.requests()[-1]["body"])
+        t.check(line in said, f"replayed: {said[:400]}")
+
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        r = importlog(t, h, raw, model=t.model, endpoint="fake")
+        imp = r.get("sid")
+        t.check(r.get("ok") == 1, f"imported: {r}")
+        users = [e for e in logged(t, imp) if e["ev"] == "user"]
+        t.check(users and not any("sessions" in e for e in users), f"stripped: {users}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -9034,11 +10228,41 @@ def plan_reopen(t):
     t.check((t.host.read(ask.get("path", "")) or "").startswith("# Plan"), "the plan stays")
 
 
+@scenario(bound=15, posix=True)
+def plan_scratch(t):
+    """Plan mode lets the file tools write the session's scratch files, as
+    its rules say, but not through a link there that leads into the
+    working directory, nor in the working directory itself."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        scratch = logged(t, sid)[0]["scratch"]
+        os.makedirs(scratch, exist_ok=True)
+        os.symlink(t.work, os.path.join(scratch, "link"))
+        h.send("prompt", sid=sid, text="plan it")
+        ended(h, sid, 1)
+        ends = h.all("tool.end", sid)
+        st = [e["status"] for e in ends]
+        t.check(st == ["ok", "denied", "denied"], f"statuses {st}: {ends}")
+        t.check(t.host.read(os.path.join(scratch, "notes.txt")) == "notes\n", "the notes")
+        t.check(t.file("escape.txt") is None and t.file("inside.txt") is None,
+                "nothing in the working directory")
+        t.check("your scratch files" in ends[2].get("text", ""), f"why: {ends[2]}")
+        told = [str(m.get("content")) for m in t.requests()[0]["body"]["messages"]
+                if str(m.get("content", "")).startswith("Plan mode is on")]
+        t.check(told and scratch in told[0], f"the rules name it: {told}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=15)
 def plan_mode(t):
     """The mode command: on and off again before a prompt, which tells the
     agent nothing; on, then refused while the plan is asked about; a steer
-    instead of an answer keeps plan mode; off while idle, told."""
+    waits for the answer, keep planning, and is read after it; off while
+    idle, told."""
     h = t.headless()
     try:
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
@@ -9062,9 +10286,12 @@ def plan_mode(t):
         r = h.call("mode", sid=sid, mode="default")
         t.check(r.get("ok") == 0 and "answer" in r.get("err", ""), f"refused: {r}")
         h.call("steer", sid=sid, text="Stop.")
+        time.sleep(1)
+        t.check(not h.all("answer", sid), f"still asking: {h.all('answer', sid)}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
         ended(h, sid, 2)
         ans = h.all("answer", sid)[-1]
-        t.check(ans["by"] == "steer", f"answered by the steer: {ans}")
+        t.check(ans["by"] == "user", f"answered by the user: {ans}")
         t.check(lastsaid(h, sid) == "Stopped.", f"said {lastsaid(h, sid)}")
         t.check(modes(h, sid)[-1] == "plan/user", "still planning")
 
@@ -9171,7 +10398,7 @@ def plan_enter(t):
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
         h.send("prompt", sid=sid, text="Plan first.")
         ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
-        t.check(ask["kind"] == "plan.enter" and 29000 <= ask["deadline"] - ask["ts"] <= 31000,
+        t.check(ask["kind"] == "plan.enter" and 59000 <= ask["deadline"] - ask["ts"] <= 61000,
                 f"the ask: {ask}")
         h.call("answer", sid=sid, req=ask["req"], decision="allow")
         plan = planask(h, sid)
@@ -9927,6 +11154,50 @@ def question_timeout(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={"_guard": {"question_timeout": 0}}, bound=10)
+def question_wait(t):
+    """question_timeout = 0: outside plan mode too, the questions wait
+    with no deadline until answered."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        t.check(ask["deadline"] == 0, f"no deadline: {ask}")
+        h.call("ask.touch", sid=sid, req=ask["req"])
+        time.sleep(2)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        t.check(not [e for e in logged(t, sid) if e["ev"] == "ask.deadline"],
+                "no deadline logged")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        end = ended(h, sid, 1)
+        t.check(h.all("answer", sid)[-1]["by"] == "user", f"answered: {h.all('answer', sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"question_timeout": 2}}, bound=15)
+def question_hold(t):
+    """ask.hold on the agent's questions: no deadline from then on, even
+    as the user works on them; they wait until answered."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        t.check(ask["deadline"] > 0, f"a deadline first: {ask}")
+        r = h.call("ask.hold", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"held: {r}")
+        h.call("ask.touch", sid=sid, req=ask["req"])
+        time.sleep(3)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e["deadline"] for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check(dls == [0], f"logged as none, once: {dls}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 1)
+        t.check(h.all("answer", sid)[-1]["by"] == "user", f"answered: {h.all('answer', sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf={"_guard": {"question_timeout": 3}}, bound=15)
 def question_touch(t):
     """ask.touch, as the user works on the answers, starts the questions'
@@ -10607,6 +11878,209 @@ def mcp_project_config(t):
     t.check("mcp__fake__echo" in names, f"the configuration's server {names}")
 
 
+@scenario(conf=mcpconf(trust="yes"), bound=30)
+def mcp_identity(t):
+    """A session's MCP tool holds to the server it came from: the
+    configuration's "fake" gone, a project's "fake" by the same name
+    does not take its calls, its trust or its grants."""
+    servers = {"fake": {"command": sys.executable, "args": [FAKE_MCP],
+                        "env": {"FAKE_MCP_WORD": "project"}}}
+    t.put(".mcp.json", json.dumps({"mcpServers": servers}))
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        t.check(not h.all("ask", sid), f"the configuration's, trusted: {h.all('ask', sid)}")
+        t.check([e["status"] for e in h.all("tool.end", sid)] == ["ok"], "echo ran")
+
+        r = h.call("config.set", kind="mcp", name="fake", delete=1)
+        t.check(r.get("ok") == 1, f"deleted {r}")
+        h.send("prompt", sid=sid, text="again")
+        ask = nextask(h, sid)
+        t.check(ask["kind"] == "mcp.project", f"the project's server asks to start: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn ends")
+        end = h.all("tool.end", sid)[-1]
+        t.check(end["status"] == "denied" and "not the one this tool came from" in end["text"],
+                f"refused {end}")
+        t.check([c["name"] for c in mcpcalls(t)] == ["echo"], f"calls {mcpcalls(t)}")
+        rec = [e for e in logged(t, sid) if e["ev"] == "prefix" and e.get("mcp")]
+        t.check(rec and all(x.get("origin") == "config" for x in rec[-1]["mcp"]),
+                f"origins logged {rec[-1:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_mcp proj": {"tools": "-where", "trust": "yes",
+                               "header.X-Mine": "env:MINE"}}, bound=30)
+def mcp_overlay(t):
+    """A section with no command or url adjusts a project's server of its
+    name rather than hiding it: its tools apply, its trust and headers
+    never do (a warning says so), and enabled = no leaves the server
+    out, never asked about."""
+    mcpproject(t)
+    env = mcpenv(t, MCP_WORD="w", MINE="secret-mine")
+    h = t.headless(env=env)
+    try:
+        cfg = h.call("config.get")
+        diags = [d["message"] for d in cfg.get("diags", [])]
+        t.check(any("never get trust" in d for d in diags) and
+                any("never get header.X-Mine" in d for d in diags) and
+                not any("neither a command nor a url" in d for d in diags), f"diags {diags}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = nextask(h, sid)
+        t.check(ask["kind"] == "mcp.project", f"the project's server asks: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        call = nextask(h, sid, ask["seq"])
+        t.check(call["kind"] == "mcp" and call["server"] == "proj",
+                f"its call asks, the section's trust not given: {call}")
+        h.call("answer", sid=sid, req=call["req"], decision="allow")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+        names = [x for x in fake_provider.tool_names(t.requests()[-1]["body"])
+                 if x.startswith("mcp__")]
+        t.check("mcp__proj__echo" in names and "mcp__proj__where" not in names,
+                f"the section's tools apply: {names}")
+        t.check("secret-mine" not in t.host.read(t.mcplog), "the section's header not sent")
+
+        r = h.call("config.set", kind="mcp", name="proj", key="enabled", value="no")
+        t.check(r.get("ok") == 1, f"disabled {r}")
+        n = len(t.requests())
+        s2 = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=s2, text="go")
+        t.check(ended(h, s2, 1)["why"] == "done", "a later session's turn ends")
+        t.check(not h.all("ask", s2), f"nothing asked: {h.all('ask', s2)}")
+        names = fake_provider.tool_names(t.requests()[n]["body"])
+        t.check(not [x for x in names if x.startswith("mcp__")], f"none offered {names}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=mcpconf(trust="yes", tools="echo"), bound=30)
+def mcp_untick(t):
+    """A tools key read as it is now: a tool turned off mid-session stays
+    declared, but its calls are refused, trusted or not; one turned on
+    joins the session at its next request, which is told."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        first = [q["body"] for q in t.requests()][0]
+        names = [x for x in fake_provider.tool_names(first) if x.startswith("mcp__")]
+        t.check(names == ["mcp__fake__echo"], f"only echo at first: {names}")
+
+        r = h.call("config.set", kind="mcp", name="fake", key="tools", value="-echo")
+        t.check(r.get("ok") == 1, f"set {r}")
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="again")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn ends")
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["ok", "denied"] and
+                "turned off in the settings" in ends[1]["text"], f"refused {ends}")
+        t.check([c["name"] for c in mcpcalls(t)] == ["echo"], f"calls {mcpcalls(t)}")
+        body = t.requests()[n]["body"]
+        names = fake_provider.tool_names(body)
+        t.check("mcp__fake__echo" in names and "mcp__fake__image" in names,
+                f"echo still declared, image joined: {names}")
+        told = json.dumps(body["messages"])
+        t.check("New tools from MCP servers are available now" in told and
+                "mcp__fake__image" in told, "told of the new tools")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+EXTRA_TOOLS = [
+    {"name": "a.b", "description": "Dotted.", "inputSchema": {"type": "object"}},
+    {"name": "a_b", "description": "Taken.", "inputSchema": {"type": "object"}},
+    {"name": "odd name", "description": "Line one\x1b[31m red\nline two",
+     "inputSchema": {"type": "object"}},
+]
+
+
+@scenario(conf=mcpconf(tools="-where, -big"), bound=30)
+def mcp_toollist(t):
+    """mcp {name, tools, start}: a server of the configuration started by
+    no session, its every tool listed with whether sessions get it,
+    which tools may be named in its tools key, and which name another
+    has taken; the list kept once it stops, as last listed. A section
+    that defines no server, one turned off, and an unknown name are not
+    started, and say why."""
+    env = mcpenv(t, FAKE_MCP_EXTRA=json.dumps(EXTRA_TOOLS))
+    addconf(t, "[mcp proj]\ntools = -x\n[mcp off]\ncommand = nothing-at-all\nenabled = no\n")
+    h = t.headless(env=dict(env, PROSPERO_TEST_MINUTE_MS="300"))
+    try:
+        r = h.call("mcp", name="fake", tools=1, start=1)
+        t.check(r.get("ok") == 1 and "why" not in r, f"started {r}")
+        srv = r["servers"][0]
+        t.check(srv["state"] == "starting" and "toollist" not in srv, f"no list yet {srv}")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            srv = h.call("mcp", name="fake", tools=1)["servers"][0]
+            if srv["state"] != "starting":
+                break
+            time.sleep(0.1)
+        t.check(srv["state"] == "ready" and srv["listed"] == 12 and srv["kept"] == 10 and
+                srv["tools"] == 10, f"ready {srv}")
+        tl = {x["tool"]: x for x in srv["toollist"]}
+        t.check([x["tool"] for x in srv["toollist"]][:3] == ["echo", "image", "big"],
+                "in the server's order")
+        t.check(tl["echo"]["kept"] == 1 and tl["echo"]["ro"] == 1 and
+                tl["echo"]["params"] == "text: string" and tl["echo"]["offered"] == 1,
+                f"echo {tl['echo']}")
+        t.check(tl["where"]["kept"] == 0 and tl["where"]["offered"] == 0, f"where {tl['where']}")
+        t.check(tl["a_b"]["offered"] == 0 and tl["a_b"]["why"] == "its name is taken by a.b",
+                f"a_b {tl['a_b']}")
+        t.check(tl["odd name"]["filterable"] == 0 and tl["a.b"]["filterable"] == 1,
+                "filterable names")
+        t.check(not any(s["source"] == "project" for s in r["servers"]), "no project rows")
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            srv = h.call("mcp", name="fake")["servers"][0]
+            if srv["state"] == "stopped":
+                break
+            time.sleep(0.2)
+        t.check(srv["state"] == "stopped" and srv.get("aslisted") == 1 and
+                srv["listed"] == 12 and srv["tools"] == 0, f"stopped, as last listed {srv}")
+        srv = h.call("mcp", name="fake", tools=1)["servers"][0]
+        t.check(len(srv.get("toollist", [])) == 12, "its list still")
+
+        for name, why in (("proj", "defines no server"), ("off", "turned off"),
+                          ("nope", "defines no server")):
+            r = h.call("mcp", name=name, tools=1, start=1)
+            t.check(why in r.get("why", ""), f"{name}: {r}")
+        r = h.call("mcp", name="proj")
+        t.check(r["servers"] == [{"name": "proj", "source": "overlay"}], f"overlay {r}")
+        starts = [m for m in mcplog(t) if m.get("method") == "initialize"]
+        t.check(len(starts) == 1, f"started once: {len(starts)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    # The command line: the same, for a terminal, escapes taken out
+    rc, out, err = prun(t, ["mcp", "tools", "fake", "--state", t.state, "-c", t.config],
+                        env=env)
+    lines = out.splitlines()
+    t.check(rc == 0 and lines[0] == "fake: 10 of 12 tools offered", f"cli {rc} {out!r} {err!r}")
+    t.check(any(x.startswith("  [x] echo") and "read-only  Repeat the text." in x
+                for x in lines) and any(x.startswith("  [ ] where") for x in lines) and
+            any(x.startswith("  [!] a_b") and "taken by a.b" in x for x in lines),
+            f"rows {lines}")
+    t.check("\x1b" not in out and "line two" not in out and "Line one [31m red" in out,
+            f"escapes and later lines out: {out!r}")
+    rc, out, err = prun(t, ["mcp", "tools", "proj", "--state", t.state, "-c", t.config])
+    t.check(rc == 0 and "settings for projects' servers" in out, f"overlay {rc} {out} {err}")
+    rc, out, err = prun(t, ["mcp", "tools", "off", "--state", t.state, "-c", t.config])
+    t.check(rc == 1 and "turned off" in err, f"off {rc} {out} {err}")
+    rc, out, err = prun(t, ["mcp", "list", "--state", t.state, "-c", t.config])
+    t.check("proj: settings for projects' servers of that name" in out, f"list {out}")
+
+
 class McpHttpServer:
     """tests/fake_mcp.py --http, run for a scenario, logging to t.mcplog."""
 
@@ -10871,6 +12345,41 @@ def mcp_oauth_client(t):
             tok[0].get("redirect_uri") == redirect, "the token request")
 
 
+@scenario(bound=40)
+def mcp_overlay_auth(t):
+    """Signing in to a project's HTTP server that a section of the same
+    name adjusts registers a client of its own: the section's client_id
+    and client_secret are never sent to a url the project chose."""
+    env = mcpenv(t, WEB_SECRET="sh!")
+    client = {"client_id": "pre-1", "client_secret": "sh!",
+              "redirect_uris": ["http://127.0.0.1:9/callback"]}
+    srv = McpHttpServer(t, oauth=True, FAKE_MCP_CLIENT=json.dumps(client))
+    try:
+        t.put(".mcp.json", json.dumps({"mcpServers": {"docs": {"type": "http",
+                                                               "url": srv.url}}}))
+        addconf(t, "[mcp docs]\ntools = -where\nclient_id = pre-1\n"
+                   "client_secret = env:WEB_SECRET\n")
+        h = t.headless(env=env)
+        try:
+            sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+            h.send("prompt", sid=sid, text="go")
+            ask = nextask(h, sid)
+            h.call("answer", sid=sid, req=ask["req"], decision="allow")
+            ended(h, sid, 1)
+            r = h.call("mcp.auth", name="docs", redirect="http://127.0.0.1:9/callback")
+            t.check(r.get("ok") == 1 and "pre-1" not in json.dumps(r), f"auth {r}")
+        finally:
+            rc = h.close()
+        t.check(rc == 0, f"headless exit {rc}")
+    finally:
+        srv.close()
+    log = mcplog(t)
+    oauth = [m["_oauth"] for m in log if "_oauth" in m]
+    t.check("/as/register" in oauth, f"a client of its own registered: {oauth}")
+    t.check(not any(m.get("client_secret") == "sh!" or m.get("client_id") == "pre-1"
+                    for m in log), "the section's client never sent")
+
+
 @scenario(bound=30)
 def mcp_oauth_name(t):
     """A client_name of the section's own, registered under in place of
@@ -11104,6 +12613,45 @@ def mcp_project_http(t):
             "the file's header")
 
 
+@scenario(bound=40)
+def mcp_http_two(t):
+    """Two projects' HTTP servers of one name, at two urls, never share
+    one connection: each session's call goes to its own project's."""
+    env = mcpenv(t)
+    a = McpHttpServer(t, FAKE_MCP_WORD="first")
+    b = McpHttpServer(t, FAKE_MCP_WORD="second")
+    try:
+        dirs = []
+        for k, srv in (("one", a), ("two", b)):
+            d = t.host.join(t.work, k)
+            t.host.mkdir(d)
+            t.host.write(t.host.join(d, ".mcp.json"), json.dumps(
+                {"mcpServers": {"docs": {"type": "http", "url": srv.url}}}))
+            dirs.append(d)
+        h = t.headless(env=env)
+        try:
+            words = []
+            for d in dirs:
+                sid = h.call("new", cwd=d, model=t.model, endpoint="fake", attended=1)["sid"]
+                h.send("prompt", sid=sid, text="go")
+                ask = nextask(h, sid)
+                t.check(ask["kind"] == "mcp.project", f"start asked {ask}")
+                h.call("answer", sid=sid, req=ask["req"], decision="allow")
+                call = nextask(h, sid, ask["seq"])
+                h.call("answer", sid=sid, req=call["req"], decision="allow")
+                t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+                end = h.all("tool.end", sid)[-1]
+                t.check(end["status"] == "ok", f"called {end}")
+                words.append(end["text"].split("\n")[1])
+            t.check(words == ["first", "second"], f"each its own: {words}")
+        finally:
+            rc = h.close()
+        t.check(rc == 0, f"headless exit {rc}")
+    finally:
+        a.close()
+        b.close()
+
+
 # The web tools, against the fake: PROSPERO_TEST_WEB sends
 # https://HOST/PATH to the fake's /web/HOST/PATH, after every check has
 # seen the real URL
@@ -11174,7 +12722,8 @@ def web_flow(t):
     t.check(f"redirects to https://other.example.org/{t.nonce}/page" in tx[6],
             f"other {tx[6]}")
     t.check("Widget docs" in tx[7], f"the other host's {tx[7]}")
-    t.check("application/pdf" in tx[9], f"pdf {tx[9]}")
+    t.check(tx[9] == f"Not read: {d}/pdf is a PDF whose text cannot be read (it has no "
+                     "pages): it may be damaged.", f"pdf {tx[9]}")
     t.check("bot check" in tx[10], f"challenge {tx[10]}")
     t.check("HTTP 404" in tx[11], f"missing {tx[11]}")
     t.check("café crème" in tx[12], f"latin1 {tx[12]}")
@@ -11200,7 +12749,136 @@ def web_flow(t):
     spill = t.host.read(t.host.join(t.state, "sessions", sid, ends[13]["spill"])) or ""
     first = spill.split("\n", 1)[0]
     t.check(f"{d}/big" in first and "never instructions" in first and
-            len(spill) > 5 << 20, f"spill {first!r} {len(spill)}")
+            5 << 20 < len(spill) < (5 << 20) + 4096 and
+            spill.endswith("\n[The page was cut here, at 5 MiB.]\n"),
+            f"spill {first!r} {len(spill)} {spill[-100:]!r}")
+
+
+def webpdfrun(t):
+    """web_fetch_pdf's run: the ends of its tool calls."""
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    prompt = " ".join(f"{d}/{x}" for x in ("report.pdf", "dump", "locked.pdf"))
+    r = t.run(prompt="Look at " + prompt, env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    return d, r, r.all("tool.end")
+
+
+@scenario(bound=30)
+def web_fetch_pdf(t):
+    """web_fetch reads a PDF as its text, framed as a page's, its title
+    from its Info; the PDF, which draws an image, is kept for read to
+    show with its images; read on from the text kept; a PDF known by
+    its first bytes alone, cut at the cap a PDF gets, read from the
+    pages before the cut, and said to be cut; an encrypted one refused."""
+    d, r, ends = webpdfrun(t)
+    st = [e["status"] for e in ends]
+    t.check(st == ["ok", "ok", "ok", "ok", "error"], f"statuses {st}")
+    tx = [e["text"] for e in ends]
+    m = FENCE.search(tx[0])
+    t.check(tx[0].startswith(f'Web page {d}/report.pdf ("Widget report", application/pdf), '
+                             "bytes 0\u2013139 of 139.") and m and
+            m.group(2) == "[title: Widget report]\n--- page 1 ---\nWidget report\n\n"
+                          "Widgets turn at 42 rpm.\n[image 1: 100x50 RGB]\n--- page 2 ---\n"
+                          "Second page: the totals.", f"report {tx[0]!r}")
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    kept = t.host.join(sdir, "out", ends[0]["call"] + ".pdf")
+    t.check(tx[0].endswith(f"--- end web content {m.group(1)} ---\n\nThe PDF is kept at "
+                           f"{kept}: read shows it with its images."), f"kept {tx[0]!r}")
+    body = fake_provider.mkpdfpages(
+        [(["Widget report", "Widgets turn at 42 rpm."], ["Im1"]),
+         (["Second page: the totals."], [])],
+        {"Im1": fake_provider.pdfrgb(100, 50, (200, 30, 30))}, title="Widget report")
+    t.check(t.host.read(kept) == body.decode("utf-8", "replace"), "the PDF kept as it came")
+    t.check(tx[1].startswith(f"{kept}: a PDF, 2 pages, its text extracted, with the image "
+                             "on these pages after it:\n") and
+            ends[1].get("images") == [{"name": f"out/{ends[1]['call']}-1.png",
+                                       "mime": "image/png", "w": 100, "h": 50,
+                                       "label": "image 1 (page 1)"}], f"read {ends[1]}")
+    t.check(tx[2].startswith(f'Web page {d}/report.pdf ("Widget report", application/pdf), '
+                             "bytes 10\u2013139 of 139.") and "kept at" not in tx[2] and
+            len(webreqs(t, "/report.pdf")) == 1, f"read on {tx[2]!r}")
+    m = FENCE.search(tx[3])
+    t.check(tx[3].startswith(f"Web page {d}/dump (application/pdf), ") and m and
+            re.fullmatch(r"--- page 1 ---\nBefore the cut\.\n\n\[The PDF was cut at "
+                         r"(8|32) MiB; only the text before that could be read\.\]",
+                         m.group(2)) and
+            "kept at" not in tx[3], f"cut {tx[3]!r}")
+    t.check(tx[4] == f"Not read: {d}/locked.pdf is a PDF, encrypted, which web_fetch "
+                     "cannot read.", f"locked {tx[4]}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=30)
+def web_fetch_pdf_blind(t):
+    """To a model that takes no images, web_fetch gives a PDF's text,
+    its image lines with it, and keeps no PDF to read."""
+    d, r, ends = webpdfrun(t)
+    st = [e["status"] for e in ends]
+    t.check(st == ["ok"], f"statuses {st}")  # then nothing to read
+    t.check("[image 1: 100x50 RGB]" in ends[0]["text"] and
+            "kept at" not in ends[0]["text"] and
+            ends[0]["text"].endswith("\n\n[This model takes no images: each [image ...] "
+                                     "line stands for a picture that is not shown.]"),
+            f"report {ends[0]['text']!r}")
+    sid = r.sessions()[0]
+    kept = t.host.join(t.state, "sessions", sid, "out", ends[0]["call"] + ".pdf")
+    t.check(t.host.read(kept) is None, "no PDF kept")
+
+
+def webpdfmore(t):
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    names = ("htmlpdf", "mention", "mid.pdf", "blank.pdf", "scan.pdf")
+    r = t.run(prompt="Look at " + " ".join(f"{d}/{x}" for x in names), env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok"] * 5,
+            f"statuses {[(e['status'], e['text'][:200]) for e in ends]}")
+    return d, r, ends, [e["text"] for e in ends]
+
+
+@scenario(bound=30)
+def web_fetch_pdf_more(t):
+    """web_fetch of PDFs, more cases: a page sent as a PDF, and text that
+    mentions "%PDF-" sent as octet-stream, are shown as what they are; a
+    PDF past a page's 5 MiB is read whole, within a PDF's cap; one whose
+    words are shapes is kept, for the shell to render its pages."""
+    d, r, ends, tx = webpdfmore(t)
+    m = FENCE.search(tx[0])
+    t.check(m and "Sign in to read the report." in m.group(2) and "<p>" not in m.group(2),
+            f"the page {tx[0]!r}")
+    m = FENCE.search(tx[1])
+    t.check(m and m.group(2).strip() == "Every PDF begins with %PDF-1.7 and a comment.",
+            f"the text {tx[1]!r}")
+    m = FENCE.search(tx[2])
+    t.check(m and m.group(2) == "--- page 1 ---\nBefore the pad.\n--- page 2 ---\n"
+                                "After the pad.", f"mid.pdf {tx[2][-400:]!r}")
+    sdir = t.host.join(t.state, "sessions", r.sessions()[0])
+    kept = t.host.join(sdir, "out", ends[3]["call"] + ".pdf")
+    t.check(tx[3].endswith(f"\n\nThe PDF is kept at {kept}.\n[No text could be extracted: "
+                           "its words may be drawn as shapes. The shell may render its pages "
+                           "as images (pdftoppm -png -r 100), which read then shows you.]") and
+            t.host.read(kept) is not None, f"blank.pdf {tx[3][-400:]!r}")
+    t.check(tx[4].endswith(": read shows it with its images."), f"scan.pdf {tx[4][-300:]!r}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=30)
+def web_fetch_pdf_more_blind(t):
+    """To a model that takes no images, web_fetch gives read's notes: a
+    scan's pages pointing to OCR, a PDF of shapes to rendering and OCR."""
+    d, r, ends, tx = webpdfmore(t)
+    sdir = t.host.join(t.state, "sessions", r.sessions()[0])
+    kept = t.host.join(sdir, "out", ends[3]["call"] + ".pdf")
+    t.check(tx[3].endswith(f"\n\nThe PDF is kept at {kept}.\n[No text could be extracted: "
+                           "its words may be drawn as shapes. The shell may render its pages "
+                           "as images (pdftoppm -png -r 100) and OCR them (tesseract).]"),
+            f"blank.pdf {tx[3][-400:]!r}")
+    kept = t.host.join(sdir, "out", ends[4]["call"] + ".pdf")
+    t.check(tx[4].endswith(f"\n\nThe PDF is kept at {kept}.\n[Its pages hold no text, only "
+                           "images (a scan), which this model cannot see. The shell may OCR "
+                           "them: pdfimages or pdftoppm, then tesseract.]"),
+            f"scan.pdf {tx[4][-400:]!r}")
 
 
 @scenario(bound=30)
@@ -11304,6 +12982,57 @@ def web_exa(t):
     exa = webreqs(t, "/mcp")
     t.check(len(exa) == 2 and all(f"exaApiKey={key}" in w["query"] for w in exa),
             f"the key sent {[w['query'] for w in exa]}")
+    sid, _ = r.sessions()
+    events = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl")) or ""
+    t.check(key not in json.dumps(r.events) and key not in r.stderr and key not in events,
+            "the key in no record")
+
+
+def web_keenable_check(t, r):
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error", "ok"],
+            f"statuses {[(e['status'], e['text'][:80]) for e in ends]}")
+    t.check(f"https://forum.example.org/{t.nonce}/next" in ends[0]["text"] and
+            "42 rpm" in ends[0]["text"] and "asked about widgets" in ends[0]["text"] and
+            "from Keenable" in ends[0]["text"], f"results {ends[0]['text']}")
+    t.check("Widget docs" in ends[1]["text"], f"retried {ends[1]['text']}")
+    t.check("HTTP 403: Query blocked by policy" in ends[2]["text"],
+            f"refused {ends[2]['text']}")
+    reqs = webreqs(t, "/search") + webreqs(t, "/search/public")
+    busy = [w for w in reqs if "busy" in w["body"]]
+    t.check(len(busy) == 2, f"the 429 retried once: {len(busy)}")
+    t.check(all(w["method"] == "POST" and
+                w["headers"].get("X-Keenable-Title") == "prospero" and
+                json.loads(w["body"])["max_results"] == 8 for w in reqs),
+            f"the requests {[(w['path'], w['headers'], w['body']) for w in reqs]}")
+    return reqs
+
+
+@scenario(bound=15)
+def web_keenable(t):
+    """Keenable without a key: its public endpoint, named by the title
+    header, a 429 retried once, and a refusal's message reported."""
+    webconf(t, search="keenable", url=None, ask="false")
+    r = t.run(env=webenv(t))
+    reqs = web_keenable_check(t, r)
+    t.check(len(reqs) == 4 and all(w["path"].endswith("/search/public") and
+                                   "X-API-Key" not in w["headers"] for w in reqs),
+            f"keyless {[(w['path'], w['headers']) for w in reqs]}")
+
+
+@scenario(bound=15)
+def web_keenable_key(t):
+    """Keenable with [web] key: the keyed endpoint, the key in a header,
+    never in the URL, and in no record the harness writes."""
+    key = "keen-key-71c0aa"
+    webconf(t, search="keenable", url=None, key="env:KEENABLE_TEST_KEY", ask="false")
+    r = t.run(env=webenv(t, KEENABLE_TEST_KEY=key))
+    reqs = web_keenable_check(t, r)
+    t.check(len(reqs) == 4 and all(w["path"].endswith("/v1/search") and
+                                   w["headers"].get("X-API-Key") == key and
+                                   key not in w["path"] + w["query"] for w in reqs),
+            f"keyed {[(w['path'], w['headers']) for w in reqs]}")
     sid, _ = r.sessions()
     events = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl")) or ""
     t.check(key not in json.dumps(r.events) and key not in r.stderr and key not in events,
@@ -12271,6 +14000,913 @@ def read_image_blind(t):
     desc = [x["function"]["description"] for x in reqs[0]["tools"]
             if x["function"]["name"] == "read"][0]
     t.check("image" not in desc, f"read's description: {desc}")
+
+
+
+# A tool result's several images (a PDF's, read shows them so): no tool
+# makes them yet, so a read image's record is rewritten to have them,
+# as tool.end would write it, and the session resumed
+
+TOOLJPEG = b"\xff\xd8\xff\xe0" + b"not decoded, only sniffed"
+
+
+def toolimageset(t, r, label=True):
+    """Rewrite the read image's tool.end in r's session as a set of two:
+    the PNG it showed and a JPEG beside it. The session's id and the
+    call's."""
+    sid = r.sessions()[0]
+    d = t.host.join(t.state, "sessions", sid)
+    end = r.all("tool.end")[0]
+    png = end["image"]
+    t.host.write(t.host.join(d, "out", "set-1.jpg"), TOOLJPEG)
+    first = {"name": png, "mime": "image/png", "w": end["width"], "h": end["height"]}
+    second = {"name": "out/set-1.jpg", "mime": "image/jpeg", "w": 2, "h": 3}
+    if label:
+        first["label"] = "image 1 (page 1)"
+        second["label"] = "image 4 (page 3)"
+    log = t.host.read(t.host.join(d, "events.jsonl"))
+    out = []
+    for line in log.splitlines():
+        rec = json.loads(line)
+        if rec.get("ev") == "tool.end" and rec.get("call") == end["call"]:
+            rec["images"] = [first, second]
+            line = json.dumps(rec)
+        out.append(line)
+    t.host.write(t.host.join(d, "events.jsonl"), "\n".join(out) + "\n")
+    return sid, end["call"]
+
+
+def toolimagedata(url):
+    return base64.b64decode(url.split(",", 1)[1])
+
+
+@scenario(conf={"_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
+def tool_images(t):
+    """A tool result's several images, replayed from its record (images):
+    each sent after the run of results, after a caption naming it and its
+    call, with its own mime; then left out together, with one text in
+    their place, once [desktop] images has newer ones to keep."""
+    readimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sid, call = toolimageset(t, r)
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resumed: exit {r2.rc}: {r2.stderr}")
+    imgs = fake_provider.desk_images(t.requests()[-1]["body"])
+    t.check([lab for lab, _ in imgs] == [f"Image 1 (page 1) from tool call {call}:",
+                                         f"Image 4 (page 3) from tool call {call}:"],
+            f"captioned {imgs}")
+    t.check(imgs[0][1].startswith("data:image/png;base64,") and
+            pngdims(toolimagedata(imgs[0][1])) == (1, 1), f"the PNG {imgs[0][1][:40]}")
+    t.check(imgs[1][1].startswith("data:image/jpeg;base64,") and
+            toolimagedata(imgs[1][1]) == TOOLJPEG, f"the JPEG {imgs[1][1][:40]}")
+
+    # Newer images: with [desktop] images = 1, the set leaves whole
+    t.host.write(t.config, t.host.read(t.config) + "[desktop]\nimages = 1\nimages_slack = 0\n")
+    r3 = t.run("more", resume=sid)
+    t.check(r3.rc == 0, f"more: exit {r3.rc}: {r3.stderr}")
+    last = t.requests()[-1]["body"]
+    imgs = fake_provider.desk_images(last)
+    alts = [p["text"] for m in last["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[PDF images")]
+    t.check(len(imgs) == 1 and "Image" not in imgs[0][0], f"only the newer shown {imgs}")
+    t.check(alts == [f"[PDF images omitted: {call}; read the file again to see them]"],
+            f"the set stands in: {alts}")
+
+
+@scenario(conf={**AN, "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
+def an_tool_images(t):
+    """On kind anthropic, a tool result's several images go inside its
+    tool_result, each after a caption, as the API takes them."""
+    readimages(t)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    sid, call = toolimageset(t, r, label=False)
+    r2 = t.run("again", resume=sid, env=ANENV)
+    anok(t, r2)
+    res = an_result(t.requests()[-1]["body"], 0)
+    t.check([c["type"] for c in res] == ["text", "text", "image", "text", "image"],
+            f"in the result {[c['type'] for c in res]}")
+    t.check([res[1]["text"], res[3]["text"]] == [f"Image 1 from tool call {call}:",
+                                                 f"Image 2 from tool call {call}:"],
+            f"numbered by place {res[1]} {res[3]}")
+    t.check(res[2]["source"]["media_type"] == "image/png" and
+            res[4]["source"]["media_type"] == "image/jpeg" and
+            base64.b64decode(res[4]["source"]["data"]) == TOOLJPEG, "their mimes")
+    t.check(not r2.all("retry"), "the API took them")
+
+
+@scenario(conf={**RS, "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
+def rs_tool_images(t):
+    """On the Responses API, a tool result's several images go in a user
+    message after the run of outputs, each after a caption."""
+    readimages(t)
+    r = t.run()
+    rsok(t, r)
+    sid, call = toolimageset(t, r)
+    r2 = t.run("again", resume=sid)
+    rsok(t, r2)
+    msgs = [x for x in rsinput(t.requests()[-1])
+            if x.get("type") == "message" and x.get("role") == "user" and
+            any(c["type"] == "input_image" for c in x["content"])]
+    t.check(len(msgs) == 1, f"one message of images {msgs}")
+    parts = msgs[0]["content"]
+    t.check([c["type"] for c in parts] == ["input_text", "input_image"] * 2, f"parts {parts}")
+    t.check(parts[2]["text"] == f"Image 4 (page 3) from tool call {call}:" and
+            parts[3]["image_url"].startswith("data:image/jpeg;base64,"), f"the JPEG {parts[2:]}")
+    t.check(not r2.all("retry"), "the API took them")
+
+def mkpdf(pages, encrypt=False):
+    """A PDF of so many pages, each with a line of text, as bytes: its
+    trailer naming an /Encrypt dictionary if encrypt."""
+    return fake_provider.mkpdf(pages, encrypt).encode()
+
+
+mkpdfpages = fake_provider.mkpdfpages
+pdfrgb = fake_provider.pdfrgb
+
+
+PDFJPEG = flatjpeg(40, 30)
+
+
+def imgpdf():
+    """img.pdf's bytes (pdfimages)."""
+    im1 = pdfrgb(100, 50, (200, 30, 30))
+    im2 = (f"/Width 40 /Height 30 /ColorSpace /DeviceGray /BitsPerComponent 8 "
+           f"/Filter /DCTDecode", PDFJPEG)
+    return mkpdfpages(
+        [(["A red chart:"], ["Im1"]),
+         (["The chart again, and a photo:"], ["Im1", "Im2"]),
+         (["No pictures here."], [])], {"Im1": im1, "Im2": im2})
+
+
+def pdfimages(t):
+    """The work directory's PDFs with images: img.pdf, a 100x50 deflated
+    image on pages 1 and 2 and a 40x30 JPEG on page 2; many.pdf, ten
+    images, one a page; scan.pdf, two pages each only an image; and
+    blank.pdf, two pages with nothing on them."""
+    t.host.write(t.host.join(t.work, "img.pdf"), imgpdf())
+    many = {f"I{i}": pdfrgb(30, 30, (i*20, 100, 50)) for i in range(10)}
+    t.host.write(t.host.join(t.work, "many.pdf"), mkpdfpages(
+        [([f"Picture {i}:"], [f"I{i}"]) for i in range(10)], many))
+    t.host.write(t.host.join(t.work, "scan.pdf"), mkpdfpages(
+        [([], ["S"]), ([], ["S"])], {"S": pdfrgb(60, 80, (240, 240, 240))}))
+    t.host.write(t.host.join(t.work, "blank.pdf"), mkpdfpages([([], []), ([], [])]))
+
+
+IMGPDF = ("img.pdf: a PDF, 3 pages, its text extracted, with the 2 images on these "
+          "pages after it:\n"
+          "     1\t--- page 1 ---\n     2\tA red chart:\n     3\t[image 1: 100x50 RGB]\n"
+          "     4\t--- page 2 ---\n     5\tThe chart again, and a photo:\n"
+          "     6\t[image 1: 100x50 RGB]\n     7\t[image 2: 40x30 JPEG]\n"
+          "     8\t--- page 3 ---\n     9\tNo pictures here.\n")
+
+
+def an_result(body, i):
+    """The content of the i-th tool result in a Messages API request."""
+    rs = [b for m in body["messages"] if m["role"] == "user" and isinstance(m["content"], list)
+          for b in m["content"] if b.get("type") == "tool_result"]
+    return rs[i]["content"]
+
+
+@scenario(conf={**AN, "_extra": "[desktop]\nimages = 1\nimages_slack = 0\n"}, bound=20)
+def an_read_pdf(t):
+    """read sends a PDF to a model on kind anthropic as a document block in
+    its tool result, kept among the session's files, and left out of
+    later requests as a read image is ([desktop] images); one encrypted,
+    or over the pages half the window holds (50 of the fake's 200000
+    tokens), is refused, pointing to the shell. A resumed session's
+    request carries the PDF still shown."""
+    three = mkpdf(3)
+    t.host.write(t.host.join(t.work, "three.pdf"), three)
+    t.host.write(t.host.join(t.work, "two.pdf"), mkpdf(2))
+    t.host.write(t.host.join(t.work, "locked.pdf"), mkpdf(1, encrypt=True))
+    t.host.write(t.host.join(t.work, "long.pdf"), mkpdf(51))
+    r = t.run(env=ANENV)
+    anok(t, r)
+    ends = r.all("tool.end")
+    texts = [e["text"] for e in ends]
+    t.check(texts[0] == "three.pdf: a PDF, 3 pages, 2 KiB, shown to you as a document: its "
+                       "text and an image of each page." and
+            ends[0].get("pages") == 3 and ends[0]["pdf"].endswith(".pdf") and
+            "image" not in ends[0], f"the first {ends[0]}")
+    t.check(texts[1].startswith("two.pdf: a PDF, 2 pages") and ends[1].get("pages") == 2,
+            f"the second {ends[1]}")
+    t.check(ends[2]["status"] == "error" and "encrypted" in texts[2] and
+            "pdftotext" in texts[2] and "pdf" not in ends[2], f"locked {ends[2]}")
+    t.check(ends[3]["status"] == "ok" and
+            texts[3].startswith("long.pdf: a PDF, 51 pages, its text extracted, as more "
+                                "than the 50 pages that can be sent as a document:\n"
+                                "     1\t--- page 1 ---\n") and
+            "pdf" not in ends[3], f"long {ends[3]}")
+    sid = r.sessions()[0]
+    kept = t.host.read(t.host.join(t.state, "sessions", sid, ends[0]["pdf"]))
+    t.check(kept == three.decode(), "kept as read")
+
+    reqs = [q["body"] for q in t.requests()]
+    desc = [x["description"] for x in reqs[0]["tools"] if x["name"] == "read"][0]
+    t.check("a PDF as a document" in desc, f"read says so: {desc}")
+    first = an_result(reqs[1], 0)
+    t.check([c["type"] for c in first] == ["text", "document"] and
+            first[1]["source"]["media_type"] == "application/pdf" and
+            base64.b64decode(first[1]["source"]["data"]) == three, f"sent {first[:1]}")
+    last = reqs[-1]
+    calls = [b["id"] for m in last["messages"] if m["role"] == "assistant"
+             for b in m["content"] if b["type"] == "tool_use"]
+    old = an_result(last, 0)
+    t.check([c["type"] for c in old] == ["text", "text"] and
+            old[1]["text"] == f"[PDF omitted: {calls[0]}; read the file again to see it]",
+            f"the first leaves {old}")
+    t.check([c["type"] for c in an_result(last, 1)] == ["text", "document"], "the second stays")
+
+    r2 = t.run("again", resume=sid, env=ANENV)
+    anok(t, r2)
+    again = t.requests()[-1]["body"]
+    t.check([c["type"] for c in an_result(again, 1)] == ["text", "document"] and
+            [c["type"] for c in an_result(again, 0)] == ["text", "text"], "resumed as it was")
+
+
+@scenario(conf={**AN, "_extra": "[desktop]\nimages = 3\n"}, bound=15)
+def an_read_pdf_room(t):
+    """A request has room for 50 pages of PDFs, half the fake's window: of
+    two of 30 pages, the older leaves the request once the newer is
+    read, with a text saying why in its place."""
+    t.host.write(t.host.join(t.work, "thirty.pdf"), mkpdf(30))
+    t.host.write(t.host.join(t.work, "thirty2.pdf"), mkpdf(30))
+    r = t.run(env=ANENV)
+    anok(t, r)
+    last = t.requests()[-1]["body"]
+    old = an_result(last, 0)
+    t.check([c["type"] for c in old] == ["text", "text"] and
+            old[1]["text"].startswith("[PDF omitted: ") and
+            "for room in the request" in old[1]["text"], f"the older leaves {old}")
+    t.check([c["type"] for c in an_result(last, 1)] == ["text", "document"], "the newer stays")
+    t.check(not r.all("retry"), "the API took every request")
+
+
+@scenario(conf=AN, bound=15)
+def an_read_pdf_bad(t):
+    """A PDF the API refuses though it counts its pages (damaged) is not
+    sent again, the step retried at once with a text saying why in its
+    place, so the session goes on rather than failing every request."""
+    pdf = mkpdf(2).replace(b"%%EOF", b"garbage")
+    t.host.write(t.host.join(t.work, "broken.pdf"), pdf)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.check(r.all("tool.end")[0].get("pages") == 2, "sent as a PDF")
+    retries = r.all("retry")
+    t.check(len(retries) == 1 and "not valid" in retries[0].get("err", json.dumps(retries[0])),
+            f"one retry {retries}")
+    reqs = [q["body"] for q in t.requests()]
+    t.check(len(reqs) == 3, f"the refused request and its retry: {len(reqs)}")
+    res = an_result(reqs[-1], 0)
+    t.check([c["type"] for c in res] == ["text", "text"] and
+            res[1]["text"].startswith("[PDF omitted: ") and
+            "which the API refused: " in res[1]["text"] and
+            "The PDF specified was not valid." in res[1]["text"], f"in its place {res}")
+    t.check(r.text().endswith("It was damaged."), f"answered {r.text()!r}")
+
+
+@scenario(conf=AN, bound=15)
+def an_read_pdf_damaged(t):
+    """On kind anthropic, a PDF that loads only by repair, which the API
+    may refuse as invalid, has its text extracted instead, the head
+    saying why: one with junk before its header, one whose page tree
+    counts pages it lacks, and one cut short before its xref."""
+    good = mkpdf(2)
+    t.host.write(t.host.join(t.work, "junk.pdf"), b"junk\n" + good)
+    t.host.write(t.host.join(t.work, "count.pdf"), good.replace(b"/Count 2", b"/Count 9"))
+    t.host.write(t.host.join(t.work, "cut.pdf"), good[:good.index(b"xref")])
+    r = t.run(env=ANENV)
+    anok(t, r)
+    ends = r.all("tool.end")
+    for e, name in zip(ends, ["junk.pdf", "count.pdf", "cut.pdf"]):
+        t.check(e["status"] == "ok" and "pdf" not in e and
+                e["text"].startswith(f"{name}: a PDF, ") and
+                ", its text extracted, as it is damaged, and may be refused as a "
+                "document" in e["text"].split("\n")[0] and
+                "\t--- page 2 ---\n" in e["text"] and "Page 2" in e["text"],
+                f"{name} {e}")
+    t.check(len(ends) == 3 and not r.all("retry"), "the API took every request")
+
+
+@scenario(conf=AN, bound=30)
+def an_read_pdf_edge(t):
+    """On kind anthropic, a PDF of exactly the 50 pages a request has room
+    for goes as a document; one whose pages cannot be counted, or over
+    the 16 MiB a document may be, has its text extracted, the head saying
+    why."""
+    t.host.write(t.host.join(t.work, "fifty.pdf"), mkpdf(50))
+    nocount = mkpdf(2)
+    for s in (b"/Type /Pages ", b"/Type /Page ", b" /Count 2"):
+        nocount = nocount.replace(s, b" " * len(s))
+    t.host.write(t.host.join(t.work, "nocount.pdf"), nocount)
+    t.host.write(t.host.join(t.work, "huge.pdf"),
+                 mkpdfpages([(["Before the pad."], []), (["After it."], [])], pad=17 << 20))
+    r = t.run(json.dumps([["read", {"path": p}] for p in
+                          ("fifty.pdf", "nocount.pdf", "huge.pdf")]), env=ANENV)
+    anok(t, r)
+    ends = r.all("tool.end")
+    t.check(ends[0].get("pages") == 50 and "shown to you as a document" in ends[0]["text"],
+            f"fifty {ends[0]}")
+    t.check(ends[1]["text"] == "nocount.pdf: a PDF, 2 pages, its text extracted, as its "
+                               "pages cannot be counted to send it as a document:\n"
+                               "     1\t--- page 1 ---\n     2\tPage 1\n"
+                               "     3\t--- page 2 ---\n     4\tPage 2\n" and
+            "pdf" not in ends[1], f"nocount {ends[1]}")
+    t.check(ends[2]["text"].startswith("huge.pdf: a PDF, 2 pages, its text extracted, as "
+                                       "it is over the 16 MiB that can be sent as a "
+                                       "document:\n     1\t--- page 1 ---\n") and
+            "pdf" not in ends[2], f"huge {ends[2]['text'][:300]!r}")
+
+
+@scenario(conf={**AN, "_extra": "[model {model}]\nimage_edge = 1000\n"}, bound=60)
+def an_read_pdf_reqbytes(t):
+    """A request carries at most 20 MiB of PDFs and PDF images together,
+    within the API's 32 MB of base64: a 14 MiB document read after seven
+    images of 1 MB each leaves room for the document alone, the images
+    left out with a text in their place."""
+    big = padjpeg(flatjpeg(700, 700), 1_000_000)
+    imgs = {f"J{i}": ("/Width 700 /Height 700 /ColorSpace /DeviceGray /BitsPerComponent 8 "
+                      "/Filter /DCTDecode", big) for i in range(7)}
+    pages = [([f"Photo {i}:"], [f"J{i}"] if i < 7 else []) for i in range(51)]
+    t.host.write(t.host.join(t.work, "pics.pdf"), mkpdfpages(pages, imgs))
+    t.host.write(t.host.join(t.work, "doc.pdf"),
+                 mkpdfpages([(["Before the pad."], []), (["After it."], [])], pad=14 << 20))
+    r = t.run(json.dumps([["read", {"path": "pics.pdf"}], ["read", {"path": "doc.pdf"}]]),
+              env=ANENV)
+    ends = r.all("tool.end")
+    t.check(len(ends) == 2 and len(ends[0].get("images", [])) == 7 and
+            ends[1].get("pages") == 2, f"seven images, then a document {ends}")
+    bodies = [q["body"] for q in t.requests()]
+    t.check(r.rc == 0 and len(bodies) >= 3, f"exit {r.rc}, requests {len(bodies)}")
+    first = an_result(bodies[1], 0)
+    t.check([c["type"] for c in first].count("image") == 7, "the images sent at first")
+    last = bodies[2]
+    pics = an_result(last, 0)
+    t.check("image" not in [c["type"] for c in pics] and
+            any(c["type"] == "text" and c["text"].startswith("[PDF images omitted: ")
+                for c in pics), f"the images left out {[c['type'] for c in pics]}")
+    t.check([c["type"] for c in an_result(last, 1)] == ["text", "document"],
+            "the document stays")
+
+
+def readdesc(req):
+    """read's description in a Chat Completions request."""
+    return [x["function"]["description"] for x in req["tools"]
+            if x["function"]["name"] == "read"][0]
+
+
+@scenario(bound=15)
+def read_pdf_text(t):
+    """A model not on kind anthropic is shown a PDF's text, extracted, a
+    line starting each page, numbered as read numbers a text file's, and
+    read's description says so."""
+    t.host.write(t.host.join(t.work, "three.pdf"), mkpdf(3))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "ok" and "pdf" not in end and "images" not in end and
+            end["text"] == "three.pdf: a PDF, 3 pages, its text extracted:\n"
+                           "     1\t--- page 1 ---\n     2\tPage 1\n"
+                           "     3\t--- page 2 ---\n     4\tPage 2\n"
+                           "     5\t--- page 3 ---\n     6\tPage 3\n", f"shown {end}")
+    desc = readdesc(t.requests()[0]["body"])
+    t.check("a PDF as its text, a '--- page N ---' line starting each page, with the "
+            "images on its pages shown" in desc, f"read's description: {desc}")
+    t.check(not fake_provider.desk_images(t.requests()[-1]["body"]), "no images")
+
+
+@scenario(bound=15)
+def read_pdf_paging(t):
+    """A PDF's text is read on as a text file's lines are (offset, limit):
+    a window short of the whole keeps the whole text in the session's
+    out/CALL.txt, said in the result, which reading on reuses while the
+    file is unchanged; once it changes, it is read again."""
+    t.host.write(t.host.join(t.work, "thirty.pdf"), mkpdf(30))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    texts = [e["text"] for e in ends]
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    kept = t.host.join(sdir, "out", ends[0]["call"] + ".txt")
+    t.check(texts[0] == "thirty.pdf: a PDF, 30 pages, its text extracted:\n"
+                       "     1\t--- page 1 ---\n     2\tPage 1\n     3\t--- page 2 ---\n"
+                       "     4\tPage 2\n     5\t--- page 3 ---\n"
+                       "[Showing lines 1-5 of 60. To read more, call read with offset=6.]\n"
+                       f"[The whole text is kept at {kept}.]\n", f"the first {texts[0]!r}")
+    whole = "".join(f"--- page {i} ---\nPage {i}\n" for i in range(1, 31))
+    t.check(t.host.read(kept) == whole, "the whole text kept")
+    t.check(texts[1].startswith("thirty.pdf: a PDF, 30 pages, its text extracted:\n"
+                                "     6\tPage 3\n     7\t--- page 4 ---\n") and
+            texts[1].endswith("[Showing lines 6-10 of 60. To read more, call read with "
+                              f"offset=11.]\n[The whole text is kept at {kept}.]\n"),
+            f"read on, from the text kept {texts[1]!r}")
+    t.check(t.host.read(t.host.join(sdir, "out", ends[1]["call"] + ".txt")) is None,
+            "kept once")
+    t.check(ends[2]["status"] == "ok", f"rewritten {ends[2]}")
+    t.check(texts[3] == "thirty.pdf: a PDF, 31 pages, its text extracted:\n"
+                       "    61\t--- page 31 ---\n    62\tPage 31\n", f"read anew {texts[3]!r}")
+
+
+READPDFIMG = "[model {model}]\nimage_edge = 64\n"
+
+
+@scenario(conf={"_extra": READPDFIMG}, bound=20)
+def read_pdf_images(t):
+    """To a model that takes images, read shows the images a PDF's window
+    of text draws, each once, at most 8, the window cut before the 9th:
+    kept as out/CALL-N.png (or .jpg, a JPEG passed through), named in the
+    record (images) with their labels, sent after the results, each after
+    a caption naming it, its page and its call; left out together as
+    newer images come ([desktop] images); a resumed session's request
+    carries them as they were."""
+    pdfimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    c0, c1 = ends[0]["call"], ends[1]["call"]
+    t.check(ends[0]["text"] == IMGPDF, f"img.pdf {ends[0]['text']!r}")
+    t.check(ends[0].get("images") == [
+        {"name": f"out/{c0}-1.png", "mime": "image/png", "w": 64, "h": 32,
+         "label": "image 1 (page 1)"},
+        {"name": f"out/{c0}-2.jpg", "mime": "image/jpeg", "w": 40, "h": 30,
+         "label": "image 2 (page 2)"}] and ends[0].get("image") == f"out/{c0}-1.png",
+            f"its images {ends[0]}")
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    t.check(t.host.read(t.host.join(sdir, "out", f"{c0}-2.jpg")) ==
+            PDFJPEG.decode("utf-8", "replace"), "the JPEG kept as it was")
+
+    reqs = [q["body"] for q in t.requests()]
+    imgs = fake_provider.desk_images(reqs[1])
+    t.check([lab for lab, _ in imgs] == [f"Image 1 (page 1) from tool call {c0}:",
+                                         f"Image 2 (page 2) from tool call {c0}:"],
+            f"captioned {[lab for lab, _ in imgs]}")
+    t.check(pngdims(toolimagedata(imgs[0][1])) == (64, 32) and
+            imgs[0][1].startswith("data:image/png;base64,"), "the PNG, scaled")
+    t.check(imgs[1][1].startswith("data:image/jpeg;base64,") and
+            toolimagedata(imgs[1][1]) == PDFJPEG, "the JPEG as it was")
+
+    # Ten images: eight shown, the window cut before the ninth's line
+    many = ends[1]
+    t.check(many["text"].startswith("many.pdf: a PDF, 10 pages, its text extracted, with "
+                                    "the 8 images on these pages after it:\n") and
+            "    26\t[Showing lines 1-26 of 30" not in many["text"] and
+            "[Showing lines 1-26 of 30. To read more, call read with offset=27.]\n"
+            in many["text"] and "[The whole text is kept at " in many["text"],
+            f"many.pdf {many['text']!r}")
+    t.check([g["label"] for g in many["images"]] ==
+            [f"image {i} (page {i})" for i in range(1, 9)], f"eight {many['images']}")
+    last = reqs[-1]
+    imgs = fake_provider.desk_images(last)
+    t.check([lab for lab, _ in imgs] ==
+            [f"Image 1 (page 1) from tool call {c0}:", f"Image 2 (page 2) from tool call {c0}:"]
+            + [f"Image {i} (page {i}) from tool call {c1}:" for i in range(1, 9)],
+            f"both sets {[lab for lab, _ in imgs]}")
+    alts = [p["text"] for m in last["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[PDF images")]
+    t.check(alts == [], f"both sets fit {alts}")
+
+    # Resumed with room for one set: the older leaves
+    t.host.write(t.config, t.host.read(t.config) + "[desktop]\nimages = 1\nimages_slack = 0\n")
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resumed: exit {r2.rc}: {r2.stderr}")
+    again = t.requests()[-1]["body"]
+    imgs = fake_provider.desk_images(again)
+    t.check([lab for lab, _ in imgs] == [f"Image {i} (page {i}) from tool call {c1}:"
+                                         for i in range(1, 9)], f"replayed {imgs}")
+    alts = [p["text"] for m in again["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[PDF images")]
+    t.check(alts == [f"[PDF images omitted: {c0}; read the file again to see them]"],
+            f"the older set stands in {alts}")
+
+
+@scenario(conf={**RS, "_extra": READPDFIMG}, bound=20)
+def read_pdf_images_rs(t):
+    """On the Responses API, a PDF's images go in a user message after the
+    run of outputs, each after its caption; a scan's pages come as its
+    images."""
+    pdfimages(t)
+    r = t.run()
+    rsok(t, r)
+    ends = r.all("tool.end")
+    c0 = ends[0]["call"]
+    t.check(ends[0]["text"] == IMGPDF, f"img.pdf {ends[0]['text']!r}")
+    t.check(ends[1]["text"].startswith(
+        "scan.pdf: a PDF, 2 pages, with no text, only images of its pages (a scan), with "
+        "the image on these pages after it:\n") and len(ends[1]["images"]) == 1,
+            f"scan.pdf {ends[1]}")
+    msgs = [x for x in rsinput(t.requests()[1])
+            if x.get("type") == "message" and x.get("role") == "user" and
+            any(c["type"] == "input_image" for c in x["content"])]
+    t.check(len(msgs) == 1, f"one message of images {msgs}")
+    parts = msgs[0]["content"]
+    t.check([c["type"] for c in parts] == ["input_text", "input_image"] * 2, f"parts {parts}")
+    t.check(parts[0]["text"] == f"Image 1 (page 1) from tool call {c0}:" and
+            parts[1]["image_url"].startswith("data:image/png;base64,") and
+            parts[2]["text"] == f"Image 2 (page 2) from tool call {c0}:" and
+            parts[3]["image_url"].startswith("data:image/jpeg;base64,"), f"captioned {parts}")
+    t.check(not r.all("retry"), "the API took them")
+
+
+@scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=15)
+def read_pdf_blind(t):
+    """A model that takes no images is shown a PDF's text with its image
+    lines, and told they stand for pictures not shown; a scan is said to
+    be one, pointing to OCR in the shell, and a PDF whose words are
+    shapes to rendering its pages. No images are kept or sent."""
+    pdfimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check(ends[0]["text"] == IMGPDF.replace(", with the 2 images on these pages after it",
+                                              "") +
+            "[This model takes no images: each [image ...] line stands for a picture "
+            "that is not shown.]\n" and "images" not in ends[0], f"img.pdf {ends[0]}")
+    t.check(ends[1]["text"].startswith("scan.pdf: a PDF, 2 pages, with no text, only images "
+                                       "of its pages (a scan):\n") and
+            "tesseract" in ends[1]["text"] and "images" not in ends[1], f"scan {ends[1]}")
+    t.check(ends[2]["text"] == "blank.pdf: a PDF, 2 pages, with no text to extract:\n"
+                               "     1\t--- page 1 ---\n     2\t[no text on this page]\n"
+                               "     3\t--- page 2 ---\n     4\t[no text on this page]\n"
+                               "[No text could be extracted: its words may be drawn as "
+                               "shapes. The shell may render its pages as images (pdftoppm "
+                               "-png -r 100) and OCR them (tesseract).]\n",
+            f"blank {ends[2]['text']!r}")
+    reqs = [q["body"] for q in t.requests()]
+    t.check(not any(fake_provider.desk_images(q) for q in reqs), "no image sent")
+    desc = readdesc(reqs[0])
+    t.check("a PDF shows as its text" in desc and "image" not in desc,
+            f"read's description: {desc}")
+
+
+@scenario(bound=15)
+def read_pdf_locked(t):
+    """An encrypted PDF is refused on any kind, pointing to the shell."""
+    t.host.write(t.host.join(t.work, "locked.pdf"), mkpdf(1, encrypt=True))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "error" and
+            end["text"].startswith("locked.pdf: a PDF, encrypted, which cannot be read here.")
+            and "pdftotext" in end["text"], f"refused {end}")
+
+
+@scenario(conf={**AN, "_extra": "[model {model}]\npdf = false\nimage_edge = 64\n"}, bound=15)
+def an_read_pdf_text(t):
+    """On kind anthropic with [model] pdf = false, read extracts a PDF's
+    text, as for other kinds, its images inside the tool_result after
+    their captions, and read's description offers no documents."""
+    pdfimages(t)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    end = r.all("tool.end")[0]
+    t.check(end["text"] == IMGPDF and "pdf" not in end and len(end["images"]) == 2,
+            f"extracted {end}")
+    reqs = [q["body"] for q in t.requests()]
+    desc = [x["description"] for x in reqs[0]["tools"] if x["name"] == "read"][0]
+    t.check("a PDF as its text" in desc and "document" not in desc, f"read says so: {desc}")
+    res = an_result(reqs[1], 0)
+    t.check([c["type"] for c in res] == ["text", "text", "image", "text", "image"],
+            f"in the result {[c['type'] for c in res]}")
+    t.check([res[1]["text"], res[3]["text"]] ==
+            [f"Image 1 (page 1) from tool call {end['call']}:",
+             f"Image 2 (page 2) from tool call {end['call']}:"], f"captions {res[1]} {res[3]}")
+    t.check(res[4]["source"]["media_type"] == "image/jpeg" and
+            base64.b64decode(res[4]["source"]["data"]) == PDFJPEG, "the JPEG")
+    t.check(not r.all("retry"), "the API took them")
+
+
+IMGPDFTEXT = ("--- page 1 ---\nA red chart:\n[image 1: 100x50 RGB]\n"
+              "--- page 2 ---\nThe chart again, and a photo:\n"
+              "[image 1: 100x50 RGB]\n[image 2: 40x30 JPEG]\n"
+              "--- page 3 ---\nNo pictures here.\n")
+
+
+@scenario(conf={"_extra": READPDFIMG + "[model {model2}]\nvision = false\n"}, bound=20)
+def attach_pdf(t):
+    """A PDF attached is kept as files/N-NAME.pdf, its text extracted
+    beside it as files/N-NAME.pdf.txt, which the reply names, with the
+    text's bytes and lines; a request has that text as an attached file's,
+    under a head that says it is a PDF's and where the PDF is. A model
+    that takes images gets the images that text's window shows as the
+    message's own (img/N), each with a label and a caption naming it, at
+    most 10 images to a message with those attached. A name without .pdf
+    gets it; an encrypted PDF is refused, as is one with no text."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("pdf" in caps, f"caps: {caps}")
+        img = imgpdf()
+
+        # Its text, to a model without vision
+        blind = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        r = upfile(t, h, blind, img, "img.pdf")
+        t.check(r.get("ok") == 1 and r.get("name") == "files/1-img.pdf.txt" and
+                r.get("bytes") == len(IMGPDFTEXT) and r.get("lines") == 9, f"uploaded: {r}")
+        fdir = t.host.join(t.state, "sessions", blind, "files")
+        t.check(t.host.read(t.host.join(fdir, "1-img.pdf")) == img.decode("utf-8", "replace"),
+                "the PDF kept")
+        t.check(t.host.read(t.host.join(fdir, "1-img.pdf.txt")) == IMGPDFTEXT, "its text kept")
+        h.call("prompt", sid=blind, text="what is this?", files=[r["name"]])
+        ended(h, blind, 1)
+        user = h.all("user", blind)[0]
+        t.check(user["files"] == [{"name": "files/1-img.pdf.txt", "bytes": len(IMGPDFTEXT),
+                                   "lines": 9}] and "images" not in user, f"the user {user}")
+        said = fake_provider.user_text_all(t.requests(t.model2)[-1]["body"])
+        pdf = t.host.join(fdir, "1-img.pdf")
+        t.check(f"[Attached PDF img.pdf, its text extracted, kept at {pdf}.txt, where read "
+                f"continues it; the PDF itself is at {pdf}:]\n     1\t--- page 1 ---\n"
+                "     2\tA red chart:\n     3\t[image 1: 100x50 RGB]\n" in said and
+                said.endswith("what is this?"), f"the request: {said[:500]}")
+        t.check(lastsaid(h, blind) == "1 PDFs, 0 images.", f"said {lastsaid(h, blind)}")
+
+        def refused(r, err):
+            t.check(r.get("ok") == 0 and r.get("err", "").startswith(err), f"{err}: {r}")
+
+        refused(upfile(t, h, blind, mkpdf(1, encrypt=True), "locked.pdf"),
+                "locked.pdf is a PDF, encrypted, so it is not attached")
+        refused(upfile(t, h, blind, b"%PDF-1.4\n%%EOF\n", "empty.pdf"),
+                "empty.pdf is a PDF whose text cannot be read (")
+        r = upfile(t, h, blind, mkpdf(2), "scan")
+        t.check(r.get("name") == "files/2-scan.pdf.txt" and r.get("lines") == 4,
+                f"named as a PDF: {r}")
+
+        # Its images too, to a model that takes them
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = upfile(t, h, sid, img, "img.pdf")
+        t.check(r.get("name") == "files/1-img.pdf.txt", f"uploaded: {r}")
+        h.call("prompt", sid=sid, text="and this?", files=[r["name"]])
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check(user.get("images") == [
+            {"name": "img/1.png", "mime": "image/png", "w": 64, "h": 32,
+             "label": "image 1 (page 1) of img.pdf"},
+            {"name": "img/2.jpg", "mime": "image/jpeg", "w": 40, "h": 30,
+             "label": "image 2 (page 2) of img.pdf"}], f"the user {user}")
+        idir = t.host.join(t.state, "sessions", sid, "img")
+        t.check(t.host.read(t.host.join(idir, "2.jpg")) == PDFJPEG.decode("utf-8", "replace"),
+                "the JPEG as it was")
+        body = t.requests(t.model)[-1]["body"]
+        imgs = fake_provider.desk_images(body)
+        t.check([lab for lab, _ in imgs] == ["Image 1 (page 1) of img.pdf:",
+                                             "Image 2 (page 2) of img.pdf:"],
+                f"captioned {[lab for lab, _ in imgs]}")
+        t.check(pngdims(toolimagedata(imgs[0][1])) == (64, 32) and
+                toolimagedata(imgs[1][1]) == PDFJPEG, "the images sent")
+        said = fake_provider.user_text_all(body)
+        t.check(", which read shows with its images:]\n" in said, f"the head {said[:400]}")
+        t.check(lastsaid(h, sid) == "1 PDFs, 2 images.", f"said {lastsaid(h, sid)}")
+
+        # Ten images to a message: nine attached leave room for one
+        names = [attached(t, h, sid, PNG) for _ in range(9)]
+        h.call("prompt", sid=sid, text="all", files=[r["name"]], images=names)
+        ended(h, sid, 2)
+        got = h.all("user", sid)[1]["images"]
+        t.check(len(got) == 10 and got[9]["label"] == "image 1 (page 1) of img.pdf" and
+                got[9]["name"] == "img/12.png", f"one more {got[9:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+JUNKTEXT = ("# Notes on PDFs\n\nEvery PDF begins with %PDF-1.7 and a comment line.\n" +
+            "More text.\n" * 20)
+
+
+def pdfmore(t):
+    """read_pdf_more's files, beside pdfimages's: late.pdf, its only image
+    on page 2; trunc.pdf, img.pdf cut short; badimg.pdf, an image whose
+    data is junk; jbig.pdf, a scan in JBIG2; thirty.pdf and three.pdf;
+    and notes.md, a text file that mentions "%PDF-" in its first KiB."""
+    pdfimages(t)
+    w = lambda name, data: t.host.write(t.host.join(t.work, name), data)
+    w("late.pdf", mkpdfpages([(["No image here."], []), (["A picture:"], ["L"])],
+                             {"L": pdfrgb(40, 30, (10, 200, 10))}))
+    img = imgpdf()
+    w("trunc.pdf", img[:len(img)*7//10])
+    w("badimg.pdf", mkpdfpages([(["Broken:"], ["B"])], {"B": (
+        "/Width 40 /Height 30 /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+        "/Filter /FlateDecode", b"\x78\x9c" + b"\xff" * 40)}))
+    w("jbig.pdf", mkpdfpages([([], ["J"]), ([], ["J"])], {"J": (
+        "/Width 60 /Height 80 /ColorSpace /DeviceGray /BitsPerComponent 1 "
+        "/Filter /JBIG2Decode", bytes(50))}))
+    w("thirty.pdf", mkpdf(30))
+    w("three.pdf", mkpdf(3))
+    w("notes.md", JUNKTEXT)
+
+
+READ_PDF_MORE = [
+    ["read", {"path": "many.pdf"}],
+    ["read", {"path": "many.pdf", "offset": 27}],
+    ["read", {"path": "img.pdf", "limit": 3}],
+    ["read", {"path": "img.pdf", "offset": 4, "limit": 4}],
+    ["read", {"path": "late.pdf"}],
+    ["read", {"path": "trunc.pdf"}],
+    ["read", {"path": "badimg.pdf"}],
+    ["read", {"path": "jbig.pdf"}],
+    ["read", {"path": "blank.pdf"}],
+    ["read", {"path": "thirty.pdf", "limit": 5}],
+    ["write", {"path": "thirty.pdf",
+               "content": fake_provider.mkpdf(30).replace("(Page 1)", "(Page X)")}],
+    ["read", {"path": "thirty.pdf", "limit": 5}],
+    ["read", {"path": "three.pdf", "offset": 100}],
+    ["read", {"path": "notes.md"}],
+]
+
+
+@scenario(conf={"_extra": READPDFIMG}, bound=30)
+def read_pdf_more(t):
+    """read of PDFs, more cases: reading on into images, from the text
+    kept, decodes those the window shows; a window shows the images of
+    its lines alone, labelled with their pages; a damaged PDF recovered;
+    an image that cannot be decoded named; a scan in JBIG2, and a PDF of
+    shapes, pointing to rendering its pages; a file changed though its
+    size is not, read again; an offset past the end keeping nothing; and
+    a text file that mentions "%PDF-" shown as text."""
+    pdfmore(t)
+    r = t.run(json.dumps(READ_PDF_MORE))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check(len(ends) == len(READ_PDF_MORE) and all(e["status"] == "ok" for e in ends),
+            f"statuses {[e['status'] for e in ends]}")
+    tx = [e["text"] for e in ends]
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    call = [e["call"] for e in ends]
+    labels = lambda e: [g["label"] for g in e.get("images", [])]
+
+    # Reading on into images, from the text kept
+    kept = t.host.join(sdir, "out", call[0] + ".txt")
+    t.check(tx[1] == "many.pdf: a PDF, 10 pages, its text extracted, with the 2 images on "
+                     "these pages after it:\n    27\t[image 9: 30x30 RGB]\n"
+                     "    28\t--- page 10 ---\n    29\tPicture 9:\n"
+                     "    30\t[image 10: 30x30 RGB]\n", f"read on {tx[1]!r}")
+    t.check([(g["name"], g["label"]) for g in ends[1]["images"]] ==
+            [(f"out/{call[1]}-1.png", "image 9 (page 9)"),
+             (f"out/{call[1]}-2.png", "image 10 (page 10)")], f"its images {ends[1]}")
+    t.check(t.host.read(t.host.join(sdir, "out", call[1] + ".txt")) is None and
+            t.host.read(kept) is not None, "the text kept once")
+
+    # The window's images alone
+    t.check(labels(ends[2]) == ["image 1 (page 1)"] and
+            "[Showing lines 1-3 of 9. To read more, call read with offset=4.]" in tx[2],
+            f"limit=3 {ends[2]}")
+    t.check(labels(ends[3]) == ["image 1 (page 2)", "image 2 (page 2)"] and
+            tx[3].startswith("img.pdf: a PDF, 3 pages, its text extracted, with the 2 "
+                             "images on these pages after it:\n     4\t--- page 2 ---\n"),
+            f"offset=4 {ends[3]}")
+    imgs = fake_provider.desk_images(t.requests()[4]["body"])
+    t.check([lab for lab, _ in imgs][-2:] == [f"Image 1 (page 2) from tool call {call[3]}:",
+                                              f"Image 2 (page 2) from tool call {call[3]}:"],
+            f"captioned {[lab for lab, _ in imgs]}")
+    t.check(labels(ends[4]) == ["image 1 (page 2)"] and
+            tx[4].endswith("     4\tA picture:\n     5\t[image 1: 40x30 RGB]\n"),
+            f"late.pdf {ends[4]}")
+
+    # Damaged, and an image that cannot be decoded
+    t.check(tx[5].startswith("trunc.pdf: a PDF, 3 pages, damaged but recovered, its text "
+                             "extracted, with the image on these pages after it:\n") and
+            labels(ends[5]) == ["image 1 (page 1)"], f"trunc.pdf {ends[5]}")
+    t.check(tx[6] == "badimg.pdf: a PDF, 1 page, its text extracted:\n"
+                     "     1\t--- page 1 ---\n     2\tBroken:\n     3\t[image 1: 40x30 RGB]\n"
+                     "[image 1 (page 1) is not shown: its data cannot be decoded.]\n" and
+            "images" not in ends[6], f"badimg.pdf {ends[6]}")
+
+    # Nothing to show: rendering the pages
+    t.check(tx[7].startswith("jbig.pdf: a PDF, 2 pages, with no text, only images of its "
+                             "pages (a scan):\n     1\t--- page 1 ---\n"
+                             "     2\t[image 1: 60x80, not shown (JBIG2)]\n") and
+            tx[7].endswith("[The images marked not shown are in a format that cannot be "
+                           "shown here. The shell may render their pages as images "
+                           "(pdftoppm -png -r 100), which read then shows you.]\n") and
+            "images" not in ends[7], f"jbig.pdf {ends[7]}")
+    t.check(tx[8].endswith("[No text could be extracted: its words may be drawn as shapes. "
+                           "The shell may render its pages as images (pdftoppm -png -r "
+                           "100), which read then shows you.]\n"), f"blank.pdf {tx[8]!r}")
+
+    # Changed, its size the same
+    t.check("     2\tPage 1\n" in tx[9] and "     2\tPage X\n" in tx[11],
+            f"read again {tx[11]!r}")
+
+    # Past the end: nothing kept
+    t.check(tx[12] == "three.pdf: a PDF, 3 pages, its text extracted:\n"
+                      "The file has only 6 lines, so offset 100 is past its end.",
+            f"past the end {tx[12]!r}")
+    t.check(t.host.read(t.host.join(sdir, "out", call[12] + ".txt")) is None, "none kept")
+
+    # Text, though "%PDF-" is in its first KiB
+    t.check(tx[13].startswith("     1\t# Notes on PDFs\n") and
+            "Every PDF begins with %PDF-1.7" in tx[13], f"notes.md {tx[13]!r}")
+
+
+def padjpeg(jpeg, size):
+    """jpeg made size bytes long by comment segments after its SOI."""
+    out, need = [jpeg[:2]], size - len(jpeg)
+    while need > 0:
+        n = min(need, 65537) - 4
+        n = max(n, 0)
+        out.append(b"\xff\xfe" + (n + 2).to_bytes(2, "big") + b"c" * n)
+        need -= n + 4
+    return b"".join(out) + jpeg[2:]
+
+
+@scenario(conf={"_extra": "[model {model}]\nimage_edge = 1000\n"}, bound=30)
+def read_pdf_bigimgs(t):
+    """A window's images, however large, fit a request: eight JPEGs of
+    1.05 MB each would pass through whole, 8.4 MB, past the 8 MiB of a
+    request's PDF images, so read shrinks them to fit, and the request
+    after it carries all eight."""
+    big = padjpeg(flatjpeg(700, 700), 1_050_000)
+    imgs = {f"J{i}": ("/Width 700 /Height 700 /ColorSpace /DeviceGray /BitsPerComponent 8 "
+                      "/Filter /DCTDecode", big) for i in range(8)}
+    t.host.write(t.host.join(t.work, "big.pdf"),
+                 mkpdfpages([([f"Photo {i}:"], [f"J{i}"]) for i in range(8)], imgs))
+    r = t.run(json.dumps([["read", {"path": "big.pdf"}]]))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(len(end.get("images", [])) == 8, f"eight shown {end}")
+    sdir = t.host.join(t.state, "sessions", r.sessions()[0])
+    total = sum(len(t.host.read(t.host.join(sdir, g["name"])) or "") for g in end["images"])
+    t.check(0 < total <= 8 << 20, f"their files: {total} bytes")
+    body = t.requests()[1]["body"]
+    t.check(len(fake_provider.desk_images(body)) == 8 and
+            "[PDF images omitted" not in json.dumps(body), "all eight sent")
+
+
+@scenario(conf={"_extra": READPDFIMG}, bound=40)
+def attach_pdf_more(t):
+    """Attachments, more cases: a text file that mentions "%PDF-" is
+    attached as text; a PDF named .PDF keeps its PDF handling, named
+    .pdf; a text file named as a PDF's text is renamed, never taken for
+    one; images are labelled with their pages; several PDFs share a
+    message's room for images; and a request carries at most 40 of
+    attached PDFs' images, the newest, older ones left out with a text
+    in their place."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = upfile(t, h, sid, JUNKTEXT.encode(), "notes.md")
+        t.check(r.get("ok") == 1 and r.get("name") == "files/1-notes.md", f"text: {r}")
+        r = upfile(t, h, sid, imgpdf(), "SHOUT.PDF")
+        t.check(r.get("name") == "files/2-SHOUT.pdf.txt", f"SHOUT.PDF: {r}")
+        shout = r["name"]
+        r = upfile(t, h, sid, b"Plain text.\n", "notes.pdf.txt")
+        t.check(r.get("name") == "files/3-notes_pdf.txt", f"renamed: {r}")
+        plain = r["name"]
+        late = mkpdfpages([(["No image here."], []), (["A picture:"], ["L"])],
+                          {"L": pdfrgb(40, 30, (10, 200, 10))})
+        r = upfile(t, h, sid, late, "late.pdf")
+        h.call("prompt", sid=sid, text="these", files=[shout, plain, r["name"]])
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check([g["label"] for g in user.get("images", [])] ==
+                ["image 1 (page 1) of SHOUT.pdf", "image 2 (page 2) of SHOUT.pdf",
+                 "image 1 (page 2) of late.pdf"], f"labels {user.get('images')}")
+        said = fake_provider.user_text_all(t.requests(t.model)[-1]["body"])
+        t.check("[Attached PDF SHOUT.pdf, its text extracted" in said and
+                "[Attached file notes_pdf.txt" in said and
+                "[Attached PDF notes" not in said, f"heads {said[:600]}")
+
+        # Two PDFs share the message's room: 7 images leave 3
+        a = upfile(t, h, sid, imgpdf(), "a.pdf")["name"]
+        b = upfile(t, h, sid, imgpdf(), "b.pdf")["name"]
+        names = [attached(t, h, sid, PNG) for _ in range(7)]
+        h.call("prompt", sid=sid, text="both", files=[a, b], images=names)
+        ended(h, sid, 2)
+        got = [g.get("label", "") for g in h.all("user", sid)[1]["images"]]
+        t.check(got == [""] * 7 + ["image 1 (page 1) of a.pdf", "image 2 (page 2) of a.pdf",
+                                   "image 1 (page 1) of b.pdf"], f"shared {got}")
+
+        # At most 40 in a request: the sixth set of 8 crowds out the first
+        many = {f"I{i}": pdfrgb(30, 30, (i*20, 100, 50)) for i in range(10)}
+        manypdf = mkpdfpages([([f"Picture {i}:"], [f"I{i}"]) for i in range(10)], many)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        for k in range(6):
+            f = upfile(t, h, sid, manypdf, f"m{k}.pdf")["name"]
+            h.call("prompt", sid=sid, text=f"set {k}", files=[f])
+            ended(h, sid, k + 1)
+        reqs = [q["body"] for q in t.requests(t.model)][-6:]
+        counts = [len(fake_provider.user_images(q)) for q in reqs]
+        t.check(counts == [8, 16, 24, 32, 40, 40], f"images sent {counts}")
+        alts = [p["text"] for m in reqs[-1]["messages"]
+                if m["role"] == "user" and isinstance(m["content"], list)
+                for p in m["content"]
+                if p["type"] == "text" and p["text"].startswith("[image omitted")]
+        t.check(alts == [f"[image omitted: image {i} (page {i}) of m0.pdf, for room in the "
+                         "request for newer images; read the PDF again to see it]"
+                         for i in range(1, 9)], f"in their place {alts}")
+        t.check(lastsaid(h, sid) == "6 PDFs, 40 images.", f"said {lastsaid(h, sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 def desk_alts(req):
@@ -13518,6 +16154,110 @@ def worktree_new(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=BIG, bound=40, alone=True)
+def fork_folder(t):
+    """fork {cwd}: a fork into another folder, between turns. Its record
+    has the new folder and moved_from; none of the original's prefix,
+    instructions, memory or snapshots come along, and a grant outside
+    the old folder does, and is dropped when a later fork leaves that
+    folder in turn. Its first request has the new folder's prompt and
+    instructions and a notice of the move, a relative read finds the new
+    folder's file, and the original's log is untouched. After a
+    compaction it is told again. Refused into its own folder, a missing
+    one, or as a side chat."""
+    t.put("AGENTS.md", "Rules of A.\n")
+    t.put("note.txt", "from A\n")
+    ext = t.host.join(t.base, "ext")
+    t.host.mkdir(ext)
+    t.host.write(t.host.join(ext, "AGENTS.md"), "Rules of B.\n")
+    t.host.write(t.host.join(ext, "note.txt"), "from B\n")
+    fill = "abcdefghij" * 6
+    for i in range(6):
+        t.host.write(t.host.join(ext, f"f{i}.txt"),
+                     "".join(f"file {i} line {j}: {fill}\n" for j in range(256)))
+    slash = lambda p: p.replace("\\", "/")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="one")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        h.call("answer", sid=sid, req=ask["req"], decision="always")
+        ended(h, sid, 1)
+        recs = logged(t, sid)
+        old = recs[0]["cwd"]
+        t.check(any(e.get("ev") == "snap" for e in recs) and
+                any(e.get("ev") == "grant" for e in recs) and
+                any(e.get("ev") == "prefix" for e in recs), f"the original's: {recs}")
+        before = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+
+        r = h.call("fork", sid=sid, cwd=t.work)
+        t.check(r.get("ok") == 0 and "already" in r.get("err", ""), f"its own folder: {r}")
+        r = h.call("fork", sid=sid, cwd=t.host.join(t.base, "nowhere"))
+        t.check(r.get("ok") == 0 and "existing directory" in r.get("err", ""),
+                f"a missing folder: {r}")
+        r = h.call("fork", sid=sid, cwd=ext, side=1)
+        t.check(r.get("ok") == 0 and "side chat" in r.get("err", ""), f"with side: {r}")
+
+        r = h.call("fork", sid=sid, cwd=ext)
+        t.check(r.get("ok") == 1 and slash(r.get("cwd", "")).endswith("/ext"), f"fork: {r}")
+        f1 = r["sid"]
+        recs = logged(t, f1)
+        first = recs[0]
+        t.check(first.get("cwd") == r["cwd"] and first.get("moved_from") == old and
+                first.get("forked_from") == sid, f"its record: {first}")
+        evs = [e.get("ev") for e in recs]
+        t.check(not {"prefix", "instructions", "memory", "snap"} & set(evs),
+                f"none of the old folder's records: {evs}")
+        grants = [e for e in recs if e.get("ev") == "grant"]
+        t.check(len(grants) == 1, f"the grant outside, kept: {grants}")
+        notes = [e for e in recs if e.get("ev") == "notice" and e.get("kind") == "moved"]
+        t.check(len(notes) == 1 and old in notes[0]["text"] and r["cwd"] in notes[0]["text"],
+                f"its notice: {notes}")
+        t.check(not os.path.exists(os.path.join(t.state, "sessions", f1, "snap")),
+                "no snapshot files")
+
+        h.call("open", sid=f1)
+        h.send("prompt", sid=f1, text="two")
+        ended(h, f1, 2)
+        read = [e for e in h.all("tool.end", f1)]
+        t.check(read and "from B" in read[-1].get("text", ""), f"the new folder's file: {read}")
+        body = t.requests()[-2]["body"]
+        system = json.dumps(body["messages"][0]["content"])
+        t.check("Rules of B." in system and "Rules of A." not in system,
+                "the new folder's instructions")
+        t.check(json.dumps(r["cwd"])[1:-1] in system, "the prompt names the new folder")
+        t.check("has moved to another folder" in json.dumps(body["messages"][1:]),
+                "the request tells of the move")
+        recs = logged(t, f1)
+        t.check(any(e.get("ev") == "prefix" for e in recs), "a prefix of its own")
+        after = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        t.check(after == before, "the original untouched")
+
+        h.send("prompt", sid=f1, text="read them")
+        ended(h, f1, 3)
+        r = h.call("compact", sid=f1)
+        t.check(r.get("ok") == 1, f"compact: {r}")
+        ended(h, f1, 4)
+        h.send("prompt", sid=f1, text="three")
+        ended(h, f1, 5)
+        msgs = json.dumps(t.requests()[-1]["body"]["messages"][1:])
+        t.check("has moved to another folder" in msgs, "told again after the summary")
+        recs = logged(t, f1)
+        at = max(i for i, e in enumerate(recs) if e.get("ev") == "compact")
+        again = [e for e in recs[at:] if e.get("ev") == "notice" and e.get("kind") == "moved"]
+        t.check(len(again) == 1, f"a notice after the summary: {again}")
+
+        r = h.call("fork", sid=f1, cwd=t.work)
+        t.check(r.get("ok") == 1, f"back: {r}")
+        recs = logged(t, r["sid"])
+        t.check(recs[0].get("moved_from") == first["cwd"], f"its record: {recs[0]}")
+        grants = [e for e in recs if e.get("ev") == "grant"]
+        t.check(not grants, f"the grant in the folder it left, dropped: {grants}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=40)
 def worktree_side(t):
     """fork {side, worktree}: a side chat in a worktree of its own, on a
@@ -13917,6 +16657,480 @@ def worktree_quit(t):
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
+
+
+# Terminals: term.open and its commands (ptyhost.cpp), each with
+# "prospero --tty-probe" for its shell, a stand-in that answers commands
+
+
+TERM_WINDOW = 256 << 10
+
+# ConPTY renders what a program writes anew, as escapes over a screen, so
+# on Windows output compares as text: without escape sequences or CR.
+VT_ESCAPE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[^\[\]])|\r")
+
+
+def vtplain(data):
+    """The text of data and where its unfinished escape, if any, starts."""
+    end = len(data)
+    esc = data.rfind(b"\x1b", max(0, end - 4096))
+    if esc >= 0 and not VT_ESCAPE.match(data, esc):
+        end = esc
+    return VT_ESCAPE.sub(b"", data[:end]), end
+
+
+def ttyprobe(t):
+    """[terminal] shell set to this harness's own --tty-probe. On Windows
+    it is a copy that runs as a console program, which ConPTY attaches,
+    as it never does a GUI program: the same image with its subsystem,
+    in the PE header (offset 0x3c, then 92), changed from 2 to 3."""
+    if isinstance(t.host, XpHost):
+        raise Skip("no ConPTY before Windows 10 1809 (term_refused)")
+    exe = getattr(t.host, "exe", None) or t.host.prospero
+    if t.host.windows:
+        probe = t.host.join(t.base, "probe.exe")
+        if isinstance(t.host, LocalHost):
+            image = bytearray(open(exe, "rb").read())
+            at = int.from_bytes(image[0x3c:0x40], "little") + 92
+            image[at] = 3 if image[at] == 2 else image[at]
+            t.host.write(probe, bytes(image))
+        else:
+            t.host.sh(f"cp {shlex.quote(exe)} {probe} && "
+                      f"at=$(($(od -An -tu4 -j60 -N4 {probe}) + 92)) && "
+                      f"if [ \"$(od -An -tu1 -j$at -N1 {probe} | tr -d ' ')\" = 2 ]; then "
+                      f"printf '\\003' | dd of={probe} bs=1 seek=$at conv=notrunc 2>/dev/null; fi")
+        exe = probe
+    # Quoted as a word of its own, and so the whole value too
+    t.host.write(t.config, (t.host.read(t.config) or "") +
+                 f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
+
+
+class Tty:
+    """A terminal of term.open: its output gathered in order, and acked
+    every ackevery bytes and when no more has come (after slow seconds
+    each time), or not at all while hold. Records may be lost on purpose (dropafter, the first at
+    or past that offset), and a gap asks for output again (resend)."""
+
+    def __init__(self, t, h, sid, cols=80, rows=24, **kw):
+        self.t = t
+        self.h = h
+        r = h.call("term.open", sid=sid, cols=cols, rows=rows, **kw)
+        t.check(r.get("ok"), f"term.open: {r}")
+        self.reply = r
+        self.tid = r["tid"]
+        self.data = bytearray()
+        self.acked = 0
+        self.asked = -1      # where a resend was last asked from
+        self.cur = 0         # where line() looks next
+        self.at = 0          # the next of h.events to look at
+        self.end = None
+        self.busy = []
+        self.window = 0      # the most output sent past what was acked
+        self.records = 0
+        self.dups = 0        # records of output already had
+        self.resends = 0
+        self.ackevery = 0
+        self.slow = 0.0
+        self.hold = False
+        self.dropafter = None
+        self.dropped = 0
+        self.plainat = 0     # how much of data plain holds, on Windows
+        self.plainbuf = bytearray()
+
+    @property
+    def text(self):
+        """Output as lines are matched: as text on Windows (vtplain)."""
+        if not self.t.host.windows:
+            return self.data
+        got, end = vtplain(bytes(self.data[self.plainat:]))
+        self.plainbuf += got
+        self.plainat += end
+        return self.plainbuf
+
+    def type(self, text):
+        data = text.encode() if isinstance(text, str) else text
+        self.h.send("term.input", tid=self.tid, data=base64.b64encode(data).decode())
+
+    def ack(self, resend=False):
+        fields = {"resend": True} if resend else {}
+        self.h.send("term.ack", tid=self.tid, off=len(self.data), **fields)
+        self.acked = len(self.data)
+
+    def step(self, ev):
+        if ev.get("tid") != self.tid or "peer" in ev:
+            return
+        name = ev.get("ev")
+        if name == "term.end":
+            self.end = ev
+        elif name == "term.busy":
+            self.busy.append(ev["busy"])
+        elif name == "term":
+            self.records += 1
+            off = ev["off"]
+            data = base64.b64decode(ev["data"])
+            self.window = max(self.window, off + len(data) - self.acked)
+            if self.dropafter is not None and off >= self.dropafter:
+                self.dropafter = None
+                self.dropped += 1
+                return
+            if off > len(self.data):
+                if self.asked != len(self.data):  # once for each gap
+                    self.asked = len(self.data)
+                    self.resends += 1
+                    self.ack(resend=True)
+                return
+            if off < len(self.data):
+                self.dups += 1
+                have = bytes(self.data[off:off + len(data)])
+                if data[:len(have)] != have:
+                    raise Failure(f"output at {off} differs when sent again")
+                data = data[len(have):]
+            self.data += data
+            if not self.hold and len(self.data) - self.acked >= max(1, self.ackevery):
+                self.later()
+
+    def later(self):
+        """Ack what came, after a while if slow."""
+        if self.slow:
+            time.sleep(self.slow)
+        self.ack()
+
+    def pump(self, until, timeout=20, what="output"):
+        deadline = time.monotonic() + timeout
+        while not until(self):
+            with self.h.cond:
+                evs = self.h.events[self.at:]
+                self.at = len(self.h.events)
+                if not evs:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        tail = bytes(self.data[-300:])
+                        raise Failure(f"timed out waiting for {what}; "
+                                      f"{len(self.data)} bytes, the last {tail!r}")
+                    self.h.cond.wait(min(left, 0.25))
+                    continue
+            for ev in evs:
+                self.step(ev)
+            if not self.hold and len(self.data) > self.acked:
+                self.later()  # all there is for now
+
+    def line(self, prefix, timeout=20):
+        """The next whole line of output that starts with prefix."""
+        found = []
+
+        def has(tt):
+            text = tt.text
+            while True:
+                nl = text.find(b"\n", tt.cur)
+                if nl < 0:
+                    return False
+                line = bytes(text[tt.cur:nl]).decode(errors="replace")
+                tt.cur = nl + 1
+                if line.startswith(prefix):
+                    found.append(line)
+                    return True
+        self.pump(has, timeout, repr(prefix))
+        return found[0]
+
+    def ended(self, timeout=20):
+        self.pump(lambda tt: tt.end is not None, timeout, "term.end")
+        return self.end
+
+
+def floodbytes(n):
+    """What --tty-probe's flood N writes (floodbyte)."""
+    out = bytearray(n)
+    for i in range(n):
+        out[i] = 10 if i % 64 == 63 else 97 + (i // 64 + i % 64) % 26
+    return bytes(out)
+
+
+def floodof(tt, start, n):
+    """The n bytes of a flood in output from start on: where it begins
+    on Windows, past whatever ConPTY drew before it."""
+    text = bytes(tt.text[start:])
+    at = max(text.find(floodbytes(64)), 0) if tt.t.host.windows else 0
+    return text[at:at + n]
+
+
+def samedir(t, a, b):
+    if t.host.windows:
+        return (a or "").replace("\\", "/").rstrip("/").lower() == \
+               (b or "").replace("\\", "/").rstrip("/").lower()
+    return os.path.realpath(a or "") == os.path.realpath(b)
+
+
+def waitfile(t, path, within=5):
+    """A file's contents once it exists, or None after within seconds."""
+    deadline = time.monotonic() + within
+    while True:
+        got = t.host.read(path)
+        if got is not None or time.monotonic() >= deadline:
+            return got
+        time.sleep(0.05)
+
+
+def termsession(t, h):
+    return h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+
+
+@scenario(bound=30)
+def term_basic(t):
+    """A terminal's shell gets its size, its folder, the terminal's
+    environment without another terminal's, a resize, and term.busy while
+    a job has the terminal; its exit ends it with its status, after all
+    of its output."""
+    ttyprobe(t)
+    h = t.headless(env={"COLUMNS": "99", "LINES": "9", "TERM_SESSION_ID": "x",
+                        "ITERM_PROFILE": "y", "TERM": "dumb"})
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, cols=100, rows=30, xpx=800, ypx=600)
+        argv = tt.reply.get("argv")
+        t.check(argv and argv[-1] == "--tty-probe", f"argv {argv}")
+        t.check(samedir(t, tt.reply.get("cwd"), t.work), f"cwd {tt.reply.get('cwd')}")
+        tt.line("probe ready")
+        tt.type("size\n")
+        got = tt.line("size ")
+        px = "0x0" if t.host.windows else "800x600"  # a console has no pixels
+        t.check(got == f"size 100x30 {px}", got)
+        tt.type("cwd\n")
+        got = tt.line("cwd ")
+        t.check(samedir(t, got[4:], t.work), got)
+        for name, want in [("TERM", None), ("COLORTERM", "truecolor"),
+                           ("TERM_PROGRAM", "Prospero"), ("COLUMNS", "unset"),
+                           ("LINES", "unset"), ("TERM_SESSION_ID", "unset"),
+                           ("ITERM_PROFILE", "unset")]:
+            tt.type(f"env {name}\n")
+            got = tt.line(f"env {name}")
+            if name == "TERM":
+                t.check(got in ("env TERM=xterm-256color", "env TERM=xterm"), got)
+            elif want == "unset":
+                t.check(got == f"env {name} unset", got)
+            else:
+                t.check(got == f"env {name}={want}", got)
+        h.send("term.resize", tid=tt.tid, cols=120, rows=40)
+        got = tt.line("winch ")
+        t.check(got == "winch 120x40", got)
+
+        tt.type("busy 2500\n")
+        tt.pump(lambda x: 1 in x.busy, 10, "term.busy 1")
+        tt.line("busy done", 10)
+        tt.pump(lambda x: x.busy[-1:] == [0], 10, "term.busy 0")
+
+        tt.type("echo bye\nexit 3\n")
+        end = tt.ended()
+        t.check(end.get("code") == 3 and end.get("signal") == 0, f"term.end {end}")
+        t.check(end.get("off") == len(tt.data), f"end at {end.get('off')}, "
+                f"had {len(tt.data)}")
+        t.check(tt.text.rstrip(b" \n").endswith(b"bye"), f"the last output {bytes(tt.data[-80:])!r}")
+        deadline = time.monotonic() + 5
+        while h.call("status").get("terms") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        t.check(h.call("status").get("terms") == 0, "the terminal went")
+    finally:
+        h.close()
+
+
+@scenario(bound=90, alone=True)
+def term_flood(t):
+    """10 MiB through a terminal to a slow acker arrive byte for byte,
+    with no more than the window unacked at any time."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        n = 10 << 20
+        tt.ackevery = 1 << 20  # past the window: acks only once it stops
+        tt.slow = 0.02
+        start = len(tt.text)
+        tt.type(f"flood {n}\n")
+        tt.pump(lambda x: x.text.find(b"flood end\n", start + n) >= 0, 80,
+                "the flood")
+        got = floodof(tt, start, n)
+        want = floodbytes(n)
+        if got != want:
+            bad = next((i for i in range(min(len(got), n)) if got[i] != want[i]),
+                       len(got))
+            raise Failure(f"the flood differs at byte {bad}")
+        text = bytes(tt.text[start:])
+        after = text[text.find(got) + n:]
+        t.check(after == b"flood end\n", f"after the flood {after[:40]!r}")
+        t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
+        t.check(tt.dups == 0 and tt.resends == 0,
+                f"{tt.dups} records again, {tt.resends} resends")
+        t.check(tt.window > TERM_WINDOW * 3 // 4, f"the window never filled: {tt.window}")
+        t.note(f"{tt.records} records, window {tt.window}")
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+    finally:
+        h.close()
+
+
+@scenario(bound=40)
+def term_resend(t):
+    """Output lost on the way is sent again from where a resend asks, and
+    output never acked is sent again after a stall."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        n = 1 << 20
+        start = len(tt.text)
+        tt.dropafter = len(tt.data) + 100000
+        tt.type(f"flood {n}\n")
+        tt.line("flood end", 20)
+        t.check(tt.dropped == 1 and tt.resends == 1,
+                f"dropped {tt.dropped}, resends {tt.resends}")
+        t.check(floodof(tt, start, n) == floodbytes(n), "the flood is whole")
+
+        # A stall: nothing acked for longer than TERM_STALL (3 s)
+        tt.hold = True
+        start = len(tt.text)
+        tt.type(f"flood {n}\n")
+        tt.pump(lambda x: len(x.data) - x.acked >= TERM_WINDOW, 10, "a full window")
+        before = tt.dups
+        time.sleep(4)
+        tt.pump(lambda x: x.dups > before, 5, "output sent again")
+        tt.hold = False
+        tt.ack()
+        tt.line("flood end", 20)
+        t.check(floodof(tt, start, n) == floodbytes(n), "the flood is whole")
+        t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
+        t.check(tt.end is None, f"no end: {tt.end}")
+    finally:
+        h.close()
+
+
+@scenario(bound=30)
+def term_close(t):
+    """term.close hangs up: the shell gets SIGHUP, and what ignores it
+    lives on; with kill, the shell's whole tree goes."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        hup = t.host.join(t.base, "hup1")
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type(f"hup {hup}\nnohup 30\n")
+        tt.line("hup set")
+        pid = int(tt.line("nohup ")[6:])
+        h.send("term.close", tid=tt.tid)
+        t.check(waitfile(t, hup) == "hup\n", "the shell got SIGHUP")
+        t.check(t.host.alive(pid), "what ignored the hang-up lives on")
+        t.host.killpid(pid)
+        count = tt.records
+        tt.type("echo more\n")  # dropped: the terminal is gone
+        time.sleep(0.5)
+        tt.pump(lambda x: True, 1)
+        t.check(tt.records == count and tt.end is None,
+                f"nothing more after close: {tt.records - count} records, end {tt.end}")
+
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("nohup 30\n")
+        pid = int(tt.line("nohup ")[6:])
+        h.send("term.close", tid=tt.tid, kill=True)
+        t.check(t.gone([pid]), "kill takes what ignored the hang-up too")
+        deadline = time.monotonic() + 5
+        while h.call("status").get("terms") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        t.check(h.call("status").get("terms") == 0, "both terminals went")
+
+        # Slots come free: more terminals than TERM_MAX (32), one by one
+        for i in range(40):
+            tt = Tty(t, h, sid)
+            tt.line("probe ready")
+            h.send("term.close", tid=tt.tid, kill=bool(i % 2))
+    finally:
+        h.close()
+
+
+@scenario(bound=30)
+def term_quit(t):
+    """A quit hangs up every terminal, and a deleted session's."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        other = termsession(t, h)
+        hup = t.host.join(t.base, "hup-delete")
+        tt = Tty(t, h, other)
+        tt.line("probe ready")
+        tt.type(f"hup {hup}\n")
+        tt.line("hup set")
+        keep = Tty(t, h, sid)
+        keep.line("probe ready")
+        h.call("close", sid=other)
+        r = h.call("delete", sid=other)
+        t.check(r.get("ok"), f"delete: {r}")
+        t.check(waitfile(t, hup) is not None, "deleting its session hung the terminal up")
+        keep.type("echo still\n")
+        keep.line("still")
+
+        hup = t.host.join(t.base, "hup-quit")
+        keep.type(f"hup {hup}\n")
+        keep.line("hup set")
+        r = h.call("term.open", sid=sid, cols=80, rows=24)
+        t.check(r.get("ok"), f"a second terminal: {r}")
+        h.call("quit")
+        h.exit()
+        t.check(waitfile(t, hup) is not None, "the quit hung the terminal up")
+    finally:
+        h.close()
+
+
+@scenario(bound=15)
+def term_errors(t):
+    """term.open refuses a bad or unknown session; the other commands
+    drop what names no terminal; an ack past what was sent is ignored."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        r = h.call("term.open", sid="../x", cols=80, rows=24)
+        t.check(not r.get("ok") and "invalid" in r.get("err", ""), f"bad sid: {r}")
+        r = h.call("term.open", sid="20200101-000000-0000", cols=80, rows=24)
+        t.check(not r.get("ok") and "no such session" in r.get("err", ""),
+                f"unknown sid: {r}")
+        h.send("term.input", tid=99, data="aGkK")
+        h.send("term.ack", tid=99, off=5)
+        h.send("term.close", tid=99)
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        h.send("term.ack", tid=tt.tid, off=1 << 30)  # past what was sent
+        h.send("term.input", tid=tt.tid, data="not base64!")
+        h.send("term.input", tid=tt.tid, peer=7, data="ZWNobyB4Cg==")  # not its frontend's
+        tt.type("echo ok\n")
+        # Nothing but ok may come, and the blank lines ConPTY repaints:
+        # neither the foreign input (x) nor the bad base64 reached it.
+        while (ln := tt.line("").strip()) != "ok":
+            t.check(ln == "", f"dropped input reached the shell: {ln!r}")
+        t.check(h.call("status").get("terms") == 1, "one terminal")
+    finally:
+        h.close()
+
+
+@scenario(bound=15)
+def term_refused(t):
+    """Where there is no pseudo-terminal, Windows before 10 1809 and so
+    XP, term.open says why; elsewhere it opens."""
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        r = h.call("term.open", sid=sid, cols=80, rows=24)
+        if isinstance(t.host, XpHost):
+            t.check(not r.get("ok") and "1809" in r.get("err", ""), f"term.open: {r}")
+        else:
+            t.check(r.get("ok"), f"term.open: {r}")
+            h.send("term.close", tid=r.get("tid"), kill=True)
+    finally:
+        h.close()
 
 
 # The soak: sessions under 10% random faults for a while

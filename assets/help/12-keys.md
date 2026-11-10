@@ -7,6 +7,12 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 
 - **Ctrl+N**: New session. Once it's made, the prompt box has the
   keyboard.
+- **Ctrl+K**: Go to, the palette: find a session by words from its
+  title, group, folder or host and show it, or a layout, pane,
+  setting or Help section. With nothing typed it
+  lists the sessions viewed before, so Ctrl+K then Enter goes back to
+  the previous one. Up, Down, Page Up and Page Down move the pick, and
+  Esc or Ctrl+K again closes it.
 - **Ctrl+Shift+N**: New session, no folder, with the default model:
   no dialog, straight to its prompt box.
 - **Ctrl+F**: find in the transcript. In Help or Settings, while it has
@@ -16,11 +22,15 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Alt+Up**: from a subagent or side chat, up to the session it
   came from (the up arrow above its transcript). On macOS, Option+Up,
   or Cmd+Up as in Finder.
+- **Ctrl+Shift+S**: fold, or show again, all of the session's shell
+  output (the Shell output button above the transcript, the Bash
+  logo), short output too, leaving its other tool rows as they were.
 - **Ctrl+Shift+T**: open, or fold again, all of the session's tool
   output (the Tool output button above the transcript, a wrench and
   screwdriver).
 - **Ctrl+Shift+R**: show, or fold again, all of its reasoning (the
-  Reasoning button, a light bulb).
+  Reasoning button, a light bulb). Each of these three buttons is
+  filled while it is on, and its tooltip says whether it is.
 - **Ctrl+1** to **Ctrl+9**: a layout, as View → Layout lists them:
   Standard, Compact, Focus, then those you saved.
 - **Ctrl+=** and **Ctrl+-** zoom the text in and out, and **Ctrl+0**
@@ -46,6 +56,12 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   returns to the empty draft.
 - **Tab** completes a `/` command or skill name, and Up and Down pick
   one from the list that shows as you type it.
+- **@** at the start of a word, after a space or `(`, opens a list of
+  the session's files and folders, and once a word is typed, other
+  sessions, ranked as you type. **Tab** or a
+  plain **Enter** puts the pick in the message without sending it,
+  **Up** and **Down** move the pick, and **Esc** closes the list before
+  it reaches the turn.
 - **Ctrl+G** opens the draft in your editor (`[ui] editor`); the draft
   becomes what you save, once the editor exits.
 - **Ctrl+V** pastes text, or attaches a copied image. **Ctrl+Shift+V**
@@ -77,8 +93,10 @@ which, folding, scrolls back to its header if that was above the view.
 In the find bar, **Enter** or **Ctrl+G** goes to the next match, and
 **Shift+Enter** or **Ctrl+Shift+G** to the previous. Only what shows is
 searched, not folded tool output or reasoning: Ctrl+Shift+T or
-Ctrl+Shift+R opens them all to search them too. **Esc** closes the
-bar.
+Ctrl+Shift+R opens them all to search them too. The search is in the
+text as shown, not its Markdown, ignoring case and how spaces and line
+breaks fall, so text copied from the transcript finds itself. **Esc**
+closes the bar.
 
 ## Dialogs
 

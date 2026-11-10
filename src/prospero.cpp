@@ -13,6 +13,17 @@
 #  define PROSPERO_VERSION "0.0.0"
 #endif
 
+// What the build is of beyond its version, for people (--version,
+// About), as " (v0.15.0-9-ga38cb70)", or "" for a release or without
+// the build's describe.h (cmake/GitDescribe.cmake). Never compared, as
+// PROSPERO_VERSION is, between programs.
+#if __has_include("describe.h")
+#  include "describe.h"
+#endif
+#ifndef PROSPERO_DESCRIBE
+#  define PROSPERO_DESCRIBE ""
+#endif
+
 // The edition (CMakeLists.txt): the itch.io builds are plain Prospero,
 // and source builds, as the GitHub releases, the Community Edition
 #if PROSPERO_ITCH
@@ -172,6 +183,10 @@ static void    os_logclose(Os *, iz log);
 static Read    os_readat(Os *, Arena *, Str path, i64 off, iz max);
 // (M2) The environment as "NAME=value" entries.
 static Slice<Str> os_environ(Os *, Arena *);
+// The environment this process started with, before a desktop-started
+// window took its login shell's (macOS), for a login shell of its own:
+// else os_environ's.
+static Slice<Str> os_launchenv(Os *, Arena *);
 // (M2) Read standard input: bytes read, 0 at its end, -1 on error.
 static iz      os_stdin(Os *, u8 *buf, iz len);
 
@@ -190,6 +205,7 @@ enum : u32 {
     CONN_NEW,       // (M5) os_listen: a Conn pointer, a connection made
     CONN_DATA,      // (M5) bytes a connection received, in order
     CONN_EOF,       // (M5) the connection's input ended or broke
+    PROC_READY,     // (term) os_ptyspawn: output waits in the ring
 };
 
 enum : i32 {
@@ -234,8 +250,15 @@ static Proc   *os_spawn(Os *, Spawn *, Arena scratch);
 // left the group (the reaper's sweep), or terminates the job. Prompt:
 // neither waits for the processes.
 static void    os_kill(Os *, Proc *, b32 hard);
-// Drop the caller's reference. Kills nothing by itself on POSIX, but on
-// Windows closing the last reference closes the job, killing the tree.
+// Let a child that exited go, and what it left running with it, as a
+// shell would (podman start's conmon, which holds its container up): on
+// POSIX its reaper ends without a sweep, and the orphans pass to the
+// system. Nothing on Windows, where the job closes with os_procfree as
+// before. Prompt: it does not wait for the reaper.
+static void    os_letgo(Os *, Proc *);
+// Drop the caller's reference. Kills nothing by itself on POSIX, where
+// the reaper lives on until os_kill or os_letgo, but on Windows closing
+// the last reference closes the job, killing the tree.
 static void    os_procfree(Os *, Proc *);
 
 // (M2) HTTP requests, each on its own thread, posting records to mbox:
@@ -282,6 +305,52 @@ static Proc   *os_spawnio(Os *, Spawn *, Arena scratch);
 // os_procfree. Returns 0 if the input is closed or broken (the child
 // stopped reading), or too much is queued already.
 static b32     os_procwrite(Os *, Proc *, Str);
+// (term) A child on a pseudo-terminal, a shell for a terminal tab. It
+// runs under a reaper as with os_spawn, but leads a session of its own,
+// the terminal its controlling one and its standard descriptors, every
+// signal at its default. Output fills a ring of ring bytes, and a full
+// ring stops reading it, holding the child back in time. PROC_READY,
+// which waits for room in the mailbox, says output arrived while none
+// was waiting to be told of: take it with os_ptypeek and os_ptytake
+// until the ring is empty, which alone re-arms PROC_READY. PROC_EOF
+// comes once nothing holds the terminal, or once the child exited and
+// 200 ms passed with nothing to read, whatever it left holding it
+// (bytes may still wait in the ring). PROC_EXIT as with os_spawn.
+// os_procwrite types input, and a null string does nothing. Closing is
+// a hang-up: os_procfree closes the terminal, dropping input not yet
+// written, and the kernel sends the child SIGHUP. Then os_letgo lets
+// its reaper end once the child exits, leaving what ignored the hang-up
+// (nohup) to the system, or os_kill (hard) sweeps the tree.
+struct PtySize {
+    i32 cols;
+    i32 rows;
+    i32 xpx;   // the whole grid in pixels, 0 if unknown
+    i32 ypx;
+};
+// Null on failure, explained by os_lasterr.
+static Proc   *os_ptyspawn(Os *, Spawn *, PtySize, iz ring, Arena scratch);
+// Output in the ring from off bytes past the oldest, perhaps not all of
+// it, valid until os_ptytake; empty when there is none, re-arming
+// PROC_READY. So output may be sent ahead and kept until acknowledged.
+static Str     os_ptypeek(Os *, Proc *, iz off);
+static void    os_ptytake(Os *, Proc *, iz len);  // drop len peeked bytes
+// The kernel tells the foreground programs (SIGWINCH). 0 on failure.
+static b32     os_ptyresize(Os *, Proc *, PtySize);
+// Whether a program other than the child runs in the foreground, as when
+// a shell runs a command.
+static b32     os_ptybusy(Os *, Proc *);
+// Whether os_ptyspawn can work here: on Windows, from 10 version 1809.
+static b32     os_ptyable(Os *);
+#if defined(_WIN32)
+enum { PTY_MAC = 0, PTY_LINUX = 0 };
+#elif defined(__APPLE__)
+enum { PTY_MAC = 1, PTY_LINUX = 0 };
+#elif defined(__linux__)
+enum { PTY_MAC = 0, PTY_LINUX = 1 };
+#else
+enum { PTY_MAC = 0, PTY_LINUX = 0 };
+#endif
+
 // A program started apart from this one, to outlive it, as a terminal
 // window is: neither waited for nor killed with it, its output nowhere,
 // in its own session (POSIX) or console (Windows). argv[0] is found on
@@ -497,6 +566,17 @@ enum {
 static void    os_guiflash(Os *, i32 how);
 // Whether the window has the keyboard focus, and is not minimized.
 static b32     os_guifocused(Os *);
+// The code point an ImGuiKey's key types under the current keyboard
+// layout, with Shift if shift and with AltGr if held, else 0: what a
+// terminal's Ctrl and Alt chords send, which bring no text. Asked
+// afresh each press, so a layout switch counts at once.
+static u32     os_guikeycp(Os *, i32 imguikey, b32 shift);
+// Drop any half-typed composition, such as a dead key pressed as part
+// of a chord the app took.
+static void    os_guiimereset(Os *);
+// Whether AltGr is held where the platform tells it apart from Ctrl+Alt
+// (ImGui sees neither Ctrl nor Alt from it there).
+static b32     os_guialtgr(Os *);
 
 // Synthetic input for the scripted checklist (gui --drive), posted to
 // the window's own event queue so that it takes the path real input
@@ -554,6 +634,12 @@ enum {
     GKEY_B,
     GKEY_2,
     GKEY_COMMA,
+    GKEY_S,
+    GKEY_GRAVE,  // ` (the Terminal pane's Ctrl+`)
+    GKEY_BACKSPACE,
+    GKEY_LEFT,
+    GKEY_D,
+    GKEY_K,
 };
 struct GuiEvent {
     i32 kind;
@@ -596,7 +682,10 @@ static void    os_guiplace(Os *, WinGeom);
 // The path chosen, or an empty one if cancelled, comes to the mailbox
 // as a record of the type with id, posted from whatever thread has the
 // answer. The dialog has the title, and suggests the file name. Returns
-// 0 if no dialog can be shown, when nothing is posted.
+// 0 if no dialog can be shown, when nothing is posted. A dialog that
+// turns out not to be shown after all, as on Linux with no desktop
+// portal, answers with a lone NUL byte, which no path can be; the open
+// dialogs below too.
 static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
                           u32 type, u64 id);
 // (M9) Ask which file to open, of a kind (OPEN_*), likewise: the path
@@ -659,10 +748,15 @@ static u32     os_guilimits(Os *);
 #include "frame.cpp"
 #include "provider.cpp"
 #include "anthropic.cpp"
+#include "responses.cpp"  // after anthropic.cpp: anpartblock, anappend
 #include "edit.cpp"
 #include "png.cpp"
 #include "image.cpp"
 #include "zip.cpp"    // after png.cpp and image.cpp: zcrc32, wuffsinflate
+#include "pdf.cpp"    // after image.cpp: wuffsinflateto
+#include "pdfenc.cpp" // after json.cpp: utf8strict
+#include "pdfimage.cpp"  // after png.cpp and image.cpp: pngfit, imgdecode
+#include "pdftext.cpp"   // after pdfimage.cpp
 #include "delta.cpp"
 #include "desktop.cpp"
 #include "tools.cpp"
@@ -678,6 +772,7 @@ static u32     os_guilimits(Os *);
 #include "help.cpp"   // after config.cpp and mcp.cpp: cfgkinds, hexval
 #include "engine.cpp"
 #include "relay.cpp"
+#include "ptyhost.cpp"  // after relay.cpp
 #include "git.cpp"
 #include "worktree.cpp"
 #include "cli.cpp"
@@ -706,6 +801,7 @@ static Str usage =
 "       prospero deploy NAME|DEST [--force] [options]\n"
 "       prospero eval [options] SUITE...\n"
 "       prospero mcp list | auth NAME | logout NAME [options]\n"
+"       prospero endpoint auth NAME | logout NAME [options]\n"
 "       prospero approve [URL] [options]\n"
 #if PROSPERO_DESKTOP
 "       prospero desktop COMMAND [ARGS]  (prospero desktop -h)\n"
@@ -726,6 +822,210 @@ static Str usage =
 #endif
 ;
 
+// prospero --pdf FILE: the built-in reader's text of a PDF, as read
+// extracts it, for checking it against a corpus (tests/pdfcheck.py) and
+// for triage of inputs too large for the fuzzer. Lines offset to
+// offset+limit-1, or all of them; stats on standard error. With
+// --images DIR, the images that window shows (pdfpick, then pdfimage)
+// are written there as p<page>-<N>.png or .jpg, N the image's number in
+// the text, within --edge and --pixels (the desktop's limits for kinds
+// other than anthropic by default), and the window is cut as read cuts
+// it, before the image past the most one shows; with --all, every
+// window's in turn. Exit 1 when the file is refused, with why, 2 for
+// usage.
+static i32 pdfmain(Os *os, Arena perm, Str *args, i32 nargs)
+{
+    Str usage  = "usage: prospero --pdf FILE [--offset N] [--limit N] [--all] "
+                 "[--images DIR [--edge N] [--pixels N]]\n";
+    Str path   = {};
+    Str dir    = {};
+    i64 offset = 1;
+    i64 limit  = 2000;
+    i64 edge   = DESK_EDGE_OAI;
+    i64 pixels = DESK_PIXELS_OAI;
+    b32 all    = 0;
+    for (i32 i = 2; i < nargs; i++) {
+        Str a = args[i];
+        if ((a=="--offset" || a=="--limit" || a=="--edge" || a=="--pixels") && i+1<nargs) {
+            Int n = parseint(args[++i]);
+            if (!n.ok || n.val<1) {
+                os_print(os, 2, usage);
+                return 2;
+            }
+            *(a=="--offset" ? &offset : a=="--limit" ? &limit :
+              a=="--edge" ? &edge : &pixels) = n.val;
+        } else if (a == "--all") {
+            all = 1;
+        } else if (a=="--images" && i+1<nargs) {
+            dir = args[++i];
+        } else if (!path.data && !startswith(a, "--")) {
+            path = a;
+        } else {
+            os_print(os, 2, usage);
+            return 2;
+        }
+    }
+    if (!path.data) {
+        os_print(os, 2, usage);
+        return 2;
+    }
+
+    Arena errs = carve(&perm, 16<<20);  // apart: images come and go in perm
+    Buf   err(&errs, 1024);
+    Arena region = newarena(os_reserve(os, PDF_REGION));
+    if (!region.beg) {
+        os_print(os, 2, "prospero --pdf: out of memory\n");
+        return 1;
+    }
+    Read rd = os_read(os, &region, path, PDF_READMAX);
+    if (rd.err != READ_OK) {
+        print(&err, "prospero --pdf: ");
+        print(&err, path);
+        print(&err, rd.err==READ_TOOBIG ? Str(": larger than the reader takes\n")
+                  : rd.err==READ_NOTFOUND ? Str(": not found\n")
+                  : Str(": cannot be read\n"));
+        os_print(os, 2, finish(&err));
+        return 1;
+    }
+
+    i64    t0 = os_ticks(os);
+    PdfOut r  = pdfread(&perm, region, rd.data, 0);
+    i64    us = os_ticks(os) - t0;
+    if (r.status!=PDFR_OK && r.status!=PDFR_PARTIAL) {
+        print(&err, "prospero --pdf: ");
+        print(&err, path);
+        print(&err, ": ");
+        print(&err, r.why);
+        putbyte(&err, '\n');
+        os_print(os, 2, finish(&err));
+        return 1;
+    }
+
+    // The window, by lines, and its images
+    Str text  = r.text;
+    iz  lines = 0;
+    for (iz i = 0; i < text.len; i++) {
+        lines += text[i] == '\n';
+    }
+    iz  first  = (iz)(offset<lines+1 ? offset : lines+1);
+    iz  last   = all || limit>lines-first+1 ? lines : first+(iz)limit-1;
+    i64 nimg   = 0;
+    i64 bytes  = 0;
+    i64 fails  = 0;
+    i64 imgus  = 0;
+    iz  cutat  = 0;
+    if (dir.data && !os_mkdirs(os, region, dir)) {
+        print(&err, "prospero --pdf: cannot make ");
+        print(&err, dir);
+        putbyte(&err, '\n');
+        os_print(os, 2, finish(&err));
+        return 1;
+    }
+    for (iz wf = first; dir.data && wf<=last;) {
+        PdfPick k = pdfpick(region, r.places, wf, last, edge, pixels, ATTACH_BYTES);
+        for (i32 i = 0; i < k.n; i++) {
+            PdfPlace *pl = r.places.data + k.at[i];
+            Arena     t  = perm;
+            i64       t1 = os_ticks(os);
+            PdfShown  s  = pdfimage(&t, region, rd.data, pl, k.edge, k.pixels, k.maxb64);
+            imgus += os_ticks(os) - t1;
+            Buf name(&t, 64);
+            putbyte(&name, 'p');
+            print(&name, (i64)pl->page);
+            putbyte(&name, '-');
+            print(&name, (i64)pl->id);
+            print(&name, s.mime=="image/jpeg" ? Str(".jpg") : Str(".png"));
+            Str file = finish(&name);
+            print(&err, "image ");
+            print(&err, (i64)pl->id);
+            print(&err, " page ");
+            print(&err, (i64)pl->page);
+            print(&err, " line ");
+            print(&err, pl->line);
+            print(&err, ": ");
+            Str path = join(&t, dir, file);
+            if (!s.data.data) {
+                fails++;
+                print(&err, s.err);
+            } else if (!os_write(os, t, path, s.data)) {
+                fails++;
+                print(&err, "cannot write ");
+                print(&err, file);
+            } else {
+                nimg++;
+                bytes += s.data.len;
+                print(&err, file);
+                putbyte(&err, ' ');
+                print(&err, (i64)s.w);
+                putbyte(&err, 'x');
+                print(&err, (i64)s.h);
+                putbyte(&err, ' ');
+                print(&err, s.data.len);
+                print(&err, " bytes");
+            }
+            putbyte(&err, '\n');
+        }
+        if (!all) {
+            cutat = k.cut ? k.last : 0;
+            last  = k.last;
+            break;
+        } else if (!k.cut) {
+            break;
+        }
+        wf = k.last + 1;
+    }
+
+    iz beg  = 0;
+    iz line = 1;
+    for (; beg<text.len && line<first; beg++) {
+        line += text[beg] == '\n';
+    }
+    iz end = beg;
+    for (; end<text.len && line<=last; end++) {
+        line += text[end] == '\n';
+    }
+    os_print(os, 1, {text.data+beg, end-beg});
+
+    print(&err, "status=");
+    print(&err, r.status==PDFR_OK ? Str("ok") : Str("partial"));
+    print(&err, " pages=");
+    print(&err, (i64)r.pages);
+    print(&err, " read=");
+    print(&err, r.pageline.len);
+    print(&err, " places=");
+    print(&err, r.places.len);
+    print(&err, " recovered=");
+    print(&err, (i64)r.recovered);
+    print(&err, " damaged=");
+    print(&err, (i64)pdfdamaged(region, rd.data));
+    print(&err, " bytes=");
+    print(&err, text.len);
+    print(&err, " ms=");
+    print(&err, us/1000);
+    if (dir.data) {
+        print(&err, " images=");
+        print(&err, nimg);
+        print(&err, " failed=");
+        print(&err, fails);
+        print(&err, " imagebytes=");
+        print(&err, bytes);
+        print(&err, " imagems=");
+        print(&err, imgus/1000);
+        if (cutat) {
+            print(&err, " cut=");
+            print(&err, cutat);
+        }
+    }
+    if (r.why.data) {
+        print(&err, " why=\"");
+        print(&err, r.why);
+        putbyte(&err, '"');
+    }
+    putbyte(&err, '\n');
+    os_print(os, 2, finish(&err));
+    return 0;
+}
+
 static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
     Arena perm    = mem;
@@ -742,6 +1042,8 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return climain(os, perm, scratch, args, nargs, 1);
     } else if (nargs>1 && args[1]=="--search") {
         return searchmain(os, perm, scratch, args, nargs);  // grep and glob
+    } else if (nargs>1 && args[1]=="--pdf") {
+        return pdfmain(os, scratch, args, nargs);  // the reader's text
     } else if (nargs>1 && args[1]=="serve") {
         return servemain(os, perm, scratch, args, nargs);
     } else if (nargs>1 && args[1]=="attach") {
@@ -754,14 +1056,14 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return deploymain(os, perm, scratch, args, nargs);
     } else if (nargs>1 && args[1]=="eval") {
         return evalmain(os, perm, scratch, args, nargs);
-    } else if (nargs>1 && (args[1]=="mcp" || args[1]=="approve")) {
+    } else if (nargs>1 && (args[1]=="mcp" || args[1]=="approve" || args[1]=="endpoint")) {
         return mcpmain(os, perm, scratch, args, nargs);
     }
 
     for (i32 i = 1; i < nargs; i++) {
         Str a = args[i];
         if (a == "--version") {
-            os_print(os, 1, "prospero " PROSPERO_VERSION "\n");
+            os_print(os, 1, "prospero " PROSPERO_VERSION PROSPERO_DESCRIBE "\n");
             return 0;
         } else if (a == "--selftest") {
             Str url = i+1<nargs ? args[i+1] : Str{};

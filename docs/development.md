@@ -143,4 +143,46 @@ llama.cpp router on this machine, and a model at Anthropic:
     $ prospero eval -m anthropic/claude-haiku-5-5 -f all -t t00-operator,t09-delete \
           -o claude.jsonl tests/bench/editbench
 
+`tests/pdfcorpus.py` builds a corpus of PDFs for testing PDF reading,
+from this machine's programs (TeX Live, Chrome, Quartz, Ghostscript,
+qpdf, tesseract), each skipped if missing: real producers' output,
+structural variants (object streams, LZW and other filters, an
+incremental update), damaged and hostile files, oddities of text
+(Type 3 fonts, ToUnicode, forms, invisible text) and images in every
+encoding. Its manifest says what each file is and what a reader should
+make of it; Poppler's reading of each is recorded beside. Its eval
+suite asks one question a task, answered through `read` alone:
+
+    $ uv run tests/pdfcorpus.py build-pdfcorpus
+    $ prospero eval -m MODEL -o pdf.jsonl build-pdfcorpus/eval
+
+The built-in PDF reader, which `read`, `web_fetch` and attachments use
+for models not sent PDFs as documents, runs alone too: `prospero --pdf
+FILE` prints a PDF's text as `read` would show it, with `--offset N`
+and `--limit N` for a window, `--all` for the whole text, and `--images
+DIR` to write the images that window shows, as a vision model would get
+them, with stats on standard error. `tests/pdfcheck.py` (CTest
+`pdfcorpus`, skipped when the corpus's programs are missing) builds the
+corpus and checks the reader's text and images against its manifest,
+known gaps listed in its XFAIL table:
+
+    $ prospero --pdf report.pdf --offset 100 --limit 50 --images /tmp/imgs
+    $ uv run tests/pdfcheck.py --prospero build/prospero
+
+The reader, its text encodings and its image decoding are fuzzed with
+AFL++, as the targets `FUZZ_PDF`, `FUZZ_PDFENC` and `FUZZ_PDFIMG` of
+`src/main_fuzz.cpp`, whose head gives the build and the seeds; the PDF
+target has a dictionary, `tests/pdffuzz.dict`:
+
+    $ afl-clang-fast -O2 -g3 -fsanitize=address,undefined \
+          -fsanitize-trap=undefined -I build/_deps/wuffs-src \
+          -c -o wuffs.o src/wuffs.c
+    $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
+          -fsanitize=address,undefined -fsanitize-trap=undefined \
+          -DFUZZ_PDF -o fuzzpdf src/main_fuzz.cpp wuffs.o
+    $ afl-fuzz -i i -o o -x tests/pdffuzz.dict ./fuzzpdf
+
+A crash too big for the fuzzer's 64 KiB inputs is triaged with
+`prospero --pdf`.
+
 [uv]: https://docs.astral.sh/uv/

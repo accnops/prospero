@@ -151,6 +151,9 @@ enum : i32 {
     FILL_SLACK = 16,  // points between a filling window's edge and its display's
 };
 
+// imgui_impl_sdl3.cpp's, which it leaves out of its header
+ImGuiKey ImGui_ImplSDL3_KeyEventToImGuiKey(SDL_Keycode, SDL_Scancode);
+
 struct TrayItem {
     GuiSdl *p;
     i32     item;  // TRAY_*
@@ -161,6 +164,9 @@ struct GuiSdl {
     SDL_Window   *window;      // null while shed (os_guished)
     SDL_Window   *waiter;      // hidden, while shed: SDL waits on it
     SDL_GLContext gl;
+    b32           gles;        // gl is OpenGL ES 3.0, not 3.2 core
+    i32           keysc[ImGuiKey_NamedKey_COUNT];  // each key's scancode,
+                                                   // as last pressed
     SDL_Tray     *tray;
     TrayItem      items[3];
     u32           wakeevent;
@@ -1038,6 +1044,26 @@ static SDL_Surface *appicon(Arena scratch, i32 n)
     return s;
 }
 
+// SDL's last error, kept: the next call may replace it.
+static Str sdlerror(Arena *a)
+{
+    char const *why = SDL_GetError();
+    return clone(a, Str{(u8 *)why, (iz)__builtin_strlen(why)});
+}
+
+// Why the window could not open, as SDL says, before the caller's
+// "could not open a window": which step failed, and its reason.
+static b32 sdlfailed(Os *os, Arena t, Str what, Str why = {})
+{
+    why   = why.len ? why : sdlerror(&t);
+    Str s = concat(&t, "prospero: ", what);
+    if (why.len) {
+        s = concat(&t, concat(&t, s, ": "), why);
+    }
+    os_print(os, 2, concat(&t, s, "\n"));
+    return 0;
+}
+
 static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -1078,7 +1104,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     nopersist();
     #endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        return 0;
+        return sdlfailed(os, g->frame, "no display (Wayland or X11)");
     }
     p->wakeevent  = SDL_RegisterEvents(3);
     p->trayevent  = p->wakeevent + 1;
@@ -1099,16 +1125,23 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     return 1;
 }
 
+// The context a window is made for: OpenGL 3.2 core, which every GPU of
+// the last fifteen years has, or OpenGL ES 3.0, which some virtual GPUs
+// give alone (UTM's accelerated one: desktop OpenGL only to 2.1).
+static void glattrs(b32 es)
+{
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, es ? 0 : SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        es ? SDL_GL_CONTEXT_PROFILE_ES : SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, es ? 0 : 2);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+}
+
 // The window, its GL context, and ImGui's backends for them, which
 // os_guished takes down again.
 static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
 {
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-
     SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                             SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
     // Where it was last, if anywhere, fitted to the displays once it
@@ -1129,9 +1162,38 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     i32 h = geom.box.h;
     flags |= geom.max ? SDL_WINDOW_MAXIMIZED : 0;
     Arena t = g->frame;
+    glattrs(0);
+    p->gles   = 0;
     p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
     if (!p->window) {
-        return 0;
+        return sdlfailed(os, t, "no OpenGL window");
+    }
+    p->gl = SDL_GL_CreateContext(p->window);
+    if (!p->gl) {
+        Str core = sdlerror(&t);
+        SDL_DestroyWindow(p->window);
+        p->window = 0;
+        #ifndef __APPLE__
+        // Made again for ES: the window's framebuffer is chosen for the
+        // kind of context it will have
+        glattrs(1);
+        p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
+        p->gl     = p->window ? SDL_GL_CreateContext(p->window) : 0;
+        if (p->gl) {
+            p->gles = 1;
+            guilog(g, concat(&t, "OpenGL ES 3.0, as OpenGL 3.2 core is not here: ", core));
+        } else {
+            Str es = sdlerror(&t);
+            if (p->window) {
+                SDL_DestroyWindow(p->window);
+                p->window = 0;
+            }
+            sdlfailed(os, t, "no OpenGL 3.2 core context", core);
+            return sdlfailed(os, t, "nor OpenGL ES 3.0", es);
+        }
+        #else
+        return sdlfailed(os, t, "no OpenGL 3.2 core context", core);
+        #endif
     }
     #ifndef __APPLE__
     // On macOS the window's icon would replace the Dock's, which is the
@@ -1155,12 +1217,6 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     if (geom.ok && geom.full) {
         SDL_SetWindowFullscreen(p->window, 1);  // as it shows
     }
-    p->gl = SDL_GL_CreateContext(p->window);
-    if (!p->gl) {
-        SDL_DestroyWindow(p->window);
-        p->window = 0;
-        return 0;
-    }
     SDL_GL_MakeCurrent(p->window, p->gl);
     // The scheduler paces frames to the display. SDL's own vsync on macOS
     // waits in each swap for a display link tick, which never comes while
@@ -1172,6 +1228,8 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     p->glclear      = (GlClear)SDL_GL_GetProcAddress("glClear");
     p->glreadpixels = (GlReadPixels)SDL_GL_GetProcAddress("glReadPixels");
     if (!p->glviewport || !p->glclearcolor || !p->glclear) {
+        SDL_ClearError();
+        sdlfailed(os, t, "OpenGL lacks glViewport, glClearColor or glClear");
         SDL_GL_DestroyContext(p->gl);
         SDL_DestroyWindow(p->window);
         p->window = 0;
@@ -1184,7 +1242,7 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     #endif
 
     ImGui_ImplSDL3_InitForOpenGL(p->window, p->gl);
-    ImGui_ImplOpenGL3_Init("#version 150");
+    ImGui_ImplOpenGL3_Init(p->gles ? "#version 300 es" : "#version 150");
     gui_scale(g, contentscale(p->window));
 
     os->gui = p;  // before any thread can wake it
@@ -1287,6 +1345,12 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
             e->type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
             e->type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
         sdlplaced(os, p);
+    }
+    if (e->type == SDL_EVENT_KEY_DOWN) {
+        ImGuiKey k = ImGui_ImplSDL3_KeyEventToImGuiKey(e->key.key, e->key.scancode);
+        if (ImGui::IsNamedKey(k)) {
+            p->keysc[k - ImGuiKey_NamedKey_BEGIN] = (i32)e->key.scancode;
+        }
     }
     if (ImGui_ImplSDL3_ProcessEvent(e)) {
         gui_input(g, inputkind(e));
@@ -1395,6 +1459,40 @@ static void os_guiflash(Os *os, i32 how)
     SDL_FlashWindow(p->window, how==FLASH_CANCEL  ? SDL_FLASH_CANCEL :
                                how==FLASH_BRIEFLY ? SDL_FLASH_BRIEFLY :
                                                     SDL_FLASH_UNTIL_FOCUSED);
+}
+
+static u32 os_guikeycp(Os *os, i32 key, b32 shift)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || key<ImGuiKey_NamedKey_BEGIN || key>=ImGuiKey_NamedKey_END) {
+        return 0;
+    }
+    SDL_Scancode sc = (SDL_Scancode)p->keysc[key - ImGuiKey_NamedKey_BEGIN];
+    if (!sc) {
+        return 0;
+    }
+    SDL_Keymod  mod = (shift ? SDL_KMOD_SHIFT : 0) | (SDL_GetModState() & SDL_KMOD_MODE);
+    SDL_Keycode cp  = SDL_GetKeyFromScancode(sc, mod, 0);  // 1 drops mod
+    return cp>=0x20 && cp!=0x7f && cp<0x110000 ? cp : 0;
+}
+
+// Wayland has no SDL_ClearComposition, and its xkb compose state takes
+// a dead key even with Ctrl held, but restarting text input resets it,
+// along with the input method's own state.
+static void os_guiimereset(Os *os)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || !p->window || !SDL_TextInputActive(p->window)) {
+        return;
+    }
+    SDL_ClearComposition(p->window);
+    SDL_StopTextInput(p->window);
+    SDL_StartTextInput(p->window);
+}
+
+static b32 os_guialtgr(Os *)
+{
+    return (SDL_GetModState() & SDL_KMOD_MODE) != 0;
 }
 
 static b32 os_guifocused(Os *os)
@@ -1519,6 +1617,12 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_B,      SDL_SCANCODE_B},
             {SDLK_2,      SDL_SCANCODE_2},
             {SDLK_COMMA,  SDL_SCANCODE_COMMA},
+            {SDLK_S,      SDL_SCANCODE_S},
+            {SDLK_GRAVE,  SDL_SCANCODE_GRAVE},
+            {SDLK_BACKSPACE, SDL_SCANCODE_BACKSPACE},
+            {SDLK_LEFT,   SDL_SCANCODE_LEFT},
+            {SDLK_D,      SDL_SCANCODE_D},
+            {SDLK_K,      SDL_SCANCODE_K},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;
@@ -1691,10 +1795,12 @@ static void SDLCALL savedone(void *ud, char const * const *files, int)
 {
     SdlSave *s    = (SdlSave *)ud;
     Str      path = {};
-    if (files && files[0]) {
+    if (!files) {
+        path = Str("\0");  // no dialog after all: no desktop portal, nor zenity
+    } else if (files[0]) {
         path = {(u8 *)files[0], (iz)SDL_strlen(files[0])};
     }
-    mailpost(s->mb, s->type, s->id, path, 1);  // empty: cancelled, or failed
+    mailpost(s->mb, s->type, s->id, path, 1);  // empty: cancelled
     SDL_free(s);
 }
 
@@ -1869,7 +1975,8 @@ static Slice<FontFile> os_guifonts(Os *os, Arena *a, Arena scratch, Str statedir
             break;
         }
     }
-    Str lang = takehead(loc, 2);
+    // Often unset, or C: no language
+    Str lang = loc.len>=2 ? takehead(loc, 2) : Str{};
     Str first = lang=="ja" ? Str("ja") : lang=="ko" ? Str("ko") :
                 lang!="zh" ? Str{} :
                 find(loc, "TW")>=0 || find(loc, "HK")>=0 || find(loc, "MO")>=0 ||

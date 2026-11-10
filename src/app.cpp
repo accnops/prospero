@@ -71,8 +71,11 @@
 #include "place.cpp"
 #include "compose.cpp"
 #include "pathpick.cpp"
+#include "filewalk.cpp"
 #include "sidebar.cpp"
 #include "dock.cpp"
+#include "termset.cpp"
+#include "palette.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -88,7 +91,7 @@ enum : iz {
     INBOX_CAP  = 1<<21,   // bytes per inbox buffer
     FIELD_MAX  = 1<<10,   // bytes of a settings or dialog field
     REQ_MAX    = 64,      // commands awaiting replies
-    FIND_BUDGET = 4<<20,  // bytes of text a frame searches at most
+    FIND_BUDGET = 2<<20,  // bytes of text a frame searches at most
 };
 
 enum : i64 {
@@ -106,6 +109,12 @@ enum : i32 {
     ENGINE_INPROC,
     ENGINE_SUBPROCESS,
     ENGINE_FAKE,
+};
+
+// The sidebar's order (the sort button), kept with the layout
+enum : i32 {
+    SIDESORT_ACTIVITY,  // roots by their latest activity, the default
+    SIDESORT_CREATED,   // newest made first
 };
 
 // Input kinds, recorded for staleness reports
@@ -214,6 +223,7 @@ enum : i32 {
     RECT_PARENTLINK, // a subagent's link to its parent
     RECT_MSGLINK,    // the latest message's link to its other session
     RECT_UNDO,       // the latest Undo on a tool row
+    RECT_HOLD,       // the latest ask's Keep waiting
     RECT_REWINDTURN, // the latest Rewind to here
     RECT_REWINDOK,   // the rewind confirmation's buttons
     RECT_REWINDCANCEL,
@@ -239,9 +249,11 @@ enum : i32 {
     RECT_REFRESHINC, // the settings window's Refresh includes
     RECT_CODEBLOCK,  // the code block aimed at (selectcode), else the latest
     RECT_CODECOPY,   // and its Copy button, while shown
-    RECT_TOOLSBTN,   // the session bar's toggles
+    RECT_SHELLBTN,   // the session bar's toggles
+    RECT_TOOLSBTN,
     RECT_THINKBTN,
     RECT_FINDFIELD,  // the find bar's field
+    RECT_FINDNEXT,   // and its next arrow
     RECT_GAUGE,      // the context gauge
     RECT_PAGECOMBO,  // its pages as a combo, when narrow
     RECT_DIAGPAGE,   // its Diagnostics page in the list
@@ -398,6 +410,10 @@ struct GuiEndpoint {
     b32        ok;
     Str        err;     // why not, if not
     Slice<Str> models;  // ids, as listed
+    b32        signedin;  // kinds chatgpt and copilot: signed in, as whom
+    Str        email;     // (ChatGPT's)
+    Str        login;     // (GitHub's)
+    Str        plan;
 };
 
 // A shell a host's engine listed (shells), for the shell picker.
@@ -431,10 +447,11 @@ struct GuiHost {
     Remote  *r;         // GH_LOCAL and GH_REMOTE while connected, else null
     Mailbox *inbox;     // its records, which wake the GUI
     i32      state;     // RS_*, from its "remote" records
-    Str      msg;       // why it is down, or failed
+    Str      msg;       // why it is down, or failed (the host toast, a tooltip)
     b32      deploys;   // failed, where deploying an engine would help
-    b32      deployfail; // a deployment there failed, said in the deploy toast
-    i32      deployfrom; // the pane its latest deployment began from (PANE_*)
+    b32      deployfail; // a deployment there failed, said in the host toast
+    i32      toastfrom; // the pane its latest connect or deployment began from
+    b32      asked;     // a click began its latest connect: its failure a toast
     i64      retryat;   // epoch ms: it tries again then, while down
     b32      up;        // it answered hello
     b32      closing;   // asked to close: its records are let go
@@ -444,6 +461,7 @@ struct GuiHost {
     b32      ctr;       // a container made for sessions (GuiCtr): its Trash stops it
     Str      taskexec;  // a container made for a subagent (ctrtask): its exec
     Str      taskimage; // and its image
+    Ctr     *taskctr;   // and its container.ini
     i64      pid;       // GH_LOCAL: the host's process
     i64      started;   // GH_LOCAL: epoch ms
     Str      endpoint;  // GH_LOCAL
@@ -549,6 +567,8 @@ enum : i32 {
     GUI_RELAYQ = 8 << 20,   // bytes of a host's lines waiting for room
 };
 
+// MentionIdx is not forward declared here: filewalk.cpp, included above,
+// defines it whole, and GuiSession below holds a pointer to it.
 struct AttBox;
 
 // The user's answers to the agent's questions (ask_user) as they fill
@@ -566,6 +586,8 @@ struct QForm {
 };
 
 // A session the GUI knows: listed by the engine, or opened here.
+struct TermTab;
+
 struct GuiSession {
     GuiSession  *next;
     GuiHost     *host;      // where it runs
@@ -590,6 +612,11 @@ struct GuiSession {
     Str          wtbranch;  // and branch
     b32          wtgone;    // and it is not there now, removed
     i64          mtime;
+    i64          lastact;   // its latest activity (evactivity), epoch ms on
+                            // its host's clock, never before it was made
+    i64          sortat;    // the time the sidebar orders it by, which
+                            // holds still while the pointer is there
+    i64          viewseq;   // when last shown here, by g->viewseq; 0 if not
     i64          jobs;      // running background jobs, from the list
     i64          openid;    // the open in flight, 0 if none
     i32          depth;     // under its parent in the sidebar, this frame
@@ -604,11 +631,20 @@ struct GuiSession {
     i32          histmsg;   // its message in the view
     Str          note;      // what the latest command from the box came to
     b32          noteerr;
+    b32          notefixed; // it says what typing does not clear (a mention's)
     i64          noteat;    // when, in sched µs: a note not an error fades
     Str          cmdtext;   // that command, put back in the box if it fails
     i64          unqueue;   // the queued message being withdrawn, else 0
     Str          cuttext;   // the prompt a rewind (cut) put in the box
     i64          cmdid;
+    // The '@' picker (mention.cpp, ui.cpp): the queued edit and the '@'
+    // the user dismissed are per session, so neither can land in another
+    // session's box
+    MentionIdxs *midx;      // the '@' picker's file lists, built when it opens
+    MentionEdit  medit;     // a pick's edit, waiting for the box's next frame
+    MentionKeep  mattach;   // a picked file, attached as the next frame begins
+    i32          mutebeg;   // the '@' the user dismissed, -1 for none
+    i32          draftslen; // the draft's length last frame, to spot a paste
     AttBox      *att;       // images attached to the draft, null until one is
     Str          group;     // its group, from the list (only a root's counts)
     b32          archived;  // from the list (only a root's counts)
@@ -630,6 +666,7 @@ struct GuiSession {
     GuiSession  *toastsel;  // what a click on it selects, under it
     QForm       *qform;     // the answers to the agent's questions, null
                             // until it first asks
+    TermSet      terms;     // a root's terminal tabs (term.cpp)
 };
 
 // A command awaiting its reply.
@@ -681,6 +718,9 @@ struct DirList {
     i64              id;    // its dir command in flight, 0 if none
     b32              got;   // ents and err are an answer
     b32              more;  // there were more entries than these
+    b32              files; // files listed too, for the '@' picker: a listing
+                            // of its own, so files cannot crowd out the
+                            // folders the new session dialog lists
 };
 
 enum : i32 {
@@ -690,7 +730,8 @@ enum : i32 {
 
 enum : i64 {
     DIRLIST_TTL = 5000000,  // µs
-    DIRLIST_MAX = 2000,     // entries of a folder listed here
+    DIRLIST_MAX   = 2000,   // folders of a folder listed here
+    DIRLIST_FILES = 4000,   // entries, files too, of one the '@' picker lists
 };
 
 // The new session dialog's directory field's completion: the folders
@@ -710,6 +751,27 @@ struct PathComp {
     i32      rows;     // its picks, 0 if it was not drawn
     char     first[64];
     i64      accepts;
+};
+
+// The Ctrl/Cmd+K palette (palette.cpp, drawpalette): its items, each
+// one's session, and their order for the query, built in mem as it
+// opens and as the query changes, never in between.
+struct PalWin {
+    Arena               mem;
+    byte               *base;
+    Slice<PalItem>      items;
+    Slice<GuiSession *> sess;    // each item's
+    Slice<i32>          order;
+    i32                 sel;     // the pick, a place in order
+    char                q[FIELD_MAX];
+    b32                 open;    // to be opened as dialogs are next drawn
+    b32                 close;   // to be closed likewise (Ctrl/Cmd+K again)
+    b32                 shown;   // open, as of this frame
+    b32                 prompt;  // the prompt had the keyboard as it opened
+    b32                 follow;  // the list to scroll to the pick
+    // For the checklist: the list as drawn last
+    i32                 rows;
+    char                first[64];
 };
 
 // A Markdown document, read-only, shown as the transcript shows a
@@ -983,6 +1045,24 @@ enum : i32 {
     EXP_ASKING,   // the dialog is up
 };
 
+// A file dialog asked for (askpath), kept in case the platform has none
+// to show, as Linux without a desktop portal or zenity has not: a field
+// of this window asks instead, its answer posted as the dialog's would be.
+enum : i32 {
+    ASK_SAVE,
+    ASK_OPEN,
+};
+struct PathAsk {
+    i32   kind;              // ASK_*
+    u32   type;              // the record the answer comes as (TASK_*)
+    u64   id;
+    Str   title;             // the dialog's, a literal
+    b32   open;              // the field's popup to open
+    b32   shown;             // and drawn, last frame
+    char  buf[FIELD_MAX];    // the field, from where the dialog would start
+    Str   err;               // why the path typed was not taken
+};
+
 struct Export {
     GuiSession *s;
     i32         kind;     // EXPORT_*
@@ -1070,12 +1150,25 @@ struct AttImage {
     Str     label;  // where it came from: a file's name, else empty
     Str     name;   // as uploaded, img/N.png or img/N.jpg, or files/N-NAME
     b32     file;   // a text file, not an image
+    b32     pdf;    // that file a PDF, whose text the engine extracts
     i64     bytes;  // and its size
     i64     lines;
+    Str     src;        // the absolute path it was read from, empty for a paste
+    b32     mention;    // an '@' pick made it: the send drops it with its token
+    b32     pathonly;   // a mention whose contents could not be attached: drawn
+                        // as a chip, never uploaded nor sent
+    Str     why;        // that chip's short reason, for its tooltip
+    Str     rpath;      // a mention on another machine: the path, relative to
+                        // the working directory, its engine attaches as the
+                        // message goes (upload {path}), until then no data
+};
+
+enum : i32 {
+    ATTACH_CHIPS = 10,  // path-only chips beside a message's attachments
 };
 
 struct AttBox {
-    AttImage imgs[ATTACH_MAX];
+    AttImage imgs[(i32)ATTACH_MAX + ATTACH_CHIPS];
     i32      len;
     i32      state;      // ATT_*
     i32      cur;        // the image uploading
@@ -1195,6 +1288,7 @@ struct Gui {
     Slice<Str>         skillsdirs; // --skillsdir DIR, each absolute
     i64                nextid;
     GuiHost           *cmdhost;    // where the command being written goes
+    b32                cmdquiet;   // and it has no id nor reply: lost, not failed
     Request            reqs[REQ_MAX];
     b32                engineok;   // it said hello
     b32                enginegone; // it stopped
@@ -1228,11 +1322,21 @@ struct Gui {
     Map<b32>          *folds;      // the user's fold choices (sidebar.cpp)
     Slice<Str>         groups;     // the groups' order, empty ones included
     b32                sidedirty;  // folds or groups changed: kept with the layout
+    i32                sidesort;   // SIDESORT_*: the sidebar's order, kept with the layout
+    i64                sideframe;  // the frame the sidebar last drew, to tell
+                                   // when it shows again
     GuiSession        *menusess;   // the session the context menu is for
     b32                dragcancel; // a session's drag ended by Escape: none
                                    // again until the button is up
     char               droplabel[FIELD_MAX]; // where the dragged session would go, this frame
-    ImVec4             trashrect;  // the trash strip, x0 y0 x1 y1, while dragging (dragtrash)
+    ImVec4             trashrect;  // the drop strip, x0 y0 x1 y1, while dragging (dragstrip)
+    i64                edgeat;     // when the dragging pointer came to an edge
+                                   // that scrolls, 0 if not at one (dragrest)
+    GuiSession        *gripsess;   // the session whose grip is held (rowactions)
+    Str                dothot;     // the fold key of the session whose dot the
+                                   // mouse is on, this frame: its rail lights
+    ImVec2             dragoff;    // where the dragged row was taken hold of,
+    b32                dragoffset; // from its corner, once set (dragcard)
     char              *namebuf;    // the naming dialog's field
     i32                nameask;    // NAME_*
     GuiSession        *namesess;
@@ -1247,6 +1351,8 @@ struct Gui {
     Mailbox           *tasks;      // the dialogs' and deployments' outcomes
     Export             exp;
     Import             imp;
+    PathAsk            pask;       // the latest file dialog asked for
+    b32                nodialog;   // the checklist's: the next one fails
     b32                openexport; // the Markdown export's options
     GuiSession        *exportsess;
     char              *modelbuf;   // the model picker's own name
@@ -1298,6 +1404,7 @@ struct Gui {
     char              *remdest;    // a new remote's ssh destination, or exec command
     b32                remexec;    // which
     char              *rempath;    // and its prospero, all New section's
+    i32                addepkind;  // a new endpoint's kind, EP_*
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
     PlanFile           plan;       // the Plan window's
@@ -1333,6 +1440,7 @@ struct Gui {
     b32                findopen;
     b32                findfocus;  // focus its field next frame
     b32                findactive; // its field had the keyboard
+    b32                findheld;   // the bar had the focus last frame
     b32                askactive;  // a question form's field had it
     f32                qformdrawn; // the latest question form's height, drawn
     b32                findjump;   // scroll to the current hit
@@ -1369,14 +1477,20 @@ struct Gui {
     b32                wtfill;     // a suggestion just put in wtname
     WtProbe            wtp;        // the folder's, for either dialog
     GuiSession        *wtsess;     // the worktree session dialog's original
+    GuiSession        *mvsess;     // and the fork into another folder's
+    b32                openmv;
     Str                wtquote;    // and the draft it gets
     b32                openwt;
     Str                newrole;    // in this role, if any
     PathComp           pc;         // newcwd's completion
+    PalWin             palw;       // the Ctrl/Cmd+K palette
+    i64                viewseq;    // sessions shown so far (GuiSession.viewseq)
     i64                newid;      // the new command in flight
     char              *denynote;   // "Deny with note"
     Str                denyreq;
     GuiSession        *denysess;
+    b32                denytimed;  // the ask has a deadline
+    i64                denytouch;  // when ask.touch last went, epoch ms
     i32                opendeny;   // 2 to keep planning
     b32                denyplan;
     b32                openrewind; // the rewind confirmation, for
@@ -1466,6 +1580,7 @@ struct Gui {
     b32                realreveal; // the checklist's show the file manager
     // Desktop notifications ([ui] notify, toastpass)
     u32                notify;     // NOTIFY_*
+    b32                nomentions; // [ui] mentions = false: '@' is plain text
     i32                toastids;   // the last id given a root
     b32                toastprep;  // the platform made ready
     Str                toastwhy;   // the latest refusal, said in the log
@@ -1486,6 +1601,24 @@ struct Gui {
     Json              *mcplist;    // its servers, null until one came
     i64                mcplistid;  // a listing under way
     i64                mcplistat;  // ms: the last one asked then
+    // The tools of the server whose page shows (mcp {name, tools}),
+    // asked as the listing is, and a tools value its checkboxes sent,
+    // held until a config.get asked after it comes back
+    Region            *mcptmem;    // made anew each time, sized to the reply
+    Json              *mcptlist;   // its entries, null until they came
+    char               mcptbuf[FIELD_MAX];
+    Str                mcptfor;    // the name they are for (mcptbuf)
+    i64                mcptid;
+    i64                mcptat;
+    b32                mcptstart;  // List tools: the next ask starts it,
+    b32                mcptsent;   //   once a visit
+    char               mcppbuf[1<<13];
+    Str                mcppend;    // the value sent, null to remove it
+    Str                mcppendfor; // the server's, null if none held
+    i64                mcppendid;  // its config.set
+    char               mcppfor[FIELD_MAX];
+    char               mcpmbuf[FIELD_MAX];
+    Str                mcpmade;    // a section a checkbox wrote anew, null if none
     // What waits for approval (approve), for the pages of [mcp] and
     // [endpoint] sections a web include gives the url of, listed as the
     // servers are
@@ -1494,6 +1627,10 @@ struct Gui {
     i64                apprlistid;
     i64                apprlistat;
     Str                mcpname;    // the server signing in, null if none
+    b32                mcpep;      // or rather the endpoint (ChatGPT's)
+    Str                mcpcode;    // a device flow's (Copilot's): the code
+    Str                mcpcodeurl; // to enter at this page, while it waits
+    Str                eplistfor;  // the endpoint whose page asked for a listing
     i64                mcpcmd;     // its mcp.auth or mcp.code under way
     u64                mcpback;    // its loopback's records' id
     Str                mcpmsg;     // how its sign-in went, for its page
@@ -1511,6 +1648,13 @@ struct Gui {
     Str                edlog;      // the editor's output
     Str                edname;     // as the box names it
     i32                slashsel;   // the slash popup's pick, among its matches
+    i32                mentionsel;   // the '@' popup's pick, among its rows
+    MentionKeep        mentionpath;  // the selected row's path, which survives
+                                     //   a re-rank
+    MentionKeep        mentionquery; // the query that pick was made for: a new
+                                     //   one starts again at the top
+    MentionKeep        mentionstatus; // the '@' popup's one line, as drawn:
+                                     //   the source's status, without its keys
     GuiSession        *pickmodel;  // /model's list is open for it
     GuiSession        *pickshell;  // /shell's list is open for it
     i32                menuact;    // a context menu pick waiting for the box
@@ -1524,10 +1668,11 @@ struct Gui {
     b32                panes[PANE_COUNT];  // shown, as the View menu says
     i64                panedrawn[PANE_COUNT];  // total.frames when last drawn
     i32                inpane;     // PANE_*+1 while drawing it, else 0
-    // A failed deployment (deployfailed), told in a toast in the pane it
-    // began from, or the other where that is not shown (drawdeploytoast)
-    u64                dtoasthost;  // its host's uid, 0 if none
-    Str                dtoasttext;
+    // A failed connect, deployment or update (hostfailed), told in a
+    // toast in the pane it began from, or the other where that is not
+    // shown (drawhosttoast)
+    u64                htoasthost;  // its host's uid, 0 if none
+    Str                htoasttext;
     // Sessions just moved to the Trash (guitrash), told in a toast with
     // Undo, in the Sessions pane or else Hosts, above any deploy toast
     TrashToast         trashtoast;
@@ -1571,6 +1716,36 @@ struct Gui {
     b32                opendellayout;
     i32                dellayout;  // the layout to delete, +1
     b32                openmodal;
+    // The Terminal pane (term.cpp)
+    b32                termhome;     // it has no home in the dock space yet
+    TermTab           *termspare;    // closed tabs, to reuse
+    GuiSession        *termbarroot;  // whose tabs the bar showed last
+    ImRect             termgrid;     // the front tab's grid, as last drawn
+    u32                termserial;   // the last tab's serial
+    b32                termfocus;    // focus the terminal when next drawn
+    GuiSession        *termaddto;    // root wanting a new tab once sized
+    i32                closeterms;   // busy tabs the quit dialog counted
+    i32                termscroll;   // [terminal] scrollback, for new tabs
+    i32                termregions;  // tabs' blocks reserved, for the drive
+    b32                termwaitshown; // the front tab showed Reconnecting, for the drive
+    b32                termsizeshown; // its size was shown over it (termsizetip)
+    Region            *termpasteregion;  // a paste waiting to be confirmed
+    Str                termpastetext;    //   in it
+    TermTab           *termpastetab;     //   for this tab
+    u32                termpasteserial;  //   while its serial is this
+    b32                termpasteopen;    //   its question to open
+    b32                termcopysel;  // [terminal] copy_on_select
+    TermTab           *termshowing;  // the tab drawn in front last
+    u32                termshowingserial;  // its serial then
+    i32                termlastcols; // the pane's size in cells last frame,
+    i32                termlastrows; //   before its shell starts
+    i64                termsizeat;   // µs: that size last changed, shown a while
+    ImVec2             termlastavail; // the pane's room for the grid last frame
+    b32                termfocused;  // it has the keyboard, as last drawn
+    ImGuiID            termid;       // its grid's item
+    i32                termforcecols;  // the checklist's grid size, past
+    i32                termforcerows;  // its pane's, else 0
+    i32                termverts;    // its window's vertices, as last drawn
 
     // Files and log
     Str                statedir;
@@ -1617,6 +1792,16 @@ struct Gui {
     b32                ambershown;   // the strip went amber
     b32                retryshown;   // the strip counted down to a retry
     b32                etashown;     // and to the prompt's end
+    b32                prateshown;   // and gave its rate
+    i32                stripform;    // the readouts' form last drawn: STRIP_*
+    b32                striprate;    // and the prompt's rate among them
+    b32                stripover;    // a readout ran past the pane's edge
+    Str                stripwhat;    // the first that did, and the room
+    b32                stripcramped; // a form other than STRIP_FULL was drawn
+    b32                stripseen;    // the readouts' line, last drawn: below
+    b32                stripbelow;   // the picks or not, with that room for
+    f32                striproom;    // them there
+    b32                stripbob;     // it changed lines in the same room
     b32                bannershown;  // the read-only banner was drawn
     b32                roclock;      // a read-only view's turn had a clock
     b32                queuedshown;  // the strip showed the line's position
@@ -1630,6 +1815,7 @@ struct Gui {
     i32                infoshown;    // instruction files the info listed
     i32                infoagents;   // of them AGENTS.md
     i32                infomems;     // memories the info listed
+    b32                infowork;     // the info had the work's rows
     i32                bgbadge;      // the session shown was badged background
     b32                outshown;     // the Output window showed text
     i32                thumbsdrawn;  // thumbnails drawn with their image
@@ -1642,6 +1828,7 @@ struct Gui {
     b32                thinkhidshown; // the strip said reasoning is hidden
     b32                copiedshown;  // a code block's button said Copied
     b32                clockshown;   // a message's time, under the mouse
+    b32                workedshown;  // a turn's work, in its last message's header
     i32                railfold;     // the message the fold rail last folded, plus one
     b32                railseen;     //   its header drawn in view this frame
     i32                gaugeshown;   // the gauge drew: 1, 2 if amber
@@ -1710,6 +1897,14 @@ struct Gui {
     Str                longval;      // the long setting before its edit
     WinGeom            geommark;     // the window's, as OP_GEOMMARK found it
     b32                slashshown;   // the slash popup drew
+    b32                mentionshown; // the '@' popup drew
+    i32                mentionrows;  // and how many rows it listed
+    i32                mentionkind;  // MENTION_*: where its candidates came
+                                     //   from (the enum is not defined yet)
+    b32                mentiontrunc; // its list was capped
+    b32                mentiontag;   // its pick was drawn marked attached
+    b32                mentionhold;  // the '@' index's walk is held, so the
+                                     //   picker lists a folder (OP_MENTIONHOLD)
     b32                cmenushown;   // the compose box's context menu drew
     u32                cmenustate;   // and what it enabled: 1 undo, 2 redo,
                                      // 4 cut and copy, 8 paste, 16 editor
@@ -1731,6 +1926,8 @@ struct Gui {
                                      // checklist's paste to restore
     Str                clippng;      // and the image it put there
     b32                promptfocus;  // activate the box when next drawn
+    i32                promptend;    // 1: with the caret at the draft's end,
+                                     // 2: the box is active to put it there
     b32                promptactive; // the box was active when last drawn
 };
 
@@ -1809,8 +2006,10 @@ static GuiSession *addsess(Gui *g, GuiHost *h, Str sid)
     GuiSession *s = alloc<GuiSession>(&g->perm);
     s->host  = h;
     s->sid   = clone(&g->perm, sid);
+    s->lastact = sidms(sid);  // made now, as far as it is known
     s->stick = 1;
     s->state = LIVE_CLOSED;
+    s->mutebeg = -1;  // no '@' dismissed: offset 0 is a real one
     s->next  = g->sessions;
     g->sessions = s;
     return s;
@@ -1850,6 +2049,9 @@ static void setcur(Gui *g, GuiSession *s)
 {
     if (g->sess && g->sess!=s) {
         draftsend(g, g->sess);  // left: its draft is kept now
+    }
+    if (s && s!=g->sess) {
+        s->viewseq = ++g->viewseq;  // the palette's empty query goes by it
     }
     g->sess = s;
     g->view = s && s->view ? s->view : g->nosession.view;
@@ -1928,11 +2130,17 @@ static void cmdfail(Gui *g, GuiHost *h, Arena scratch, i64 id, Str err)
 // follow the command's buffer.
 static void cmdsend(Gui *g, EvOut *w, Arena scratch)
 {
-    Str      line = evend(w);
-    GuiHost *h    = g->cmdhost;
+    Str      line  = evend(w);
+    GuiHost *h     = g->cmdhost;
+    b32      quiet = g->cmdquiet;
+    g->cmdquiet = 0;
     if (h->kind != GH_ENGINE) {
         // The library holds it while the host has not answered hello
-        if (!h->r || h->closing) {
+        if (quiet) {
+            if (h->r && !h->closing) {
+                remotetry(h->r, cuttail(line, 1));
+            }
+        } else if (!h->r || h->closing) {
             cmdfail(g, h, scratch, g->nextid, "not connected to the host");
         } else if (!remotetry(h->r, cuttail(line, 1))) {
             cmdfail(g, h, scratch, g->nextid, "too much is waiting to go to the host");
@@ -2294,6 +2502,141 @@ static void onmcplist(Gui *g, Str line, b32 ok)
     scheddirty(&g->sched);
 }
 
+// The tools of server NAME, for its page, asked as the listing is, and
+// once a visit with start when List tools was pressed. Another name's
+// page drops what came for the last one.
+static void mcptlisting(Gui *g, Str name)
+{
+    i64 now = os_time(g->os);
+    if (name != g->mcptfor) {
+        if (name.len > countof(g->mcptbuf)) {
+            return;
+        }
+        copybytes(g->mcptbuf, name.data, name.len);
+        g->mcptfor   = {(u8 *)g->mcptbuf, name.len};
+        g->mcptlist  = 0;
+        g->mcptid    = 0;  // a reply to the last one is dropped
+        g->mcptat    = 0;
+        g->mcptstart = g->mcptsent = 0;
+    }
+    if (g->mcptid || !engineup(g) || !hostcan(g->main, "mcp.auth")) {
+        return;
+    } else if (!g->mcptstart && g->mcptlist && now-g->mcptat < 2000) {
+        schedat(&g->sched, g->sched.now + (2000 - (now-g->mcptat))*1000, DUE_CLOCK);
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + name.len);
+    EvOut w = cmdopen(g, &b, CMD_MCP, 0, g->main);
+    putstrkey(&w.json, "name", name);
+    putintkey(&w.json, "tools", 1);
+    if (g->mcptstart) {
+        putintkey(&w.json, "start", 1);
+        g->mcptstart = 0;
+        g->mcptsent  = 1;
+    }
+    g->mcptid = g->nextid;
+    g->mcptat = now;
+    cmdsend(g, &w, a);
+}
+
+static void mcpsay(Gui *, Str, Str, b32);
+
+static void onmcptlist(Gui *g, Str line, b32 ok)
+{
+    g->mcptid = 0;
+    if (!ok) {
+        return;
+    }
+    // Room for the copy and its nodes, at most one for each two bytes
+    iz      cap = line.len + (line.len/2 + 64)*(iz)sizeof(Json) + ((iz)1<<16);
+    Region *mem = os_reserve(g->os, cap);
+    if (!mem) {
+        return;
+    }
+    if (g->mcptmem) {
+        os_release(g->os, g->mcptmem);
+    }
+    Arena a = newarena(mem);
+    Json *root = jsonparse(&a, clone(&a, line)).root;
+    g->mcptmem  = mem;
+    g->mcptlist = jsonget(root, "servers");
+    Str why = jsonstr(jsonget(root, "why"));
+    if (why.len) {
+        mcpsay(g, g->mcptfor, concat(&g->frame, "Not started: ", why), 1);
+    }
+    scheddirty(&g->sched);
+}
+
+static void guiconfigset(Gui *, Str, Str, Str, Str);
+static void guiconfigdelete(Gui *, Str, Str);
+
+// The tools value a server's checkboxes go by: the one sent, while held,
+// else the one in effect, null if unset. With incl, whether a file other
+// than the user's own sets it.
+static Str mcptoolsnow(Gui *g, Str name, b32 *incl)
+{
+    *incl = 0;
+    if (g->mcppendfor.data && g->mcppendfor==name) {
+        return g->mcppend;
+    }
+    Str own = {};
+    for (iz i = 0; i < g->cfgheads.len; i++) {
+        CfgHead *h = &g->cfgheads[i];
+        own = h->own ? h->file : own;
+    }
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="mcp" && r->name==name && r->key=="tools" && !r->isdflt) {
+            *incl = r->file.len && r->file!=own;
+            return r->value;
+        }
+    }
+    return {};
+}
+
+// A checkbox of server NAME's turned tool on or off: its tools key
+// rewritten (mcptoggle), held as sent until the configuration has it.
+// An error, null if none.
+static Str mcptset(Gui *g, Arena *a, Str name, Str tool, b32 on)
+{
+    b32       incl = 0;
+    Str       cur  = mcptoolsnow(g, name, &incl);
+    McpToggle t    = mcptoggle(a, cur, tool, on, incl);
+    if (t.err.len) {
+        return t.err;
+    } else if (t.value.len>countof(g->mcppbuf) || name.len>countof(g->mcppfor)) {
+        return "the list is too long to change here: edit the file";
+    }
+    // A section a checkbox made goes again once it holds nothing else
+    b32 own   = 0;
+    b32 other = 0;
+    for (iz i = 0; i < g->cfgheads.len; i++) {
+        CfgHead *h = &g->cfgheads[i];
+        own |= h->kind=="mcp" && h->name==name && h->own;
+    }
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        other |= r->kind=="mcp" && r->name==name && r->key!="tools" && !r->isdflt;
+    }
+    if (!own && !incl) {
+        copybytes(g->mcpmbuf, name.data, name.len);
+        g->mcpmade = {(u8 *)g->mcpmbuf, name.len};
+    }
+    if (t.drop && own && !other && g->mcpmade.data && g->mcpmade==name) {
+        guiconfigdelete(g, "mcp", name);
+        g->mcpmade = {};
+    } else {
+        guiconfigset(g, "mcp", name, "tools", t.drop ? Str{} : t.value);
+    }
+    copybytes(g->mcppbuf, t.value.data, t.value.len);
+    copybytes(g->mcppfor, name.data, name.len);
+    g->mcppend    = {(u8 *)g->mcppbuf, t.value.len};
+    g->mcppendfor = {(u8 *)g->mcppfor, name.len};
+    g->mcppendid  = g->cfgset;
+    return {};
+}
+
 // What waits for approval, listed at most every 2 s while a page that
 // shows it does.
 static void apprlisting(Gui *g)
@@ -2332,11 +2675,13 @@ static void onapprlist(Gui *g, Str line, b32 ok)
     scheddirty(&g->sched);
 }
 
-// A server of the listing, by name, or null.
+// A server of the configuration in the listing, by name, or only its
+// settings for projects' servers of that name (source overlay), or null.
 static Json *mcpof(Gui *g, Str name)
 {
     for (Json *s = g->mcplist ? g->mcplist->child : 0; s; s = s->next) {
-        if (jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="config") {
+        Str src = jsonstr(jsonget(s, "source"));
+        if (jsonstr(jsonget(s, "name"))==name && (src=="config" || src=="overlay")) {
             return s;
         }
     }
@@ -2368,6 +2713,34 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     print(&b, name);
     print(&b, ": ");
     *dot = g->pal->dim;
+    i32 proj[4] = {};  // projects' servers by name: ready, starting, failed, else
+    for (Json *s = g->mcplist ? g->mcplist->child : 0; s; s = s->next) {
+        if (jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="project") {
+            Str ps = jsonstr(jsonget(s, "state"));
+            proj[ps=="ready" ? 0 : ps=="starting" ? 1 : ps=="stopped" ? 3 : 2]++;
+        }
+    }
+    b32 overlay = jsonstr(jsonget(m, "source")) == "overlay";
+    if (hostcan(g->main, "mcp.auth") && (overlay || (!m && proj[0]+proj[1]+proj[2]+proj[3]))) {
+        // Settings for projects' servers of the name, each where it runs
+        print(&b, overlay && !jsonflag(jsonget(m, "enabled"), 1)
+                  ? Str("turned off for projects' servers of this name")
+                  : Str("projects' servers of this name"));
+        Str words[] = {" running", " starting", " failed", " not running"};
+        b32 any = 0;
+        for (i32 i = 0; i < 4; i++) {
+            if (proj[i]) {
+                print(&b, any ? Str(", ") : Str(": "));
+                print(&b, proj[i]);
+                print(&b, words[i]);
+                any = 1;
+            }
+        }
+        print(&b, any ? Str("") : Str(": none running"));
+        *dot = proj[2] ? g->pal->bad : proj[1] ? g->pal->amber :
+               proj[0] ? g->pal->ok  : g->pal->dim;
+        return finish(&b);
+    }
     if (!hostcan(g->main, "mcp.auth")) {
         print(&b, "the engine is too old to show it");
     } else if (!m) {
@@ -2400,13 +2773,72 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     return finish(&b);
 }
 
+// Endpoint NAME's kind as the configuration sets it, if it does
+static Str cfgepkind(Gui *g, Str name)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="endpoint" && r->name==name && r->key=="kind") {
+            return trim(r->value);
+        }
+    }
+    return {};
+}
+
+// A chatgpt or copilot endpoint's sign-in, as its page puts it (and the
+// checklist reads it), as the main host's engine lists it, with its
+// dot's color.
+static Str epstatus(Gui *g, Arena *a, Str name, u32 *dot, b32 copilot)
+{
+    GuiHost     *h   = g->main;
+    b32          can = h && hostcan(h, copilot ? Str("endpoint.copilot") : Str("endpoint.auth"));
+    GuiEndpoint *ep  = 0;
+    Str          svc = copilot ? Str("GitHub Copilot") : Str("ChatGPT");
+    for (iz i = 0; can && i < h->eps.len; i++) {
+        ep = h->eps[i].name==name ? &h->eps[i] : ep;
+    }
+    *dot = g->pal->dim;
+    Buf b(a, 256);
+    if (!can) {
+        print(&b, "The engine is too old to sign in to ");
+        print(&b, svc);
+    } else if (!ep || h->listid) {
+        print(&b, "...");
+    } else if (ep->signedin) {
+        print(&b, "Signed in to ");
+        print(&b, svc);
+        Str who = ep->email.len ? ep->email : ep->login;
+        if (who.len) {
+            print(&b, " as ");
+            print(&b, who);
+        }
+        if (ep->plan.len) {
+            print(&b, " (");
+            print(&b, ep->plan);
+            print(&b, ")");
+        }
+        *dot = g->pal->ok;
+    } else {
+        print(&b, "Not signed in to ");
+        print(&b, svc);
+        *dot = g->pal->amber;
+    }
+    return finish(&b);
+}
+
+static void cfgsay(Gui *, Str, b32);
+
+// How a sign-in or a server's command went, as Settings' toast says it
+// (cfgsay), over the foot of the page, which then moves nothing: an
+// error stays until dismissed or replaced. Kept for the checklist too.
 static void mcpsay(Gui *g, Str name, Str msg, b32 bad)
 {
     g->mcpmsg    = clone(&g->perm, msg);
     g->mcpmsgfor = clone(&g->perm, name);
     g->mcpbad    = bad;
-    guilog(g, concat(&g->frame, concat(&g->frame, name, ": "), msg));
-    scheddirty(&g->sched);
+    Str line = concat(&g->frame, concat(&g->frame, name, ": "), msg);
+    guilog(g, line);
+    cfgsay(g, line, !bad);
 }
 
 // A sign-in that ended, however it went.
@@ -2416,6 +2848,12 @@ static void mcpsigned(Gui *g, Str msg, b32 bad)
     g->mcpname = {};
     g->mcpcmd  = 0;
     g->mcpback++;  // a late return is no longer this one's
+    if (g->mcpep) {
+        g->mcpep     = 0;
+        g->eplistfor = {};  // its page lists again, signed in or not
+    }
+    g->mcpcode    = {};
+    g->mcpcodeurl = {};
     if (g->mcpbrowser) {
         os_httpcancel(g->os, g->mcpbrowser);
         os_httpfree(g->os, g->mcpbrowser);
@@ -2445,12 +2883,48 @@ static void mcpbrowse(Gui *g, Str url)
     }
 }
 
+// Sign in to ChatGPT for an endpoint (endpoint.auth), as to a server,
+// but at the redirect ChatGPT takes.
+// Or to GitHub Copilot (device), with no loopback: the engine replies
+// with a code to enter at GitHub's page (onmcpauth).
+static void epsignin(Gui *g, Str name, b32 device)
+{
+    if (g->mcpname.len) {
+        return;
+    }
+    Arena a        = newarena(g->cmdr);
+    u64   back     = ++g->mcpback;
+    Str   redirect = device ? Str{} : chatgptloopback(g->os, &a, g->tasks, TASK_MCPBACK, back);
+    if (!device && !redirect.len) {
+        mcpsay(g, name, "Cannot listen on this computer's loopback at port 1455 or "
+                        "1457, where ChatGPT's sign-in comes back: is another "
+                        "sign-in, the Codex CLI's perhaps, waiting there?", 1);
+        return;
+    }
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, CMD_EPAUTH, 0, g->main);
+    putkey(&w.json, "name");
+    putstr(&w.json, name);
+    if (!device) {
+        putkey(&w.json, "redirect");
+        putstr(&w.json, redirect);
+    }
+    g->mcpname = clone(&g->perm, name);
+    g->mcpep   = 1;
+    g->mcpcmd  = g->nextid;
+    mcpsay(g, name, device ? Str("Asking GitHub for a code...")
+                           : Str("Asking where to sign in..."), 0);
+    cmdsend(g, &w, a);
+}
+
 static void mcpsignin(Gui *g, Str name)
 {
     if (g->mcpname.len) {
         return;
     }
-    Str uri  = trim(mcprow(g, name, "redirect_uri"));
+    // Only for a server the section defines by url, not a project's
+    Str uri  = trim(mcprow(g, name, "url")).len ? trim(mcprow(g, name, "redirect_uri"))
+                                                 : Str{};
     Url at   = loopbackuri(uri);
     i32 port = at.ok ? at.port : 0;
     u64 back = ++g->mcpback;
@@ -2486,12 +2960,39 @@ static void mcpsignin(Gui *g, Str name)
     cmdsend(g, &w, a);
 }
 
+// A device flow's code came (endpoint.auth): shown with GitHub's page,
+// which the browser opens, while mcp.code waits for it to be entered.
+static void ondevicecode(Gui *g, Str url, Str code)
+{
+    g->mcpcode    = clone(&g->perm, code);
+    g->mcpcodeurl = clone(&g->perm, url);
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, CMD_MCPCODE, 0, g->main);
+    putkey(&w.json, "name");
+    putstr(&w.json, g->mcpname);
+    putintkey(&w.json, "endpoint", 1);
+    g->mcpcmd = g->nextid;
+    mcpsay(g, g->mcpname, "Waiting for the code at GitHub", 0);
+    cmdsend(g, &w, a);
+    if (g->drive && !g->realreveal) {
+        // The checklist's stand-in enters it
+        mcpbrowse(g, concat(&g->frame, concat(&g->frame, url, "?user_code="), code));
+    } else if (!os_guiopenurl(g->os, g->frame, url)) {
+        mcpsay(g, g->mcpname, concat(&g->frame, "Visit ", url), 0);
+    }
+}
+
 // mcp.auth's reply: the browser sent to sign in.
 static void onmcpauth(Gui *g, Json *j, b32 ok, Str err)
 {
-    Str url = jsonstr(jsonget(j, "url"));
+    Str url  = jsonstr(jsonget(j, "url"));
+    Str code = jsonstr(jsonget(j, "code"));
     if (!ok || !url.len) {
         mcpsigned(g, err.len ? err : Str("the engine gave no page to sign in at"), 1);
+        return;
+    } else if (code.len) {
+        ondevicecode(g, url, code);
         return;
     }
     g->mcpcmd = 0;
@@ -2518,6 +3019,9 @@ static void mcpback(Gui *g, Record r)
     EvOut w = cmdopen(g, &b, CMD_MCPCODE, 0, g->main);
     putkey(&w.json, "name");
     putstr(&w.json, g->mcpname);
+    if (g->mcpep) {
+        putintkey(&w.json, "endpoint", 1);
+    }
     Str keys[] = {"code", "state", "error", "error_description"};
     for (iz i = 0; i < countof(keys); i++) {
         Str v = mcpquery(&a, q, keys[i]);
@@ -2596,6 +3100,10 @@ static void onhostlist(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok)
         putbyte(&sig, 0);
         print(&sig, jsonint(jsonget(e, "ok"), 0));
         print(&sig, jsonstr(jsonget(e, "err")));
+        print(&sig, jsonint(jsonget(e, "signedin"), 0));
+        print(&sig, jsonstr(jsonget(e, "email")));
+        print(&sig, jsonstr(jsonget(e, "login")));
+        print(&sig, jsonstr(jsonget(e, "plan")));
         for (Json *m = jsonget(e, "models")->child; m; m = m->next) {
             putbyte(&sig, 0);
             print(&sig, jsonstr(m));
@@ -2618,6 +3126,10 @@ static void onhostlist(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok)
         ep.url  = clone(a, jsonstr(jsonget(e, "url")));
         ep.ok   = jsonint(jsonget(e, "ok"), 0) != 0;
         ep.err  = clone(a, jsonstr(jsonget(e, "err")));
+        ep.signedin = jsonint(jsonget(e, "signedin"), 0) != 0;
+        ep.email    = clone(a, jsonstr(jsonget(e, "email")));
+        ep.login    = clone(a, jsonstr(jsonget(e, "login")));
+        ep.plan     = clone(a, jsonstr(jsonget(e, "plan")));
         for (Json *m = jsonget(e, "models")->child; m; m = m->next) {
             Str id = jsonstr(m);
             if (id.len) {
@@ -2793,6 +3305,29 @@ static void guiconfigset(Gui *g, Str kind, Str name, Str key, Str value)
     }
     g->cfgset = g->nextid;
     cmdsend(g, &w, a);
+}
+
+// An endpoint's kind was just set to kind: its url follows, to the new
+// kind's own service (epkindurl), when it is unset, still another
+// kind's own, or the placeholder a new section gets (cfgseed's). A url
+// the user wrote stays.
+static void epurlfollow(Gui *g, Str name, Str kind)
+{
+    Str to  = epkindurl(epkindof(kind));
+    Str cur = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="endpoint" && r->name==name && r->key=="url" && !r->isdflt) {
+            cur = trim(r->value);
+        }
+    }
+    b32 stock = !cur.len || cur=="http://localhost/";
+    for (i32 k = 0; k < (i32)countof(epkinds); k++) {
+        stock |= cur.len && cur==epkindurl(k);
+    }
+    if (to.len && stock && cur!=to) {
+        guiconfigset(g, "endpoint", name, "url", to);
+    }
 }
 
 // Delete a section of the user's file.
@@ -3442,6 +3977,9 @@ static void guinew(Gui *g, GuiHost *h, Str cwd, Str endpoint, Str model, Str rol
     cmdsend(g, &w, a);
 }
 
+static Slice<Str> mentionrefs(Arena *, Gui *, GuiSession *, Str text);
+static void mentionputrefs(JsonOut *, Slice<Str> refs);
+
 // Send text to the current session: a prompt, or a steer while its turn
 // runs.
 static void guiprompt(Gui *g, Str text)
@@ -3450,12 +3988,14 @@ static void guiprompt(Gui *g, Str text)
     if (!s || !s->view || !text.len) {
         return;
     }
-    Arena a = newarena(g->cmdr);
-    Buf   b(&a, 256 + text.len);
-    EvOut w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
+    Arena      a    = newarena(g->cmdr);
+    Slice<Str> refs = mentionrefs(&a, g, s, text);  // before b, which grows
+    Buf        b(&a, 256 + text.len + 32*refs.len);
+    EvOut      w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
     s->stick = 1;  // to see the reply
     putkey(&w.json, "text");
     putstr(&w.json, text);
+    mentionputrefs(&w.json, refs);
     cmdsend(g, &w, a);
 }
 
@@ -3698,15 +4238,19 @@ static void guimode(Gui *g, GuiSession *s, Str mode)
 
 // A new session from a copy of this one's log, whole (turn < 0) or cut
 // after a turn, shown once made, with the prompt that came next, if
-// any, as its draft (onsesscmd).
-static void guifork(Gui *g, GuiSession *s, i64 turn)
+// any, as its draft (onsesscmd). With cwd, it works in that folder
+// instead (fork {cwd}).
+static void guifork(Gui *g, GuiSession *s, i64 turn, Str cwd = {})
 {
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 128);
+    Buf   b(&a, 128 + cwd.len);
     EvOut w = cmdopen(g, &b, CMD_FORK, s);
     if (turn >= 0) {
         putkey(&w.json, "turn");
         putint(&w.json, turn);
+    }
+    if (cwd.len) {
+        putstrkey(&w.json, "cwd", cwd);
     }
     s->cmdid   = g->nextid;
     s->cmdtext = {};
@@ -3736,7 +4280,7 @@ static void guiside(Gui *g, GuiSession *s, Str quote)
 
 static b32  hostready(Gui *, GuiHost *);
 static void fieldput(char *, Str);
-static void setnote(Gui *, GuiSession *, Str, b32);
+static void setnote(Gui *, GuiSession *, Str, b32, b32 fixed = 0);
 
 // What a change in Settings came to, shown as a toast (drawcfgtoast).
 static void cfgsay(Gui *g, Str text, b32 ok)
@@ -3903,22 +4447,41 @@ static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
     cmdsend(g, &w, a);
 }
 
-// The user works on the answers to the agent's questions: their clock
-// starts over (ask.touch), at most every 10 s, where the engine can.
-static void guitouchq(Gui *g, GuiSession *s, ViewTool *t, QForm *f)
+// The user works on the answer to a waiting ask: its clock starts over
+// (ask.touch), at most every 10 s, where the engine can (cap).
+static void guitouch(Gui *g, GuiSession *s, Str req, i64 *touched, Str cap)
 {
     i64 now = os_time(g->os);
-    if (!t->deadline || now-f->touched<10000 ||
-            !hostcap(s->host, "question.deadline")) {
+    if (now-*touched<10000 || !hostcap(s->host, cap)) {
         return;
     }
-    f->touched = now;
+    *touched = now;
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 128 + t->req.len);
+    Buf   b(&a, 128 + req.len);
     EvOut w = cmdopen(g, &b, CMD_ASKTOUCH, s);
     putkey(&w.json, "req");
-    putstr(&w.json, t->req);
+    putstr(&w.json, req);
     cmdsend(g, &w, a);
+}
+
+// The user chose to keep a waiting ask waiting, with no deadline
+// (ask.hold): the engine drops it, and says so with ask.deadline 0.
+static void guihold(Gui *g, GuiSession *s, Str req)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + req.len);
+    EvOut w = cmdopen(g, &b, CMD_ASKHOLD, s);
+    putkey(&w.json, "req");
+    putstr(&w.json, req);
+    cmdsend(g, &w, a);
+}
+
+// The user works on the answers to the agent's questions
+static void guitouchq(Gui *g, GuiSession *s, ViewTool *t, QForm *f)
+{
+    if (t->deadline) {
+        guitouch(g, s, t->req, &f->touched, "question.deadline");
+    }
 }
 
 // Answers to the agent's questions, from their form: picks and words of
@@ -4161,6 +4724,8 @@ static void setcfgstr(Gui *g, Str *dst, CfgRow r)
 static void wslremotes(Gui *);
 static void setnotify(Gui *, u32);
 
+static void palbuild(Gui *, b32);
+
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
 static void loadcfg(Gui *g, Str line)
@@ -4240,6 +4805,12 @@ static void loadcfg(Gui *g, Str line)
             setcfgstr(g, &g->editor, r);
         } else if (r.kind=="ui" && r.key=="terminal") {
             setcfgstr(g, &g->terminal, r);
+        } else if (r.kind=="terminal" && r.key=="scrollback") {
+            g->termscroll = termscrollparse(r.valid && r.value.len ? r.value : r.dflt);
+        } else if (r.kind=="terminal" && r.key=="copy_on_select") {
+            g->termcopysel = cfgbool(r.valid && r.value.len ? r.value : r.dflt) == 1;
+        } else if (r.kind=="ui" && r.key=="mentions") {
+            g->nomentions = cfgbool(r.valid && r.value.len ? r.value : r.dflt) == 0;
         } else if (r.kind=="ui" && r.key=="notify") {
             setnotify(g, notifyparse(r.valid && r.value.len ? r.value : r.dflt));
         } else if (r.kind=="tools" && r.key=="path_prepend") {
@@ -4267,6 +4838,9 @@ static void loadcfg(Gui *g, Str line)
         g->cfgrows = push(a, g->cfgrows, r);
     }
     wslremotes(g);
+    if (g->palw.shown) {
+        palbuild(g, 1);  // its settings, as they are now, the pick kept
+    }
 }
 
 static void guiopen(Gui *, GuiSession *);
@@ -4354,6 +4928,8 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         s->parent = s->parent==parent ? s->parent : clone(&g->perm, parent);
         s->remote = jsonint(jsonget(e, "remote"), 0) == 1;
         s->mtime  = jsonint(jsonget(e, "mtime"), 0);
+        i64 act   = jsonint(jsonget(e, "lastact"), 0);  // an older engine's: none
+        s->lastact = act>s->lastact ? act : s->lastact;
         s->jobs   = jsonint(jsonget(e, "jobs"), 0);
         s->locked = jsonint(jsonget(e, "locked"), 0) != 0;
         s->state  = livestate(state);
@@ -4398,7 +4974,7 @@ static void onfile(Gui *, Json *, b32 ok, Str err);
 static Str  draftstr(GuiSession *);
 static void draftput(Gui *, GuiSession *, Str);
 static void setdraft(Gui *, GuiSession *, Str);
-static void setnote(Gui *, GuiSession *, Str, b32);
+static void setnote(Gui *, GuiSession *, Str, b32, b32);
 static Str  sesstitle(GuiSession *);
 static Str  shorten(Arena *, Str, iz);
 
@@ -4408,6 +4984,17 @@ static Str  shorten(Arena *, Str, iz);
 // Why the session takes no attachment now, or empty if it does: a text
 // file, if its engine takes them ("files"), else an image, if its
 // model has vision.
+// The attachments a message carries, path-only chips aside: what the
+// limit of ATTACH_MAX counts.
+static i32 attachcount(AttBox *x)
+{
+    i32 n = 0;
+    for (i32 i = 0; i < x->len; i++) {
+        n += !x->imgs[i].pathonly;
+    }
+    return n;
+}
+
 static Str attachwhy(GuiSession *s)
 {
     AttBox *x = s ? s->att : 0;
@@ -4419,8 +5006,10 @@ static Str attachwhy(GuiSession *s)
         return "This model takes no images: [model] vision is off for it";
     } else if (x && x->state!=ATT_IDLE) {
         return "Wait for the attachments being sent";
-    } else if (x && x->len==ATTACH_MAX) {
+    } else if (x && attachcount(x)>=ATTACH_MAX) {
         return "At most 10 files go in a message";
+    } else if (x && x->len==countof(x->imgs)) {
+        return "No room for another attachment: remove one";
     }
     return {};
 }
@@ -4455,9 +5044,10 @@ static GuiTex *attthumb(Gui *g, Str data)
 
 // Attach an image, PNG, JPEG, GIF, WebP or BMP, which the engine
 // converts to a PNG if not a PNG or JPEG, or else a text file, which the
-// agent gets as read shows it, its bytes copied. A binary file, by read's
+// agent gets as read shows it, its bytes copied, or a PDF, whose text
+// the engine extracts, if it can ("pdf"). A binary file, by read's
 // measure, is refused. Returns why not, or empty if attached.
-static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
+static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
 {
     Str why = attachwhy(s);
     if (why.len) {
@@ -4465,14 +5055,19 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
     }
     ImageKind k    = imagekind(g->frame, data);
     Str       name = label.len ? label : Str("the pasted file");
+    b32       pdf  = !k.mime.len && pdfsniff(data) && pdflikely(data);
     if (!k.mime.len && !hostcap(s->host, "files")) {
         return "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached "
                "here, as this host's engine is too old to take text files";
-    } else if (!k.mime.len && readbinary(data)) {
-        return concat(&g->frame, name, " is a binary file: only text files and "
-                                       "images can be attached");
+    } else if (pdf && !hostcap(s->host, "pdf")) {
+        return concat(&g->frame, name, " is a PDF, which this host's engine is too "
+                                       "old to read: update the engine");
+    } else if (!pdf && !k.mime.len && readbinary(data)) {
+        return concat(&g->frame, name, " is a binary file: only text files, PDFs "
+                                       "and images can be attached");
     } else if (!k.mime.len && data.len>ATTACH_FILE) {
-        return "too large to attach: a text file is at most 16 MiB";
+        return pdf ? Str("too large to attach: a PDF is at most 16 MiB")
+                   : Str("too large to attach: a text file is at most 16 MiB");
     } else if (!k.mime.len) {
         Region *r = os_reserve(g->os, data.len + label.len + 4096);
         if (!r) {
@@ -4488,8 +5083,11 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
         m->data  = clone(&m->mem, data);
         m->label = clone(&m->mem, label.len ? label : Str("pasted.txt"));
         m->file  = 1;
+        m->pdf   = pdf;
         m->bytes = data.len;
-        m->lines = countlines(startswith(data, "\xef\xbb\xbf") ? cuthead(data, 3) : data);
+        m->lines = pdf ? 0 : countlines(startswith(data, "\xef\xbb\xbf") ? cuthead(data, 3)
+                                                                           : data);
+        m->src   = clone(&m->mem, src);
         scheddirty(&g->sched);
         return {};
     } else if (s->view->novision) {
@@ -4517,6 +5115,7 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
     m->w     = k.w;
     m->h     = k.h;
     m->tex   = attthumb(g, data);
+    m->src   = clone(&m->mem, src);  // set for an '@'-picked image too
     scheddirty(&g->sched);
     return {};
 }
@@ -4543,7 +5142,7 @@ static Str attachfile(Gui *g, GuiSession *s, Str path)
     } else if (rd.err != READ_OK) {
         err = concat(&g->frame, "cannot read ", path);
     } else {
-        err = attachadd(g, s, rd.data, name);
+        err = attachadd(g, s, rd.data, name, path);
     }
     os_release(g->os, r);
     return err;
@@ -4570,6 +5169,8 @@ static void attachnamedfile(Gui *g, GuiSession *s, Json *k)
     m->name  = clone(&m->mem, name);
     m->label = cut(cuthead(m->name, 6), '-').tail;
     m->file  = 1;
+    m->pdf   = endswith(m->label, ".pdf.txt");  // its text, kept beside it
+    m->label = m->pdf ? cuttail(m->label, 4) : m->label;
     m->bytes = jsonint(jsonget(k, "bytes"), 0);
     m->lines = jsonint(jsonget(k, "lines"), 0);
 }
@@ -4654,8 +5255,20 @@ static void attachnext(Gui *g, GuiSession *s)
     AttBox *x = s->att;
     Arena   a = newarena(g->cmdr);
     i32     i = 0;
-    for (; i<x->len && x->imgs[i].name.len; i++) {}
-    if (i < x->len) {
+    for (; i<x->len && (x->imgs[i].name.len || x->imgs[i].pathonly); i++) {}
+    if (i < x->len && x->imgs[i].rpath.len) {
+        // A mention on another machine: its engine reads it there
+        AttImage *m = x->imgs + i;
+        Buf       b(&a, 256 + 6*m->rpath.len);
+        EvOut     w = cmdopen(g, &b, CMD_UPLOAD, s);
+        putstrkey(&w.json, "kind", "file");
+        putstrkey(&w.json, "path", m->rpath);
+        x->state = ATT_UPLOADING;
+        x->cur   = i;
+        x->id    = g->nextid;
+        cmdsend(g, &w, a);
+        return;
+    } else if (i < x->len) {
         AttImage *m    = x->imgs + i;
         iz        n    = m->data.len - (iz)x->off;
         n              = n<(iz)UPLOAD_PART ? n : (iz)UPLOAD_PART;
@@ -4680,14 +5293,19 @@ static void attachnext(Gui *g, GuiSession *s)
         cmdsend(g, &w, a);
         return;
     }
-    Buf   b(&a, 256 + 2*x->text.len + 160*x->len);
+    Slice<Str> refs = mentionrefs(&a, g, s, x->text);  // before b, which grows
+    Buf   b(&a, 256 + 2*x->text.len + 160*x->len + 32*refs.len);
     EvOut w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
     putstrkey(&w.json, "text", x->text);
+    mentionputrefs(&w.json, refs);
     // The images, and the text files only if any, which older engines refuse
     b32 files = 0;
     putkey(&w.json, "images");
     putarray(&w.json);
     for (i32 k = 0; k < x->len; k++) {
+        if (x->imgs[k].pathonly) {
+            continue;  // a chip only: nothing was uploaded to name
+        }
         files |= x->imgs[k].file;
         if (!x->imgs[k].file) {
             putstr(&w.json, x->imgs[k].name);
@@ -4698,7 +5316,7 @@ static void attachnext(Gui *g, GuiSession *s)
         putkey(&w.json, "files");
         putarray(&w.json);
         for (i32 k = 0; k < x->len; k++) {
-            if (x->imgs[k].file) {
+            if (x->imgs[k].file && !x->imgs[k].pathonly) {
                 putstr(&w.json, x->imgs[k].name);
             }
         }
@@ -4714,14 +5332,19 @@ static void attachnext(Gui *g, GuiSession *s)
 static void attachsend(Gui *g, GuiSession *s, Str text)
 {
     AttBox *x = s->att;
-    s->cmdtext = clone(&g->perm, text);
-    s->note    = {};
-    s->stick   = 1;  // to see the reply
-    x->text    = s->cmdtext;
-    x->off     = 0;
-    x->toklen  = 0;
+    s->cmdtext   = clone(&g->perm, text);
+    s->note      = {};  // sent: no note, fixed or not
+    s->notefixed = 0;
+    s->stick     = 1;  // to see the reply
+    x->text      = s->cmdtext;
+    x->off       = 0;
+    x->toklen    = 0;
     attachnext(g, s);
 }
+
+// The note for a mention that went as a path (mention.cpp, included with
+// ui.cpp further down).
+static Str mentionpathnote(Arena *, Str name, Str why);
 
 // A reply to an upload of an attachment: on to the next part.
 static void onattach(Gui *g, GuiSession *s, EvRec *r)
@@ -4734,6 +5357,37 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
     i64       off   = jsonint(jsonget(j, "off"), -1);
     Str       name  = jsonstr(jsonget(j, "name"));
     x->id = 0;
+    if (m->rpath.len) {
+        // A mention its host's engine attached, or could not: one that
+        // could not goes as a path, as a mention here does, and the
+        // message is sent all the same
+        b32 image = jsonstr(jsonget(j, "kind")) == "image";
+        Str why   = {};
+        if (!jsonint(jsonget(j, "ok"), 0)) {
+            why = err.len ? err : Str("the host could not attach it");
+        } else if (!name.len || name.len>128) {
+            why = "the host's answer came garbled";
+        } else if (image && s->view && s->view->novision) {
+            why = "this model takes no images";
+        }
+        if (why.len) {
+            m->pathonly = 1;
+            m->why      = clone(&m->mem, why);
+            setnote(g, s, mentionpathnote(&g->frame, m->label, why), 0);
+        } else {
+            m->name  = clone(&m->mem, name);
+            m->file  = !image;
+            m->pdf   = !image && endswith(name, ".pdf.txt");
+            m->mime  = clone(&m->mem, jsonstr(jsonget(j, "mime")));
+            m->w     = (i32)jsonint(jsonget(j, "w"), 0);
+            m->h     = (i32)jsonint(jsonget(j, "h"), 0);
+            m->bytes = jsonint(jsonget(j, "bytes"), 0);
+            m->lines = jsonint(jsonget(j, "lines"), 0);
+        }
+        m->rpath = {};  // done with, either way
+        attachnext(g, s);
+        return;
+    }
     if (!jsonint(jsonget(j, "ok"), 0)) {
         attachfail(g, s, err.len ? err : Str("the upload failed"));
         return;
@@ -4756,6 +5410,38 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
 // Ask for a file to attach (TASK_ATTACH): text, or an image. One
 // dialog at a time, which may be slow to come up, its answer for the
 // session that asked, whichever is shown by then.
+static void fieldput(char *, Str);
+
+// Keep a file dialog's ask (ASK_*), its answer the record type with id,
+// for the field that asks instead where no dialog can be shown: whether
+// the platform says so at once (pathfallback) or later (ontask). That
+// field starts with at. The checklist's OP_NODIALOG makes this ask one
+// the platform could not show, later, as SDL says it without a portal;
+// 1 if so, and the platform is then not asked.
+static b32 pathkeep(Gui *g, i32 kind, Str title, Str at, u32 type, u64 id)
+{
+    PathAsk *p = &g->pask;
+    p->kind  = kind;
+    p->type  = type;
+    p->id    = id;
+    p->title = title;
+    p->open  = 0;
+    fieldput(p->buf, at);
+    if (g->nodialog) {
+        g->nodialog = 0;
+        mailpost(g->tasks, type, id, Str("\0"), 1);
+        return 1;
+    }
+    return 0;
+}
+
+// No dialog for the ask kept: the field asks instead.
+static void pathfallback(Gui *g)
+{
+    g->pask.open = 1;
+    scheddirty(&g->sched);
+}
+
 static void attachpick(Gui *g, GuiSession *s)
 {
     if (g->attpend) {
@@ -4763,10 +5449,13 @@ static void attachpick(Gui *g, GuiSession *s)
     }
     g->attask++;
     g->attsess = s;
-    g->attpend = os_guiopenfile(g->os, g->frame, "Attach a file", OPEN_ATTACH, g->tasks,
+    Str title  = "Attach a file";
+    g->attpend = pathkeep(g, ASK_OPEN, title, "~/", TASK_ATTACH, g->attask) ||
+                 os_guiopenfile(g->os, g->frame, title, OPEN_ATTACH, g->tasks,
                                 TASK_ATTACH, g->attask);
     if (!g->attpend) {
-        setnote(g, s, "cannot ask for a file here", 1);
+        g->attpend = 1;
+        pathfallback(g);
     }
 }
 
@@ -4799,7 +5488,7 @@ static void browsestart(Gui *g, GuiHost *h)
     at = at.len && os_stat(g->os, a, at).type==STAT_DIR ? at : Str{};
     if (!os_guiopendir(g->os, a, "Choose the working directory", at, g->tasks,
                        TASK_BROWSED, g->browseask)) {
-        g->newerr = "cannot ask for a directory here";
+        g->newerr = "No folder dialog can be shown here: type the folder's path";
     }
 }
 
@@ -4981,7 +5670,10 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         if (next.len) {
             setdraft(g, f, next);
         }
-        setnote(g, f, concat(&scratch, "forked from ", s->sid), 0);
+        Str cwd = jsonstr(jsonget(j, "cwd"));
+        Str say = concat(&scratch, "forked from ", s->sid);
+        say     = cwd.len ? concat(&scratch, concat(&scratch, say, " into "), cwd) : say;
+        setnote(g, f, say, 0);
         guilist(g, h);
     } break;
     }
@@ -5107,6 +5799,10 @@ static void ongit(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok)
 }
 
 static void sessgone(Gui *, GuiSession *);
+// The '@' picker's index (mention.cpp), which sessgone lets go: mention.cpp
+// is included with ui.cpp, further down, so its freeing is named here
+static void mentionidxdrop(Gui *, GuiSession *);
+static void mentionlate(Gui *);
 static b32  trashtoasted(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
 static void cfgeditrun(Gui *, Arena, Str path);
@@ -5115,6 +5811,23 @@ static void setpane(Gui *, i32, b32);
 static void guiofferask(Gui *);
 static void onoffer(Gui *, Arena, Json *, b32);
 static void ontermenv(Gui *, Arena, Json *, b32);
+static void termopened(Gui *, GuiSession *, i64, Json *, b32, Str);
+static b32  termapply(Gui *, GuiHost *, Arena, EvRec *);
+static void termcloseall(Gui *);
+static void termhostlost(Gui *, GuiHost *);
+static void termcloseengine(Gui *);
+static void drawterm(Gui *);
+static void termhotkeys(Gui *);
+static void termsweep(Gui *);
+static Str  termaddwhy(Gui *, GuiSession *);
+static Str  termwhy(Gui *, GuiSession *);
+static void termgo(Gui *);
+static i32  termbusy(Gui *);
+static void termadd(Gui *, GuiSession *);
+static void termgrab(Gui *);
+static Str  termscreen(Gui *, Arena *);
+static ImVec2 termtextat(Gui *, Str);
+static b32  termsizecheck(Gui *);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
@@ -5162,6 +5875,10 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         guilist(g, h);
         guiskills(g, s);
     } return;
+
+    case CMD_TERMOPEN:
+        termopened(g, q.s, id, j, ok, err);
+        return;
 
     case CMD_SKILLS:
         if (q.s && q.s->skillsid==id) {
@@ -5417,9 +6134,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_MCP:
         if (id == g->mcplistid) {
             onmcplist(g, line, ok);
+        } else if (id == g->mcptid) {
+            onmcptlist(g, line, ok);
         }
         return;
     case CMD_MCPAUTH:
+    case CMD_EPAUTH:
         if (id==g->mcpcmd && g->mcpname.len) {
             onmcpauth(g, j, ok, err);
         }
@@ -5442,10 +6162,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
     case CMD_MCPLOGOUT:
     case CMD_MCPRESTART:
+    case CMD_EPLOGOUT:
         if (!ok) {
             mcpsay(g, g->mcpmsgfor, err, 1);
         }
         g->mcplistat = 0;
+        g->eplistfor = {};
         scheddirty(&g->sched);
         return;
 
@@ -5464,6 +6186,11 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         }
         if (ok) {
             loadcfg(g, line);
+        }
+        if (g->mcppendfor.data && id>g->mcppendid) {
+            g->mcppendfor = {};
+        } else if (g->mcppendfor.data && !g->cfgset) {
+            guiconfigget(g);  // asked before the set: ask again
         }
         return;
 
@@ -5729,12 +6456,15 @@ static void setdraft(Gui *g, GuiSession *s, Str text)
 
 // What the latest command from the box came to, shown in a toast at the
 // foot of the transcript (drawtoast): an error until the next is typed,
-// else for a few seconds.
-static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
+// else for a few seconds. A fixed note is the exception to that: it says
+// what typing must not take away (the reason a mention attached no text),
+// so drawprompt's edit leaves it, and only a new note or a send ends it.
+static void setnote(Gui *g, GuiSession *s, Str note, b32 err, b32 fixed)
 {
-    s->note    = clone(&g->perm, note);
-    s->noteerr = err;
-    s->noteat  = g->sched.now;
+    s->note      = clone(&g->perm, note);
+    s->noteerr   = err;
+    s->notefixed = fixed;
+    s->noteat    = g->sched.now;
     scheddirty(&g->sched);
 }
 
@@ -6118,7 +6848,7 @@ static b32 hostlists(GuiHost *h)
 
 // Folders as listed, kept in pc->mem, which starts over when it runs
 // low: a reply to a list let go then finds no slot and is dropped.
-static DirList *dirslot(Gui *g, GuiHost *h, Str dir)
+static DirList *dirslot(Gui *g, GuiHost *h, Str dir, b32 files)
 {
     PathComp *pc = &g->pc;
     if (!pc->base) {
@@ -6128,7 +6858,7 @@ static DirList *dirslot(Gui *g, GuiHost *h, Str dir)
     DirList *free = 0;  // else the one asked for longest ago
     for (i32 i = 0; i < DIRLISTS; i++) {
         DirList *l = &pc->lists[i];
-        if (l->host==h->uid && l->dir==dir) {
+        if (l->host==h->uid && l->files==files && l->dir==dir) {
             return l;
         }
         if (!free || (free->host && (!l->host || l->at<free->at))) {
@@ -6143,8 +6873,9 @@ static DirList *dirslot(Gui *g, GuiHost *h, Str dir)
         free = &pc->lists[0];
     }
     *free = {};
-    free->host = h->uid;
-    free->dir  = clone(&pc->mem, dir);
+    free->host  = h->uid;
+    free->files = files;
+    free->dir   = clone(&pc->mem, dir);
     return free;
 }
 
@@ -6162,24 +6893,28 @@ static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, St
     l->id   = 0;
 }
 
-// The folders in a folder typed on a host, as listed so far, which is
-// listed if it is not, or was a while ago: here at once, or by the
-// host's engine (dir), its answer coming in later (ondir).
-static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir)
+// The folders in a folder typed on a host, or with files its files too,
+// as listed so far, which is listed if it is not, or was a while ago:
+// here at once, or by the host's engine (dir), its answer later (ondir).
+static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir, b32 files = 0)
 {
-    DirList *l = dirslot(g, h, dir);
+    DirList *l = dirslot(g, h, dir, files);
     if (l->id || (l->got && g->sched.now-l->at<DIRLIST_TTL)) {
         return l;
     }
     l->at = g->sched.now;
     if (h->kind != GH_REMOTE) {
         Arena            a  = scratch;
-        HomePath         hp = tildepath(&a, dir, h->home, HOST_WINDOWS);
+        // The slot's own copy of the directory, not the caller's: the
+        // listing's arena starts where the caller's string may lie, so
+        // cstr's NUL-terminated copy of it would overwrite it as it is made
+        HomePath         hp = tildepath(&a, l->dir, h->home, HOST_WINDOWS);
         Listing          ls = hp.err.len ? Listing{} :
-                              os_listall(g->os, &a, hp.path, 1, DIRLIST_MAX);
+                              os_listall(g->os, &a, hp.path, !files,
+                                         files ? DIRLIST_FILES : DIRLIST_MAX);
         Slice<PathEntry> e  = {};
         for (Dirent *d = ls.head; d; d = d->next) {
-            e = push(&a, e, PathEntry{d->name, 1});
+            e = push(&a, e, PathEntry{d->name, d->isdir});
         }
         Str err = hp.err.len ? hp.err : ls.ok ? Str{} :
                   os_stat(g->os, a, hp.path).type==STAT_MISSING ? Str("no such folder") :
@@ -6193,7 +6928,7 @@ static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir)
     putkey(&w.json, "path");
     putstr(&w.json, dir);
     putkey(&w.json, "dirs");
-    putint(&w.json, 1);
+    putint(&w.json, !files);
     l->id = g->nextid;
     cmdsend(g, &w, a);
     return l;
@@ -6213,8 +6948,9 @@ static void ondir(Gui *g, Arena a, i64 id, Json *j, b32 ok, Str err)
     Slice<PathEntry> e = {};
     for (Json *x = jsonget(j, "entries")->child; ok && x; x = x->next) {
         Str name = jsonstr(jsonget(x, "name"));
-        if (name.len && jsonint(jsonget(x, "dir"), 0)) {
-            e = push(&a, e, PathEntry{name, 1});
+        // Files too, carrying each entry's own flag: a mention needs them
+        if (name.len) {
+            e = push(&a, e, PathEntry{name, (b32)jsonint(jsonget(x, "dir"), 0)});
         }
     }
     dirput(pc, l, e, ok && jsonint(jsonget(j, "more"), 0), ok ? Str{} : err);
@@ -6592,6 +7328,10 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     case EV_RELIST:
         h->relist = 1;  // as a subagent's container's sessions, kept
         return 1;
+    case EV_TERM:
+    case EV_TERMEND:
+    case EV_TERMBUSY:
+        return termapply(g, h, a, r);
     case EV_OVERFLOW:
         if (!r->sid.len && h->kind==GH_ENGINE) {
             // The engine process lost records, replies among them
@@ -6649,6 +7389,10 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
         g->tailseen += i>=0 && v->msgs[i].tool->status==VTOOL_RUNNING;
     }
     b32 changed = viewrecord(v, a, r);
+    b32 rose    = evactivity(r->ev, jsonstr(jsonget(r->root, "why"))) && r->ts>s->lastact;
+    if (rose) {
+        s->lastact = r->ts;  // a replay's older records leave it be
+    }
     if (r->ev==EV_ASK && changed) {
         s->stick = 1;  // an ask needs seeing: scroll to it
     }
@@ -6669,13 +7413,13 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     if (s != g->sess) {
         // Only the sidebar shows it, and the rows of its parent's tasks
         return state!=v->state || asks!=v->asks || busy!=v->busy ||
-               jobs!=v->jobsrun || qpos!=v->queuepos ||
+               jobs!=v->jobsrun || qpos!=v->queuepos || rose ||
                r->ev==EV_TITLE || r->ev==EV_SESSION || r->ev==EV_TOOLEND;
     }
     if (g->histreq && r->ev==EV_NOTE && find(line, "history loaded")>=0) {
         g->histdone = 1;
     }
-    return changed;
+    return changed || rose;
 }
 
 // Apply one record from a host. Returns 1 if what shows changed. It is
@@ -6836,6 +7580,17 @@ static void reissue(Gui *g)
                 q.s->git.id = 0;
                 gitstale(g, q.s);
             }
+            break;
+        case CMD_MODELS:
+            // Else listid stays and hostlist thinks one under way, so
+            // the new session dialog asks for its models forever
+            if (e->listid == q.id) {
+                e->listid = 0;
+                hostlist(g, e);
+            }
+            break;
+        case CMD_SHELLS:
+            e->shellsid = e->shellsid==q.id ? 0 : e->shellsid;  // asked again when wanted
             break;
         case CMD_DIR:
             for (i32 k = 0; k < DIRLISTS; k++) {
@@ -7023,7 +7778,22 @@ static GuiHost *ctrtask(Gui *g, Arena scratch, Str hostname)
     h = h ? h : addhost(g, GH_REMOTE, hostname);
     h->taskexec  = ctrexec(&g->perm, &c);
     h->taskimage = clone(&g->perm, c.image);
+    h->taskctr   = alloc<Ctr>(&g->perm);
+    *h->taskctr  = ctrparse(&g->perm, name, rd.data);
     return h;
+}
+
+// The container a host is in, made for sessions or for a subagent, as
+// its container.ini says, else null; *running whether it runs, as last
+// known (a subagent's while its host is connected).
+static Ctr *hostctr(Gui *g, GuiHost *h, b32 *running)
+{
+    if (GuiCtr *c = ctrofhost(g, h)) {
+        *running = c->state == "running";
+        return &c->c;
+    }
+    *running = h && h->taskctr && h->up;
+    return h ? h->taskctr : 0;
 }
 
 // A [container] setting of the user's own file, else null.
@@ -7183,7 +7953,24 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s, Str distro = {})
         return r;
     }
     Slice<Str> cmd = {};
-    if (h->kind == GH_REMOTE) {
+    b32        run = 0;
+    Ctr       *c   = h->kind==GH_REMOTE ? hostctr(g, h, &run) : 0;
+    if (c) {
+        // Inside it, by its runtime, as its engine runs there
+        if (!run) {
+            r.why = "Its container is not running";
+            return r;
+        }
+        Slice<Str> sh = {};
+        if (v && v->shellpath.len) {
+            sh = termshell(a, v->shellkind, v->shellpath, 0);
+            if (!sh.len && v->shellkind=="sh") {
+                sh = push(a, sh, v->shellpath);  // bash or /bin/sh, a login shell
+                sh = push(a, sh, Str("-l"));
+            }
+        }
+        cmd = ctrterm(a, c, dir, sh);
+    } else if (h->kind == GH_REMOTE) {
         Reach l = remotelink(g, h->name);
         if (l.ssh.len) {
             cmd = termssh(a, Str("ssh"), l.ssh, dir, hostwin(h));
@@ -7549,27 +8336,35 @@ static b32 remoteignored(Gui *g, Str name, Str key)
     return 0;
 }
 
-// A deployment to h begins, or may (a connect that deploys as needed):
-// from the pane being drawn, if a click there began it, whose toast
-// tells if it fails; and an earlier failure's toast there goes.
-static void deploystart(Gui *g, GuiHost *h)
+// A connect to h or a deployment there begins: from the pane being
+// drawn, if a click there began it, whose toast tells if it fails; and
+// an earlier failure's toast there goes.
+static void hoststart(Gui *g, GuiHost *h)
 {
     if (g->inpane) {
-        h->deployfrom = g->inpane - 1;
+        h->toastfrom = g->inpane - 1;
+        h->asked     = 1;  // until it fails or is up: a deploy's connect too
     }
     h->deployfail = 0;
-    if (g->dtoasthost == h->uid) {
-        g->dtoasthost = 0;
+    if (g->htoasthost == h->uid) {
+        g->htoasthost = 0;
     }
 }
 
-// A deployment to h failed: why, in the deploy toast, which replaces
+// Something asked of h failed: why, in the host toast, which replaces
 // any other's.
+static void hostfailed(Gui *g, GuiHost *h, Str why)
+{
+    h->asked      = 0;
+    g->htoasthost = h->uid;
+    g->htoasttext = clone(&g->perm, why);
+}
+
+// A deployment to h failed, which its status line notes.
 static void deployfailed(Gui *g, GuiHost *h, Str why)
 {
     h->deployfail = 1;
-    g->dtoasthost = h->uid;
-    g->dtoasttext = clone(&g->perm, why);
+    hostfailed(g, h, why);
 }
 
 // Connect to a [remote NAME] over ssh, or into its WSL distro, as its
@@ -7606,19 +8401,21 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     rc.localstate = g->statedir;
     rc.deploy     = deploy || remotedeploys(g, name);
     h->deploys    = 0;
-    if (rc.deploy) {
-        deploystart(g, h);
-    }
+    hoststart(g, h);
     b32 none = !rc.ssh.len && !rc.wsl.len && !rc.exec.len;
     if (none && (remoteignored(g, name, "ssh") || remoteignored(g, name, "wsl") ||
                  remoteignored(g, name, "exec"))) {
         h->state = RS_FAILED;
         h->msg   = "its ssh, wsl or exec is set in an included file, which "
                    "cannot choose what runs where: set it in your own file";
-        return h;
     } else if (none) {
         h->state = RS_FAILED;
         h->msg   = "no ssh destination: set ssh (or wsl, or exec) in its section";
+    }
+    if (none) {
+        if (h->asked) {
+            hostfailed(g, h, concat(&scratch, concat(&scratch, name, ": "), h->msg));
+        }
         return h;
     }
     hostconnect(g, h, &rc, scratch);
@@ -7677,6 +8474,7 @@ static void findhosts(Gui *g, Arena a)
 
 static b32  updating(GuiHost *);
 static void guiupdate(Gui *, GuiHost *);
+static Str  hostlabel(Gui *, Arena *, GuiHost *);
 
 // A host's connection changed: connecting, up, down until a retry,
 // failed or closed, as the library says.
@@ -7703,14 +8501,23 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         // A connect's deployment failed: its library says why ("cannot
         // deploy an engine: ...")
         deployfailed(g, h, concat(&a, concat(&a, h->name, ": "), msg));
+    } else if (h->state==RS_FAILED && was!=RS_FAILED && h->asked && !h->taskexec.len) {
+        // A connect a click began: why, in a toast, which moves nothing;
+        // one begun otherwise, as at launch, says why in its tooltip
+        hostfailed(g, h, concat(&a, concat(&a, hostlabel(g, &a, h), ": "), msg));
     }
     if (h->up) {
         hostcaps(g, h, r->root);
         h->deployfail = 0;
-        if (g->dtoasthost == h->uid) {
-            g->dtoasthost = 0;
+        h->asked      = 0;
+        if (g->htoasthost == h->uid) {
+            g->htoasthost = 0;
+        }
+        if (jsonflag(jsonget(r->root, "anew"), 0)) {
+            termhostlost(g, h);  // the old one's shells went with it
         }
     }
+    scheddirty(&g->sched);  // its terminals' note, waiting or not
     if (!h->up) {
         guirelaydrop(g, a, h);
     }
@@ -8179,6 +8986,7 @@ static void sessgone(Gui *g, GuiSession *s)
     s->listed = 0;
     imgdrop(g, s);
     attachclear(g, s);
+    mentionidxdrop(g, s);  // its 16 MiB of file list must not outlive it
     if (g->out.s == s) {
         g->out.s   = 0;
         g->outopen = 0;
@@ -8272,7 +9080,7 @@ static void exportready(Gui *g)
         return;
     }
     Str name = exportname(&a, x->s, x->kind==EXPORT_MD ? Str(".md") : Str(".jsonl"));
-    if (g->drive) {
+    if (g->drive && !g->nodialog) {
         Str path = join(&a, g->drivecwd, name);
         exportwrite(g, a, path);
         return;
@@ -8280,8 +9088,10 @@ static void exportready(Gui *g)
     x->state = EXP_ASKING;
     x->ask++;
     Str title = x->kind==EXPORT_MD ? Str("Export as Markdown") : Str("Export the raw log");
-    if (!os_guisave(g->os, a, title, name, g->tasks, TASK_SAVED, x->ask)) {
-        exportfail(g, "cannot ask where to save it here");
+    Str at    = g->drive ? join(&a, g->drivecwd, name) : concat(&a, "~/", name);
+    if (!pathkeep(g, ASK_SAVE, title, at, TASK_SAVED, x->ask) &&
+            !os_guisave(g->os, a, title, name, g->tasks, TASK_SAVED, x->ask)) {
+        pathfallback(g);
     }
 }
 
@@ -8453,11 +9263,13 @@ static void importstart(Gui *g, GuiHost *h)
     x->status  = {};
     x->state   = IMP_ASKING;
     x->ask++;
+    Str title = "Import a session's raw log";
     if (g->drive) {
         mailpost(g->tasks, TASK_OPENED, x->ask, g->exp.saved, 1);
-    } else if (!os_guiopenfile(g->os, g->frame, "Import a session's raw log", OPEN_LOG,
+    } else if (!pathkeep(g, ASK_OPEN, title, "~/", TASK_OPENED, x->ask) &&
+               !os_guiopenfile(g->os, g->frame, title, OPEN_LOG,
                                g->tasks, TASK_OPENED, x->ask)) {
-        importfail(g, "cannot ask for a file here");
+        pathfallback(g);
     }
 }
 
@@ -8686,6 +9498,27 @@ static void ctrnoted(Gui *, Record);
 static void ontask(Gui *g, Record r)
 {
     Export *x = &g->exp;
+    b32     nodialog = r.data.len==1 && !r.data[0];  // the platform had none to show
+    switch (r.type) {
+    case TASK_SAVED:
+    case TASK_OPENED:
+    case TASK_ATTACH:
+        if (nodialog) {
+            if (r.type==g->pask.type && r.id==g->pask.id) {
+                pathfallback(g);  // its answer comes later, as this type
+            }
+            return;
+        }
+        break;
+    case TASK_BROWSED:
+        if (nodialog) {
+            if (r.id == g->browseask) {
+                g->newerr = "No folder dialog can be shown here: type the folder's path";
+            }
+            return;
+        }
+        break;
+    }
     switch (r.type) {
     case TASK_SAVED:
         if (x->state==EXP_ASKING && r.id==x->ask) {
@@ -8845,7 +9678,7 @@ static void guiupdate(Gui *g, GuiHost *h)
     }
     h->updating = UPD_DEPLOYING;
     h->updmsg   = "deploying the engine";
-    deploystart(g, h);
+    hoststart(g, h);
     scheddirty(&g->sched);
 }
 
@@ -9181,6 +10014,9 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
 {
     image  = trim(image);
     folder = trim(folder);
+    HomePath hp = ws==CTR_EMPTY ? HomePath{} :
+                  tildepath(&g->frame, folder, g->main->home, HOST_WINDOWS);
+    folder = hp.path;
     if (!g->ctrrt.up) {
         return g->ctrrt.why.len ? g->ctrrt.why : Str("no container runtime answers");
     } else if (!image.len) {
@@ -9189,13 +10025,16 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
         return "An image cannot begin with -";
     } else if (ws!=CTR_EMPTY && !folder.len) {
         return "Choose a folder";
+    } else if (hp.err.len) {
+        return hp.err;
     } else if (ws != CTR_EMPTY && os_stat(g->os, g->frame, folder).type != STAT_DIR) {
         return "No such folder here";
     }
-    Arena a     = g->frame;
-    Str   noeng = ctrnoengine(g->os, &a, carve(&a, 1<<16));
+    // In the frame itself, not a copy of it, which is gone on return
+    Arena scratch = carve(&g->frame, 1<<16);
+    Str   noeng   = ctrnoengine(g->os, &g->frame, scratch);
     if (noeng.len) {
-        noeng = clone(&a, noeng);  // as a sentence, for the dialog
+        noeng = clone(&g->frame, noeng);  // as a sentence, for the dialog
         noeng.data[0] = noeng[0]>='a' && noeng[0]<='z' ? (u8)(noeng[0]-32) : noeng[0];
         return noeng;
     }
@@ -9954,8 +10793,11 @@ static b32 gobackground(Gui *g)
             hc.toastsince = os_time(g->os);
         }
         // Commands to the engine go through the host from now on: the
-        // calls it makes for thin hosts end here
+        // calls it makes for thin hosts end here. The terminals hang up,
+        // having no window to show them.
         guirelaylostall(g, newarena(g->cmdr), "this computer's window closed");
+        termcloseall(g);
+        termcloseengine(g);  // and those whose term.open is still in flight
         Arena hp = newarena(os_reserve(g->os, (iz)1<<30));
         g->host  = hp.beg ? newhost(g->os, &hp, g->frame, &hc, &why) : 0;
         why      = g->host ? Str{} : why.len ? why : Str("out of memory");
@@ -10172,6 +11014,7 @@ static void zoomby(Gui *, i32);
 static void setpane(Gui *, i32, b32);
 
 #include "ui.cpp"
+#include "term.cpp"
 
 
 // The fake agent
@@ -10806,7 +11649,7 @@ static void gui_close(Gui *g)
         shedlater(g, 0);
         return;
     }
-    if (!g->quitting && !running(g) && !elsewhere(g)) {
+    if (!g->quitting && !running(g) && !elsewhere(g) && !termbusy(g)) {
         startquit(g);
         return;
     }
@@ -11040,6 +11883,7 @@ static void saveini(Gui *g, b32 last)
 //   Maximized=0
 //   Fullscreen=0
 //   [Prospero][Sidebar]
+//   Sort=created
 //   Group=Work
 //   Folded=g:Work
 //   Opened=a
@@ -11056,7 +11900,8 @@ static void saveini(Gui *g, b32 last)
 // A pane missing (a layout older than it) keeps its default, and the
 // window's place is fitted to the displays as they are (place.cpp). The
 // sidebar keeps its groups' order, empty ones included, and each fold
-// the user chose by its key (sidebar.cpp), folded or opened. Help keeps
+// the user chose by its key (sidebar.cpp), folded or opened, and its
+// order, written only when not the default, recent activity. Help keeps
 // its topic by name (help.cpp), an unknown one the first. Each layout
 // the user saved has a section, in the order saved (dock.cpp); one
 // that cannot be read, or named as one before it, is dropped (iniapply).
@@ -11099,7 +11944,9 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
         }
         return;
     } else if (entry == (void *)3) {
-        if (kv.head=="Group" && kv.tail.len) {
+        if (kv.head == "Sort") {
+            g->sidesort = kv.tail=="created" ? SIDESORT_CREATED : SIDESORT_ACTIVITY;
+        } else if (kv.head=="Group" && kv.tail.len) {
             addgroup(g, kv.tail);
             g->sidedirty = 0;  // as the file has it
         } else if ((kv.head=="Folded" || kv.head=="Opened") && kv.tail.len) {
@@ -11163,8 +12010,11 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         out->appendf("Maximized=%d\n", w->max ? 1 : 0);
         out->appendf("Fullscreen=%d\n\n", w->full ? 1 : 0);
     }
-    if (g->groups.len || g->folds) {
+    if (g->groups.len || g->folds || g->sidesort) {
         out->append("[Prospero][Sidebar]\n");
+        if (g->sidesort == SIDESORT_CREATED) {
+            out->append("Sort=created\n");
+        }
         for (iz i = 0; i < g->groups.len; i++) {
             Str n = g->groups[i];
             out->append("Group=");
@@ -11426,6 +12276,7 @@ static void gui_frame(Gui *g)
     toastlook(g);
     i64 t0 = s->now;
     g->frame.beg = g->framebase;
+    mentionlate(g);  // while nothing holds a copy of the frame arena
     if (g->exp.want) {
         exportstart(g);  // asked for in the last frame
     }
@@ -11487,7 +12338,7 @@ static void gui_frame(Gui *g)
         // the mouse is elsewhere: the script's mouse is the one
         io.AddMousePosEvent(g->drivex, g->drivey);
     }
-    uishiftpaste();
+    uishiftpaste(g);
     ImGui::NewFrame();
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
@@ -12036,7 +12887,8 @@ enum : i32 {
     OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
-    OP_DROP,      // write a dx by dy PNG (or dy lines, .txt) to --cwd as text, drop it
+    OP_DROP,      // write a dx by dy PNG (or dy lines, .txt; dy pages, .pdf) to
+                  // --cwd as text, drop it
                   // (a flat gray JPEG if text ends in .jpg)
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
@@ -12053,6 +12905,11 @@ enum : i32 {
     OP_NOTIFY,    // [ui] notify is dx (NOTIFY_*), as a setting would
     OP_TOASTMARK, // remember the toasts shown and withdrawn so far
     OP_TOASTCLICK,// click the latest toast, which gives the window focus
+    OP_MENTIONHOLD,// dx 1: the shown session's '@' index begins again and is
+                  // not walked, as a tree too big for one frame is not, so
+                  // the picker lists a folder; dx 0 lets the walk go on
+    OP_MENTIONS,  // dx 0 as [ui] mentions = false would, dx 1 as true
+    OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -12075,6 +12932,8 @@ enum : i32 {
     T_TRANSCRIPT,
     T_PROMPT,
     T_EMPTY,       // an empty part of the menu bar
+    T_TERMGRID,    // the middle of the terminal's grid
+    T_TERMTEXT,    // the terminal's text, where it last shows
     T_SPLITTER,    // the dock splitter between the columns
     T_HELPTAB,
     T_TRANSCRIPTTAB,
@@ -12104,6 +12963,7 @@ enum : i32 {
     T_PARENTLINK,  // a subagent's link back to its parent
     T_MSGLINK,     // the latest message's link to its other session
     T_UNDO,        // the latest Undo on a tool row
+    T_HOLD,        // the latest ask's Keep waiting
     T_REWINDTURN,  // the latest Rewind to here
     T_REWINDOK,    // the rewind confirmation's Rewind
     T_FORCE,       // the latest rewind card's Rewind anyway
@@ -12127,8 +12987,10 @@ enum : i32 {
     T_RAIL,        // the latest fold rail drawn
     T_CODEBLOCK,   // the code block selectcode chose, as drawn
     T_CODECOPY,    // and its Copy button
-    T_TOOLSBTN,    // the session bar's toggles
+    T_SHELLBTN,    // the session bar's toggles
+    T_TOOLSBTN,
     T_THINKBTN,
+    T_FINDNEXT,    // the find bar's next arrow
     T_GAUGE,       // the context gauge
     T_PAGECOMBO,   // the settings' pages as a combo, when narrow
     T_PAGEITEM,    // the settings page text names ("endpoint fake", "ui",
@@ -12195,6 +13057,7 @@ enum : i32 {
     CHK_LIVETAIL,
     CHK_ASKCARD,
     CHK_ASKALLOWED,
+    CHK_ASKHELD,    // kept waiting: no deadline, past the one it had
     CHK_QCARD,      // the agent's questions: the form as reserved
     CHK_QWAITING,   // and as picked and typed, still waiting, touched
     CHK_QANSWERED,  // the agent read the answers
@@ -12217,7 +13080,9 @@ enum : i32 {
     CHK_AMBER,
     CHK_RETRYSHOWN,
     CHK_ETASHOWN,
+    CHK_STRIPFIT,     // the status line gave way, brief or below, within the pane
     CHK_CLOCKSHOWN,
+    CHK_WORKED,
     CHK_RAILFOLD,
     CHK_RAILOPEN,
     CHK_DIAGS,
@@ -12298,6 +13163,7 @@ enum : i32 {
     CHK_TOOLSOPEN,
     CHK_TOOLSFOLD,
     CHK_TOOLSAUTO,
+    CHK_FOLDSHELL,
     CHK_SHOWTOOLS,
     CHK_SHOWTHINK,
     CHK_THINKBACK,
@@ -12309,6 +13175,7 @@ enum : i32 {
     CHK_FINDQUIET,
     CHK_FINDHIDDEN,
     CHK_FINDCLOSED,
+    CHK_FINDARROWESC,
     CHK_GAUGEREAL,
     CHK_GAUGE,
     CHK_GAUGEAMBER,
@@ -12316,6 +13183,7 @@ enum : i32 {
     CHK_TWOPANE,
     CHK_NOHSCROLL,
     CHK_PAGE,
+    CHK_CFGVAL,   // text "KIND NAME KEY=VALUE": that row's value in effect
     CHK_ROOTS,
     CHK_DELINCLUDE,
     CHK_DELMODAL,
@@ -12347,7 +13215,8 @@ enum : i32 {
     CHK_TITLE,        // the session's title is text
     CHK_LASTUSER,     // its latest user message is text
     CHK_MODELS,
-    CHK_COMPACTED,
+    CHK_COMPACTED,    // a compaction card, focused on text when given
+    CHK_WRAPBLANK,    // the font's word wrap breaks ASCII at blanks only
     CHK_ORPHAN,    // the session shown names a parent that is gone: a root
     CHK_SIDE,
     CHK_NOSIDE,
@@ -12355,6 +13224,7 @@ enum : i32 {
     CHK_NOINI,        // the layout file lacks text
     CHK_MODEL,
     CHK_EXPORTED,
+    CHK_PATHASK,      // the path box asks, its field ending with text
     CHK_LASTERR,
     CHK_HOSTTRIED,
     CHK_FORKED,
@@ -12451,7 +13321,10 @@ enum : i32 {
                       // of that host's: ~, or where a session there works
     CHK_MCPSTATE,     // the MCP server web's page says text
     CHK_MCPSIGNED,    // the sign-in to web succeeded, once, through the browser
+    CHK_EPSIGNED,     // a sign-in for an endpoint succeeded, the count as text says
     CHK_MCPCALL,      // the session's call to web's echo tool came back
+    CHK_MCPTOOLSET,   // [mcp web] tools is text, null for unset, the page
+                      // shows echo ticked as that says, and the file has it
     CHK_FARKID,       // the latest task's subagent is open on far, under its
                       // parent in the sidebar, marked away, the row on far
     CHK_FARREPORT,    // its ask allowed from here, the file written there,
@@ -12484,6 +13357,35 @@ enum : i32 {
     CHK_VIA,          // the session shown streams via this computer
     CHK_CFGSEARCH,    // the settings' search field has the keyboard
     CHK_CTR,          // the first container is as text says (ctrcheck)
+    CHK_MENTION,      // the '@' picker's rows: dx -1 none, 0 one or more,
+                      // else exactly dx
+    CHK_MENTIONKIND,  // its source by name: "index", "list" or "none"
+    CHK_MENTIONSTATUS,// its one line, as drawn ("no files match")
+    CHK_MENTIONSEL,   // its pick's path is text, from the path not the row
+    CHK_MENTIONTAG,   // its pick was drawn marked attached (dx 1) or not (0)
+    CHK_TERMFOCUS,    // the terminal has the keyboard
+    CHK_TERMSCREEN,   // the terminal's screen has text
+    CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
+    CHK_TERMNONE,     // the session shown has no terminal
+    CHK_TERMCOUNT,    // dx terminals are open, in every session
+    CHK_TERMTABS,     // the shown root's tab labels, '|' between, '*' front
+    CHK_TERMKID,      // a subagent is shown, with its root's tabs
+    CHK_TERMCLOSE,    // the quit dialog counted dx busy terminal tabs
+    CHK_TERMHOME,     // the terminal docked under the prompt, as placed
+    CHK_TERMHIST,     // its front tab keeps dx rows of history
+    CHK_TERMVIEW,     // scrolled back into history (dx 1), or not (0)
+    CHK_TERMSEL,      // the front tab's selection is the text
+    CHK_DCLICKTIME,   // (sets) ImGui's double-click time to dx seconds
+    CHK_TERMREGIONS,  // dx terminal blocks are reserved, one a tab
+    CHK_TERMQUIET,    // no frames while idle, the terminal shown
+    CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
+                      // (0 by 0: its pane's), and passes
+    CHK_TERMGRID,     // the terminal is dx by dy, drawn in over 64K
+                      // vertices (32-bit indices)
+    CHK_PALETTE,      // the palette is open, listing dx rows (0: any), the
+                      // first titled text if any (dy 1: any row)
+    CHK_TERMWAIT,     // the front tab shows Reconnecting (dx 1), or not (0)
+    CHK_TERMSIZETIP,  // the terminal's size shows over it (dx 1), or not (0)
     CHK_COUNT,
 };
 
@@ -12501,6 +13403,7 @@ static Str chknames[] = {
     "tool rows for read, edit and shell, each ok, with exit code and output file",
     "the edit shows a highlighted diff", "shell output showed while it ran",
     "an ask card with its buttons", "allowed by the user, and the agent went on",
+    "kept waiting: no deadline, and still waiting past the one it had",
     "the questions' form, at its reserved height, recommended options picked",
     "the questions picked and typed, still waiting",
     "the agent read the answers", "skipped with a note, which the agent read",
@@ -12517,7 +13420,9 @@ static Str chknames[] = {
     "a closed session opened, its log replayed",
     "a session held elsewhere opened read-only, with its banner",
     "amber after 15 s without data", "a retry's countdown shown",
-    "the prompt's time left shown", "a message's time shown under the mouse",
+    "the prompt's time left and rate shown",
+    "a cramped status line gave way within the pane", "a message's time shown under the mouse",
+    "a turn's work shown in its last message's header",
     "the fold rail folded its message, its header in view",
     "the fold rail opened the folded message again",
     "configuration diagnostics listed with file and line",
@@ -12597,6 +13502,7 @@ static Str chknames[] = {
     "tools = open: every tool row open but those the user chose",
     "tools = fold: every tool row folded but those the user chose",
     "tools = auto: tool rows folded by kind and outcome again",
+    "the session's shell toggle folded every shell row, the rest as auto",
     "the session's toggle opened every tool row, the setting unchanged",
     "the session's toggle opened all reasoning",
     "toggled off, reasoning folded again but for what the user opened",
@@ -12608,6 +13514,7 @@ static Str chknames[] = {
     "no frames while the find bar shows its matches",
     "hidden reasoning is not searched",
     "Esc closed the find bar, and left the session alone",
+    "Esc closed the find bar after a click on its arrow",
     "the context gauge drew from the engine's own numbers",
     "the context gauge drew from a record's numbers",
     "the gauge turned amber near where compaction begins",
@@ -12615,6 +13522,7 @@ static Str chknames[] = {
     "wide, the settings' pages are a list beside the page",
     "the settings have nothing to scroll to sideways",
     "the settings page picked is shown",
+    "the setting has the value given",
     "the roots, one a line, were saved joined by \"; \"",
     "a section only an include defines cannot be deleted, which says where it is",
     "Delete asks first",
@@ -12646,7 +13554,8 @@ static Str chknames[] = {
     "the session's title is as renamed",
     "the text went out as a message, not a command",
     "/model lists the configured models",
-    "/compact compacted the conversation",
+    "/compact compacted the conversation, its focus on the card",
+    "word wrap breaks only at the blank",
     "a subagent whose parent is gone is a root, to trash",
     "the sidebar shows it",
     "the sidebar does not show it",
@@ -12654,6 +13563,7 @@ static Str chknames[] = {
     "the layout file no longer has it",
     "the session switched model",
     "the export was written with what it should hold",
+    "a field asks for the path, where the dialog would start",
     "the error says why",
     "the remote's heading connected, or tried",
     "the fork is shown, its draft the prompt that came next",
@@ -12685,7 +13595,7 @@ static Str chknames[] = {
     "the plan is open in the editor, Approve held meanwhile",
     "the plan's ask shows the plan as the editor left it",
     "Reveal showed the plan file in the file manager",
-    "Open in terminal opened one in its folder, as said",
+    "Open in external terminal opened one in its folder, as said",
     "the plan is open in the editor, with no plan waiting",
     "the session is idle and asks nothing: the agent was not told",
     "the agent heard that the plan it carries out was revised by hand",
@@ -12702,7 +13612,7 @@ static Str chknames[] = {
     "the window opened at its first size, maximized on a small display",
     "a first run's Help floats centered in front, its tab selected",
     "the layout is as built: its panes' places and shares, Jobs selected",
-    "the Compact layout is as built: two columns, Plan with Transcript",
+    "the Compact layout is as built: two columns, Plan with Transcript, Terminal under Prompt",
     "the Focus layout is as built: one session, four panes",
     "the layout saved is back as it was saved",
     "Help shows the topic picked, its page from the top",
@@ -12731,7 +13641,9 @@ static Str chknames[] = {
     "a Windows path typed for a WSL distro became the distro's",
     "the new session's directory, turned to a remote, is one of its own",
     "the MCP server's page says what it is", "signed in through the browser",
+    "signed in for an endpoint, the count as given",
     "the MCP server's tool answered the session",
+    "the MCP server's tools key, as its checkbox wrote it",
     "the subagent on far was opened here, under its parent, its row on far",
     "its ask, answered here, let it write there, and the parent heard",
     "a host the user disconnected stays so, the task row saying so",
@@ -12752,6 +13664,27 @@ static Str chknames[] = {
     "the remote is thin", "its calls go via this computer",
     "the settings' search field has the keyboard",
     "the container is as expected",
+    "the '@' picker listed the rows it should",
+    "the '@' picker's source: index, list or none",
+    "the '@' picker's one line, as drawn",
+    "the '@' picker's pick is the path it should be",
+    "the '@' picker's pick says it is attached, or does not",
+    "the terminal has the keyboard", "the terminal shows the text",
+    "the terminal fills its pane", "the terminal is closed",
+    "that many terminals are open", "the terminal tabs are as said",
+    "a subagent shows its root's terminal tabs",
+    "the quit dialog counts the busy terminal tabs",
+    "the terminal is in its home under the prompt",
+    "the terminal keeps as much history as configured",
+    "the terminal's view is scrolled back, or at the bottom, as said",
+    "the terminal's selection is as said",
+    "the double-click time is set",
+    "closed tabs let their blocks go",
+    "no frames while idle, the terminal shown",
+    "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
+    "the palette lists what it should",
+    "the terminal shows Reconnecting, or not, as said",
+    "the terminal's size shows over it while it changes, or not, as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -12770,6 +13703,7 @@ enum : i32 {
     W_OPENED,     // the session shown is open, its replay applied
     W_AMBER,      // the strip went amber
     W_ETA,        // the strip showed the prompt's ETA
+    W_STRIPFULL,  // in full, the rate too, on the picks' line
     W_BACKOFF,    // the session shown backs off to retry
     W_GONE,       // the engine stopped
     W_TASKS,      // the session shown waits for two subagents
@@ -12820,6 +13754,10 @@ enum : i32 {
     W_NAMEDUPDATED,// the remote named by text is updated, or failed to be
     W_MCPSTATE,   // the MCP server web's page says what text begins
     W_MCPSIGNED,  // a sign-in to an MCP server ended
+    W_MCPTOOLS,   // the MCP server web's page lists its tool text
+    W_MCPTOOLSET, // [mcp web] tools is text, null for unset, nothing held
+    W_EPSTATE,    // endpoint gpt's page, or text "NAME|STATUS" NAME's, says what it begins
+    W_EPSIGNED,   // a sign-in for endpoint gpt, or text NAME, ended
     W_FARKID,     // the latest subagent on far is open here, at work
     W_FARSHOWN,   // a session on far is shown, open, its replay applied
     W_TOAST,      // a toast since OP_TOASTMARK
@@ -12830,12 +13768,15 @@ enum : i32 {
     W_VIA,        // the session shown streams, relayed
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
+    W_TERM,       // the shown session's terminal shows text
+    W_TERMBUSY,   // its front tab runs a program, or not with "idle"
+    W_TERMCOUNT,  // dx terminals are open, in every session
 };
 
 static Str waitnames[] = {
     "", "the engine", "the session", "the turn to end", "an ask",
     "a running tool", "the configuration", "the settings edit", "quitting",
-    "every turn to end", "the session to open", "amber", "an ETA", "a retry",
+    "every turn to end", "the session to open", "amber", "an ETA", "the status line in full", "a retry",
     "the engine to stop", "two subagents at work", "a subagent's ask",
     "a todo item in progress", "a reply", "the jobs", "a rewind",
     "the conversation's rewind", "a compaction", "the endpoint's line", "streaming", "the window to go",
@@ -12850,11 +13791,14 @@ static Str waitnames[] = {
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
+    "the MCP server's tool listed", "the MCP server's tools key",
+    "the endpoint's ChatGPT state", "the ChatGPT sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
+    "the terminal's text", "the terminal's program", "the terminals' count",
 };
-static_assert(countof(waitnames) == W_CTR+1);
+static_assert(countof(waitnames) == W_TERMCOUNT+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -12876,6 +13820,13 @@ struct DriveOp {
 #define DRAGSESS(title) \
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, title}, {OP_DOWN, 0, 0, 0, 100, ""}, \
     {OP_MOVE, T_SESSTITLE, 4, 3, 100, title}, {OP_MOVE, T_SESSTITLE, 14, 8, 300, title}
+
+// A key with Cmd held on macOS, else Ctrl
+#define CMDKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CMD, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CMD, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
 
 // A layout picked from View, Layout, by its name
 #define LAYOUT(name) \
@@ -13210,6 +14161,8 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     {OP_WAIT, W_THUMBS, 0, 0, 10000, ""},
     {OP_CHECK, CHK_THUMBS, 0, 0, 1000, ""},
+    // The box, active since the click, once its caret stops blinking
+    {OP_MOVE, T_EMPTY, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 2500, ""},
     {OP_CHECK, CHK_IMGQUIET, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "0-thumbs"},
@@ -13329,6 +14282,74 @@ static DriveOp m3ops[] = {
     LAYOUT("Focus"),
     {OP_CHECK, CHK_FOCUSED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "18-layoutfocus"},
+    // The palette, here in Focus, where the Sessions pane is hidden: a
+    // query narrows the sessions, the better match first, and Enter
+    // opens it, the prompt having the keyboard. Esc closes it, the
+    // prompt given the keyboard back; Ctrl/Cmd+K then Enter goes back
+    // to the session before.
+    CMDKEY(GKEY_K, 500),
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 500, "hold"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Hold me: say hello."},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Hold me: say hello."},
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "say hel"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Say hello."},
+    {OP_SHOT, 0, 0, 0, 300, "18-palette"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Say hello."},
+    {OP_TEXT, 0, 0, 0, 300, "xy"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "xy"},
+    CMDKEY(GKEY_K, 500),
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Hold me: say hello."},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Say hello."},
+    {OP_TEXT, 0, 0, 0, 300, "z"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "xyz"},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 300, ""},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
+    CMDKEY(GKEY_K, 500),
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Hold me: say hello."},
+    // And beyond sessions: a setting, shown on its page in Settings,
+    // hidden in Focus; a layout, applied; a Help section, its page
+    // scrolled to it
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "theme"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "theme"},
+    {OP_SHOT, 0, 0, 0, 300, "18-palettefind"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Settings"},
+    {OP_CHECK, CHK_CFGFOCUS, 0, 0, 0, "ui theme"},
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "focus lay"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Focus layout"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 800, ""},
+    {OP_CHECK, CHK_FOCUSED, 0, 0, 0, ""},
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "dropping files"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Dropping files"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1000, ""},
+    {OP_CHECK, CHK_HELPSECTION, 0, 0, 0, "# Keyboard and mouse\n"},
+    {OP_MAIN, 0, 0, 0, 500, ""},
     LAYOUT("Drive"),
     {OP_CHECK, CHK_LAYOUTBACK, 0, 0, 0, "Drive"},
     // Layouts by number too, as the View menu numbers them: the second,
@@ -13427,12 +14448,23 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_BACKOFF, 0, 0, 15000, ""},
     {OP_CHECK, CHK_RETRYSHOWN, 0, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
-    // A slow prompt's progress, with the time left
+    // A slow prompt's progress, with the time left: in this window too
+    // narrow for the status line in full beside the picks, which gives
+    // way, brief or on a line below; then maximized, in full with its
+    // rate, on whichever line
     {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
     {OP_WAIT, W_ETA, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_STRIPFIT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "1-etacramped"},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_MAXIMIZE, 0, 1, 0, 1500, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
+    {OP_WAIT, W_STRIPFULL, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_WORKED, 0, 0, 0, ""},  // that turn's, a few seconds
+    {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     // When that message was sent, shown under the mouse
     {OP_MOVE, T_USERMSG, 0, 0, 300, ""},
     {OP_CHECK, CHK_CLOCKSHOWN, 0, 0, 0, ""},
@@ -13551,7 +14583,19 @@ static DriveOp m3ops[] = {
     {OP_TOOLS, 0, TOOLS_AUTO, 0, 300, ""},
     {OP_CHECK, CHK_TOOLSAUTO, 0, 0, 0, ""},
     // The session's toggles, from the session bar, then off by their
-    // shortcuts, Cmd+Shift+T and R (Ctrl elsewhere)
+    // shortcuts, Cmd+Shift+S, T and R (Ctrl elsewhere). Shell's first,
+    // alone, then the others
+    {OP_MOVE, T_SHELLBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_CHECK, CHK_FOLDSHELL, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_S, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_S, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_CHECK, CHK_TOOLSAUTO, 0, 0, 0, ""},
     {OP_MOVE, T_TOOLSBTN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 400, ""},
@@ -13623,6 +14667,19 @@ static DriveOp m3ops[] = {
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    // Opened again, its arrow clicked, which takes the keyboard from
+    // its field: Esc still closes it
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_MOVE, T_FINDNEXT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FINDARROWESC, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
     // The context gauge, from the engine's records, then from a live
     // record's numbers near where compaction begins, and its tooltip
     {OP_CHECK, CHK_GAUGEREAL, 0, 0, 0, ""},
@@ -13646,6 +14703,14 @@ static DriveOp m3ops[] = {
     {OP_MARK, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_ASKCARD, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "2-ask"},
+    // Kept waiting, past its 10 s deadline (tests/gui.py), then allowed
+    {OP_MOVE, T_HOLD, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_ASKHELD, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-askheld"},
+    {OP_MOVE, T_EMPTY, 0, 0, 11000, ""},
+    {OP_CHECK, CHK_ASKHELD, 0, 0, 0, ""},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_MOVE, T_ALLOW, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -14589,6 +15654,17 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 500, "dark"},
+    // The session bar's toggles, Shell output on, Tool output off under
+    // the mouse, then Shell output on under it, each with its tooltip
+    {OP_MOVE, T_SHELLBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_MOVE, T_TOOLSBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "dark-toggle-off"},
+    {OP_MOVE, T_SHELLBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "dark-toggle-on"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
     {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -14612,6 +15688,17 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_TITLEBAR, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 500, "light"},
+    // The session bar's toggles, Shell output on, Tool output off under
+    // the mouse, then Shell output on under it, each with its tooltip
+    {OP_MOVE, T_SHELLBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_MOVE, T_TOOLSBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "light-toggle-off"},
+    {OP_MOVE, T_SHELLBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "light-toggle-on"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
     // A configured theme stays when the system's changes: no frames
     {OP_MARK, 0, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, 1, 0, 1000, ""},
@@ -14723,6 +15810,112 @@ static DriveOp settingsops[] = {
     {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "remote box"},
+    // A new endpoint of a kind picked as it is named: the kind written,
+    // and the kind's URL
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add endpoint"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "endpoint"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "gpt"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "addkind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "addkind chatgpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_SHOT, 0, 0, 0, 300, "add-endpoint"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint gpt"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt kind=chatgpt"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt url=https://chatgpt.com/backend-api/codex/responses"},
+    // Its kind changed, the URL still the old kind's follows
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind=responses"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt kind=responses"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt url=https://api.openai.com/v1"},
+    // A URL typed stays through another change of kind
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt url"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "http://gpt.example/v1"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind=anthropic"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt kind=anthropic"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt url=http://gpt.example/v1"},
+    {OP_SHOT, 0, 0, 0, 300, "endpoint-kind"},
+    // One added as openai, its URL the placeholder, then given another
+    // kind: the placeholder goes for the kind's URL
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add endpoint"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "endpoint"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "oa"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa url=http://localhost/"},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint oa kind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint oa kind=chatgpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa kind=chatgpt"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa url=https://chatgpt.com/backend-api/codex/responses"},
+    // Then copilot: ChatGPT's URL goes for Copilot's
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint oa kind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint oa kind=copilot"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa kind=copilot"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa url=https://api.githubcopilot.com"},
+    {OP_SHOT, 0, 0, 0, 300, "endpoint-copilot"},
     // A remote's page
     {OP_SHOWPAGE, 0, 0, 0, 300, "remote far"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "remote far"},
@@ -14828,6 +16021,49 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "H remote:far\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "remote:hidden"},
     {OP_SHOT, 0, 0, 0, 300, "sessions-tree"},
+    // A root's actions show while the pointer is on its row: archived
+    // from there, and back from under Archived
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Say hello."},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-hover"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "archive Say hello."},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-hover-archive"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nA+\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head a"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Say hello."},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "archive Say hello."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},  // left open, empty
+    // Into the Trash by its row's icon, its view open, and back by Undo
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Say hello."},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "trash Say hello."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT+\n"},
+    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "trash undo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nT"},
+    // A host's rail folds it, from beside its sessions
+    {OP_MOVE, T_NAMED, 0, 0, 300, "rail h:this"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-rail"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this+\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head h:this"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start subagents.\n"},
     // A subagent whose parent is gone (gui.py made it) is a root, even
     // opened, its record naming that parent: to trash as one
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Orphaned subagent\n"},
@@ -14847,12 +16083,34 @@ static DriveOp sessionsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n  S "},
-    // A terminal in its folder, from its context menu (noted, not opened)
+    // Three finished subagents fold into a row of their own, folded
+    // until opened; two do not
+    {OP_NEWSESSION, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Start more subagents."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "All three"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Start more subagents.\n  D 3+\n S "},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n  S "},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-finished"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head d:this:"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Start more subagents.\n  D 3\n   S "},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Opened=d:this:"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-finished-open"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head d:this:"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Start more subagents.\n  D 3+\n"},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},  // its turn's end was news, rightly
+    // An external terminal in its folder, from its context menu (noted,
+    // not opened)
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in terminal"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 1, 0, ""},
@@ -14895,13 +16153,18 @@ static DriveOp sessionsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Opened=g:Work\n"},
-    // Archived: under the Archived heading, folded, opened; then back
+    // Archived: under the Archived heading (left open above), folded,
+    // opened; then back
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "Archive"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "A\n H this\n  S Greeting\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head a"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "A+\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Greeting"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "head a"},
@@ -15064,6 +16327,68 @@ static DriveOp sessionsops[] = {
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start more subagents."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello once more."},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Hello"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sessions sort"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-sort"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sort created"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Whole fork\n S Start more subagents.\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Sort=created\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sessions sort"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sort activity"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
+    {OP_CHECK, CHK_NOINI, 0, 0, 0, "Sort="},
+    // Dragged by its grip onto New group, at the pane's foot: named, and
+    // in it
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Whole fork"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "grip Whole fork"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-grip"},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, -4, -3, 100, "grip Whole fork"},
+    {OP_MOVE, T_NAMED, -14, -8, 300, "grip Whole fork"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "sessions newgroup"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-newgroupdrag"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Dropped"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork\n"},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},  // the turn above was news, rightly
+    // Into another folder, from the sidebar: the dialog's folder typed
+    // over, Enter forks; the fork works there, titled as a fork
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Whole fork"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Fork into another folder\xe2\x80\xa6"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTCWD, 0, 0, 0, 500, "/moved"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-forkfolder"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "into"},
+    {OP_CHECK, CHK_SESSDIR, 0, 0, 0, "/moved"},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Whole fork (fork)"},
     // A fork before a prompt, from the transcript's menu: the turns
     // before it, none here, the prompt left in the new session's box
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
@@ -15113,6 +16438,11 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Start subagents.\n"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT+\n"},
     {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
+    // The toast dismissed, as it covers the Trash at the pane's foot
+    {OP_MOVE, T_NAMED, 0, 0, 100, "trash dismiss"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 0, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1500, ""},
@@ -15266,6 +16596,44 @@ static DriveOp stopops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// Physical Ctrl and a key, pressed and let go
+#define CTRLKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// Physical Ctrl+Shift and a key
+#define CTRLSHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// The terminal's copy and paste chords: Cmd on macOS, Ctrl on Windows
+// (Ctrl+C copying while there is a selection), else Ctrl+Shift
+#if defined(__APPLE__) || defined(_WIN32)
+#  define TERMCOPY(ms)  CMDKEY(GKEY_C, ms)
+#  define TERMPASTE(ms) CMDKEY(GKEY_V, ms)
+#else
+#  define TERMCOPY(ms)  CTRLSHIFTKEY(GKEY_C, ms)
+#  define TERMPASTE(ms) CTRLSHIFTKEY(GKEY_V, ms)
+#endif
+// A program in the foreground that leaves a child ignoring SIGHUP, its
+// pid in a file, its command line naming the folder for gui.py's checks
+#define TERMSTRAY(file) \
+    "sh -c 'trap \"\" HUP; sh -c \"while :; do sleep 1; done\" stray \"$PWD\" & " \
+    "echo $! >" file "; wait'"
+// The shell a tab runs, as its label names it: the test's bash, or on
+// Windows the session's busybox sh
+#if defined(_WIN32)
+#  define TERMSH "sh"
+#else
+#  define TERMSH "bash"
+#endif
+#define TERMKEY(key, ms) \
+    {OP_KEYDOWN, 0, key, 0, 50, ""}, {OP_KEYUP, 0, key, 0, ms, ""}
+
 // M5, keeping a turn running in the background (--background,
 // tests/gui.py --mode background): the window goes partway through a
 // streaming turn, and this process hosts its engine, keeping the state
@@ -15293,6 +16661,13 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Stream in the background."},
     {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    // A terminal tab, which goes with the window: its shell hung up
+    // (gui.py checks the trap's file, or the pid on Windows)
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >bg.pid; trap 'echo hup >hup-bg.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_GEOMMARK, 0, 0, 0, 0, ""},
     {OP_MARK, 0, 0, 0, 800, ""},
@@ -15435,17 +16810,26 @@ static DriveOp remoteops[] = {
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_REMOTEUP, 0, 0, 0, ""},
     // One whose destination ssh would take for an option fails, saying why
+    // in a toast at the pane's foot
     {OP_MOVE, T_CONNECT2, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 5000, ""},
     {OP_CHECK, CHK_REMOTEFAILED, 0, 0, 0, ""},
-    // One with no engine there fails too, offering to deploy one, which
-    // the checklist leaves alone
+    {OP_SHOT, 0, 0, 0, 300, "remote-failtoast"},
+    // Dismissed, as it can cover the hosts below it in a small window
+    {OP_MOVE, T_NAMED, 0, 0, 100, "host dismiss"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    // One with no engine there fails too, offering to deploy one, in its
+    // toast as under it, which the checklist leaves alone
     {OP_MOVE, T_NAMED, 0, 0, 100, "connect missing"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_DEPLOYOFFER, 0, 0, 30000, ""},
     {OP_CHECK, CHK_DEPLOYOFFER, 0, 0, 0, ""},
+    {OP_IFSCP, 0, 2, 0, 0, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 5000, "toast deploy missing"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-deploytoast"},
     // Deploy engine there (into a fake home, through a stand-in for scp),
     // then connected: its engine leaves out a cap (PROSPERO_TEST_DROPCAP),
     // so is older, and Update engine deploys again and restarts it
@@ -15559,17 +16943,16 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
     {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
-    // A terminal in its folder there, over ssh, from its Info
-    {OP_MOVE, T_INFOBTN, 0, 0, 100, ""},
+    // An external terminal in its folder there, over ssh, from the
+    // Session menu
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Terminal"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd "},
     {OP_SHOT, 0, 0, 0, 300, "remote-terminal"},
-    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
-    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     // Its model picker lists the models of the host's own configuration
     {OP_MOVE, T_NAMED, 0, 0, 100, "model picker"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -15648,6 +17031,33 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Run the tools: read, edit, then a slow shell command."},
     {OP_CHECK, CHK_IMPORTREMOTE, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-imported"},
+    // A mention there: the picker lists the host's files through its
+    // engine, a folder at a time, and the file picked goes with the
+    // message, its engine reading it there as the message goes
+    // (upload {path}), as the GUI cannot. A character at a time, as a
+    // burst is a paste, which opens no picker
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 120, "@"},
+    {OP_TEXT, 0, 0, 0, 120, "h"},
+    {OP_TEXT, 0, 0, 0, 120, "e"},
+    {OP_TEXT, 0, 0, 0, 120, "l"},
+    {OP_TEXT, 0, 0, 0, 120, "l"},
+    {OP_TEXT, 0, 0, 0, 120, "o"},
+    {OP_MARK, 0, 0, 0, 1500, ""},  // the listing's answer, from there
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "hello.txt"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-mention"},
+    {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""}, {OP_KEYUP, 0, GKEY_TAB, 0, 600, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@hello.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""}, {OP_KEYUP, 0, GKEY_ENTER, 0, 600, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@hello.txt"},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: hello.txt"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     // URL includes, fetched again from the settings window
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -15764,7 +17174,8 @@ static b32 ctrwait(Gui *g, Str what)
 }
 
 // CHK_CTR: "made", the container copies --rcwd to /work, with no
-// network, its registry saying so; "trashed", it and its session are in
+// network, its registry saying so; "nofolder", so its session's folder
+// is only in it, not here to open; "trashed", it and its session are in
 // the Trash, the host left; "started", it is up again, its session
 // still in the Trash; "restored", neither is; "gone", nothing of it is
 // listed. Of the shown session's subagent in a container of its own:
@@ -15806,6 +17217,14 @@ static b32 ctrcheck(Gui *g, Str what)
         b32 ok = c->made && !k.network && k.workspace==CTR_COPY && k.image==c->c.image &&
                  g->driverwd.len && pathendswith(k.folder, g->driverwd);
         return ok;
+    } else if (what == "nofolder") {
+        Arena a   = g->frame;
+        Str   why = {};
+        if (!g->sess || g->sess->host!=c->h) {
+            return 0;
+        }
+        sesswork(g, &a, g->sess, &why);
+        return why == "Its files are only in its container";
     } else if (what == "trashed") {
         return c->c.trashed && trashed==1 && !live && !c->h->r;
     } else if (what == "started") {
@@ -15822,7 +17241,8 @@ static b32 ctrcheck(Gui *g, Str what)
 // Containers made for sessions (--containers, tests/gui.py --mode
 // containers), against a real Docker or Podman: the runtime's row in
 // the sidebar; its New session, an image from [container] images,
-// --rcwd copied in, no network; a turn there, relayed; its session to
+// --rcwd copied in, no network; a turn there, relayed; Open in terminal
+// and a Terminal tab, both a shell inside it in /work; its session to
 // the Trash stops it; its + starts it again for New session, the session
 // left in the Trash; restored, and Delete removes it. Then a session here
 // starts a subagent in a container of its own, which the window reaches
@@ -15852,6 +17272,8 @@ static DriveOp ctrops[] = {
     {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
     {OP_TEXTRCWD, 0, 0, 0, 300, ""},
     {OP_SHOT, 0, 0, 0, 300, "containers-1-new"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},  // closes the field's completion
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -15862,6 +17284,27 @@ static DriveOp ctrops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 300, "containers-2-turn"},
+    // Its files copied in, so no folder here to open, but an external
+    // terminal in its folder inside it, by its runtime
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "nofolder"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, " exec -it "},
+    // And the prompt's button: a Terminal pane's shell inside it, which
+    // its engine there runs, in its folder
+    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "/work"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "test -d /prospero/state && echo \"inside $PWD\""},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\ninside /work"},
+    {OP_SHOT, 0, 0, 0, 300, "containers-terminal"},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -16124,11 +17567,77 @@ static DriveOp mcpops[] = {
     {OP_MARK, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_MCPCALL, 0, 0, 0, ""},
     {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: running, "},
+    // Its Tools list: echo unticked writes tools = -echo to the user's
+    // file, ticked again takes the key away
+    {OP_WAIT, W_MCPTOOLS, 0, 0, 10000, "echo"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-tools-0"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp tool echo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_MCPTOOLSET, 0, 0, 10000, "-echo"},
+    {OP_CHECK, CHK_MCPTOOLSET, 0, 0, 0, "-echo"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-tools-1-unticked"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp tool echo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_MCPTOOLSET, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_MCPTOOLSET, 0, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "mcp signout web"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: needs you to sign in"},
     {OP_SHOT, 0, 0, 0, 300, "mcp-3-signedout"},
+    // An endpoint of kind chatgpt signs in to ChatGPT likewise, at the
+    // fake's issuer (PROSPERO_TEST_CHATGPT_AUTH), and out
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint gpt"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint gpt"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint gpt"},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "Not signed in to ChatGPT"},
+    {OP_SHOT, 0, 0, 0, 300, "chatgpt-1-page"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "endpoint signin gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_EPSIGNED, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_EPSIGNED, 0, 0, 0, ""},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "Signed in to ChatGPT as me@example.com (plus)"},
+    {OP_SHOT, 0, 0, 0, 300, "chatgpt-2-signed"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "endpoint signout gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "Not signed in to ChatGPT"},
+    // An endpoint of kind copilot signs in to GitHub by its device flow
+    // (PROSPERO_TEST_COPILOT_AUTH), its code shown while GitHub waits
+    // for it, and entered by the stand-in browser
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint cop"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint cop"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint cop"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint cop"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint cop"},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "cop|Not signed in to GitHub Copilot"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "endpoint signin cop"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "endpoint code cop"},
+    {OP_SHOT, 0, 0, 0, 100, "copilot-1-code"},
+    {OP_WAIT, W_EPSIGNED, 0, 0, 30000, "cop"},
+    {OP_CHECK, CHK_EPSIGNED, 0, 0, 0, "cop|3"},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "cop|Signed in to GitHub Copilot as me (individual)"},
+    {OP_SHOT, 0, 0, 0, 300, "copilot-2-signed"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "endpoint signout cop"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "cop|Not signed in to GitHub Copilot"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -16348,6 +17857,525 @@ static DriveOp planops[] = {
 // both, no frames while idle with it shown, a file made elsewhere listed
 // once the window has the focus back and not before, another click
 // hiding the pane.
+
+// The Terminal pane (--terminal), on [terminal] shell = /bin/sh with
+// PS1 "tty$ ": Ctrl+` shows it, starting a shell, typing and editing
+// reach it, Ctrl+C interrupts, a new window size reaches the shell, it
+// draws nothing while idle, Ctrl+` goes to the prompt and back with
+// the pane docked, and floating hides it and brings it back as it was, vim edits and writes a file through a resize, less pages, exit
+// closes it, a failing exit leaves a banner to restart, and quitting
+// hangs the shell up. A session on the remote "r" (over ssh to this
+// computer) has a tab of its own: its shell runs there in its folder,
+// goes busy and idle, says Reconnecting while the link is down, shows
+// what it printed meanwhile, and is hung up by quitting too.
+static DriveOp termops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    // Standard shows it as a tab beside Plan, where a first run finds it
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
+    // The prompt's terminal button brings it forward and starts a shell
+    // there, as Ctrl+` does (below)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    // Typed, in pieces, with a mistake taken back
+    {OP_TEXT, 0, 0, 0, 100, "echo ab$((6*7))"},
+    {OP_TEXT, 0, 0, 0, 100, "X"},
+    TERMKEY(GKEY_BACKSPACE, 100),
+    {OP_TEXT, 0, 0, 0, 100, "cd"},
+    TERMKEY(GKEY_LEFT, 100),
+    {OP_TEXT, 0, 0, 0, 100, "-"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nab42c-d"},
+    // Ctrl+C ends what runs; Ctrl+D at the prompt would end the shell
+    {OP_TEXT, 0, 0, 0, 100, "sleep 30"},
+    TERMKEY(GKEY_ENTER, 500),
+    CTRLKEY(GKEY_C, 300),
+    {OP_TEXT, 0, 0, 0, 100, "echo after"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal"},
+    // A new size, which the shell hears of, shown over it as it changes
+    {OP_RESIZE, 0, 1100, 700, 300, ""},
+    {OP_CHECK, CHK_TERMSIZETIP, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 0, "terminal-sizetip"},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZETIP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-small"},
+    {OP_TEXT, 0, 0, 0, 100, "echo cols=$(tput cols)"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    {OP_RESIZE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    // Quiet once its output stops: past its tooltip's timers, and past the
+    // layout's save, 4 s after the last input, which the move is
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
+    // Docked beside the prompt, from the terminal to the prompt and back,
+    // the pane staying where it is
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    // Floating, hidden from the terminal, then back as it was, with the
+    // keyboard; then home again by the layout, beside Plan
+    {OP_FLOAT, 0, 700, 400, 700, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    LAYOUT("Standard"),
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nafter"},
+    // vim: an edit, resized mid-edit, written and quit
+    {OP_TEXT, 0, 0, 0, 100, "vim -u NONE -N notes.txt"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\"notes.txt\""},
+    {OP_TEXT, 0, 0, 0, 100, "ihello vim"},
+    TERMKEY(GKEY_ESCAPE, 300),
+    {OP_RESIZE, 0, 1100, 700, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "hello vim"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-vim"},
+    {OP_RESIZE, 0, 0, 0, 1000, ""},
+    {OP_TEXT, 0, 0, 0, 100, ":w"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_TEXT, 0, 0, 0, 100, ":q"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILE, 0, 0, 5000, "notes.txt"},
+    {OP_TEXT, 0, 0, 0, 100, "cat notes.txt"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nhello vim\n"},
+    // less: paged, to the end, and quit back to the shell's screen
+    {OP_TEXT, 0, 0, 0, 100, "seq 1 500 | less"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\n10\n"},
+    {OP_TEXT, 0, 0, 0, 300, "G"},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\n500\n"},
+    {OP_TEXT, 0, 0, 0, 300, "q"},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nhello vim\n"},
+    // 300x80 filled, past 64K vertices: 32-bit indices, which GLES 3.0
+    // needs, having no VtxOffset to split a draw list by
+    {OP_CHECK, CHK_TERMFORCE, 300, 80, 1000, ""},
+    {OP_TEXT, 0, 0, 0, 100, "seq 6000 | tr '\\n' x; echo end"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "x6000xend\n"},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMGRID, 300, 80, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-big"},
+    {OP_CHECK, CHK_TERMFORCE, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    // Tabs: a title names one; "+" adds one, shown, with the keyboard
+    // and a shell of its own; a drag reorders them; a click shows one;
+    // exit closes one, showing its neighbour
+    {OP_TEXT, 0, 0, 0, 100, "printf '\\033]0;one\\342\\200\\256two\\007'; echo titled"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\ntitled"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab +"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "printf '\\033]2;two\\007'; echo second"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nsecond"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 300, "onetwo|*two"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-tabs"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, -6, 0, 100, "term tab 2"},
+    {OP_MOVE, T_NAMED, -20, 0, 100, "term tab 1"},
+    {OP_MOVE, T_NAMED, -30, 0, 300, "term tab 1"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*two|onetwo"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "two|*onetwo"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\ntitled"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 1"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nsecond"},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 1, 0, 0, ""},
+    // Ctrl+Shift+` adds a tab, named by its shell until titled, and so
+    // does the session's menu
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo keyed"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nkeyed"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
+    // Each layout picked puts the terminal in its place, its tabs as they
+    // were, its size following: Compact under the prompt, as tall as it;
+    // Focus leaves it out, and Ctrl+` brings it back under the prompt;
+    // Standard beside Plan
+    LAYOUT("Compact"),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-compact"},
+    LAYOUT("Focus"),
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-focus"},
+    LAYOUT("Standard"),
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
+    // History as [terminal] scrollback says (gui.py's 100)
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "seq 1 300"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\n300\n"},
+    {OP_CHECK, CHK_TERMHIST, 100, 0, 0, ""},
+    // The wheel scrolls history (a notch may be lost to XWayland, so
+    // only back at all), and typing comes back to the bottom
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 300, ""},
+    {OP_CHECK, CHK_TERMVIEW, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-scrolled"},
+    {OP_TEXT, 0, 0, 0, 300, "x"},
+    {OP_CHECK, CHK_TERMVIEW, 0, 0, 0, ""},
+    TERMKEY(GKEY_BACKSPACE, 300),
+    // A double-click selects a word, a triple-click its line; a click
+    // clears it. The drive's clicks come a few frames apart, too slow
+    // for ImGui's double-click time, so it is longer meanwhile.
+    {OP_TEXT, 0, 0, 0, 100, "echo pick selword here"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\npick selword here"},
+    {OP_CHECK, CHK_DCLICKTIME, 1, 0, 0, ""},
+    {OP_MOVE, T_TERMTEXT, 2, 0, 100, "selword here"},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "selword"},
+    {OP_SHOT, 0, 0, 0, 1200, "terminal-selected"},  // past a double-click
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 1200, ""},
+    {OP_MOVE, T_TERMTEXT, 0, 0, 100, "pick selword here"},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "pick selword here"},
+    // Copied, then pasted (the clipboard put back afterwards)
+    {OP_CLIPPNG, 0, 8, 8, 100, ""},
+    TERMCOPY(300),
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "pick selword here"},
+    {OP_TEXT, 0, 0, 0, 100, "echo pasted:"},
+    TERMPASTE(300),
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\npasted:pick selword here"},
+    // Lines selected, by a triple-click and a Shift+click, and pasted
+    // where they aren't taken as a paste (cat's), ask first
+    {OP_TEXT, 0, 0, 0, 100, "printf 'echo l1\\necho l2\\n'"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\necho l1\necho l2\n"},
+    {OP_MOVE, T_TERMTEXT, 2, 0, 1200, "echo l1"},  // past a double-click
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_TERMTEXT, 2, 0, 1200, "echo l2"},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_SHIFT, 50, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "echo l1\necho l2"},
+    TERMCOPY(300),
+    {OP_TEXT, 0, 0, 0, 100, "head -n 2 >pasted.txt"},  // the tty echoes
+    TERMKEY(GKEY_ENTER, 500),
+    TERMPASTE(500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-paste"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term paste ok"},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "tty$ head -n 2 >pasted.txt\necho l1\necho l2"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    TERMKEY(GKEY_ENTER, 500),  // the second line, and head is done
+    {OP_CLIPBACK, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_DCLICKTIME, 0.3f, 0, 0, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "New terminal tab"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo menued"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nmenued"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|" TERMSH "|*" TERMSH},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "300\ntty$ echo pick"},  // the keyed tab's
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    // A tab's menu: Kill ends what its shell started, even ignoring
+    // SIGHUP (kill.pid, which gui.py finds gone); Close only hangs up,
+    // so that lives on (close.pid, which gui.py ends); Restart starts a
+    // new shell in the same tab
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, TERMSTRAY("kill.pid")},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Kill"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, TERMSTRAY("close.pid")},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Close"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo before"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nbefore"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Restart"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo after"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "tty$ echo after"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_CHECK, CHK_TERMREGIONS, 1, 0, 0, ""},
+    // A tab behind another draws nothing while it prints (in one
+    // program, so that its busy dot holds still)
+    {OP_TEXT, 0, 0, 0, 100, "sh -c 'while :; do date; sleep 0.2; done'"},
+    TERMKEY(GKEY_ENTER, 300),
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    CTRLKEY(GKEY_C, 500),
+    {OP_TEXT, 0, 0, 0, 100, "true"},  // a clean status for exit's
+    TERMKEY(GKEY_ENTER, 300),
+    // exit closes it; a failing exit leaves its screen under a banner,
+    // and Enter starts another shell
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "exit 3"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_SHOT, 0, 0, 0, 300, "terminal-ended"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "exit 3"},
+    TERMKEY(GKEY_ENTER, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo fresh"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nfresh"},
+    // Moving its session to the Trash hangs up its shell (gui.py checks
+    // the trap's file, or the pid on Windows) and closes its terminal;
+    // the next session's terminal is its own
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >trash.pid; trap 'echo hup >hup-trash.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERMCOUNT, 0, 0, 10000, ""},  // Windows' console closes slowly
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 1, 0, 0, ""},
+    // Each root has its own tabs, which its subagents show too; another
+    // root's are its own, and switching back finds the first's as left
+    {OP_TEXT, 0, 0, 0, 100, "echo rootwo"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nrootwo"},
+    {OP_PROMPT, 0, 0, 0, 0, "Start subagents."},
+    {OP_WAIT, W_TASKS, 0, 0, 10000, ""},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMKID, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo third"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nthird"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMREGIONS, 2, 0, 0, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    // A program running in a tab makes quitting ask, counting it
+    {OP_TEXT, 0, 0, 0, 100, "sleep 30"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCLOSE, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-quit"},
+    {OP_MOVE, T_CLOSECANCEL, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the dialog took the keyboard
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    CTRLKEY(GKEY_C, 300),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, "idle"},
+    // A session on a remote host (tests/gui.py's fake ssh, --rcwd its
+    // folder) has its own tabs there, its shell run by that host's
+    // engine: busy comes back through the host, a dropped link shows
+    // Reconnecting over the screen while the shell runs on, its output
+    // arriving once the link is back, and quitting hangs it up (gui.py
+    // checks its trap's file)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect h:remote:r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDUP, 0, 0, 60000, "r"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_MOVE, T_HOSTCOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_NEWLISTED, 0, 0, 30000, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
+    {OP_TEXTRCWD, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 15000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo \"at $PWD\""},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "far/work\ntty$"},
+    {OP_TEXT, 0, 0, 0, 100, "sleep 30"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    CTRLKEY(GKEY_C, 300),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, "idle"},
+    {OP_TEXT, 0, 0, 0, 100, "sleep 2; echo late"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_DROPLINK, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_REMOTEDOWN, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMWAIT, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 0, "terminal-reconnecting"},
+    {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nlate\ntty$"},
+    {OP_CHECK, CHK_TERMWAIT, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >remote.pid; trap 'echo hup >hup-remote.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    // Quitting hangs up the shell, whose trap leaves a file (gui.py), but
+    // on Windows, where busybox's sh runs no trap for the hang-up (a
+    // CTRL_CLOSE_EVENT), it only ends: gui.py checks its pid is gone
+    // bash 5 in readline takes the hang-up as EOF and exits without its
+    // HUP trap, so EXIT too: either way an ending, not a SIGKILL
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >shell.pid; trap 'echo hup >hup.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},  // set, at the next prompt
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_CLOSE, 0, 0, 0, 0, ""},  // with nothing busy, it quits at once
+};
+
 static DriveOp changesops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -16623,6 +18651,11 @@ static DriveOp launchops[] = {
     {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""}, \
     KEY(GKEY_V, KEY_CMD|KEY_SHIFT, 50), \
     {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""}, {OP_KEYUP, 0, GKEY_CMD, 0, 200, ""}
+// One character typed into the box: a mention's query goes in a
+// character at a time, since a burst of bytes is a paste to the box,
+// which dismisses the picker for that word (drawprompt)
+#define TYPE1(c) \
+    {OP_TEXT, 0, 0, 0, 120, c}
 
 static DriveOp composeops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
@@ -16758,7 +18791,10 @@ static DriveOp composeops[] = {
     {OP_SHOT, 0, 0, 0, 300, "compose-slash"},
     KEY(GKEY_DOWN, 0, 300),
     {OP_CHECK, CHK_SLASHSEL, 0, 0, 0, "/model"},
-    {OP_TEXT, 0, 0, 0, 300, "re"},
+    // Spelled out past "re" on purpose: a skill installed on the machine
+    // can match that prefix too, and the pick Down left would complete
+    // the skill instead of the command
+    {OP_TEXT, 0, 0, 0, 300, "rena"},
     {OP_CHECK, CHK_SLASH, 1, 0, 0, ""},
     KEY(GKEY_TAB, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/rename "},
@@ -16829,9 +18865,30 @@ static DriveOp composeops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_WAIT, W_FILE, 0, 0, 5000, "Session-A.md"},
     {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Session-A.md|# Session A\n"},
+    // Where no file dialog can be shown after all, as without a desktop
+    // portal, a field asks instead, starting where the dialog would
+    {OP_NODIALOG, 0, 0, 0, 0, ""},
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 200, "/export"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "export save"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PATHASK, 0, 0, 0, "Session-A.md"},
+    // A dot file, which the '@' picker below leaves out
+    SELALL,
+    {OP_TEXTCWD, 0, 0, 0, 300, "/.typed.md"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-pathask"},
+    KEY(GKEY_ENTER, 0, 500),
+    {OP_WAIT, W_FILE, 0, 0, 5000, ".typed.md"},
+    {OP_CHECK, CHK_EXPORTED, 0, 0, 0, ".typed.md|# Session A\n"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     CLICK(T_PROMPT, "", 200),
-    // B: a draft of its own. Leaving each keeps its draft at once
+    // B: a draft of its own. Leaving each keeps its draft at once, and
+    // picking one in the sidebar activates its box, the caret at the end
     SELALL,
     {OP_TEXT, 0, 0, 0, 200, "Kept across a restart"},
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
@@ -16848,9 +18905,13 @@ static DriveOp composeops[] = {
     CLICK(T_SESSTITLE, "Session A", 500),
     {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Draft for B"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Kept across a restart"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "Kept across a restart"},
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "end"},
     {OP_SHOT, 0, 0, 0, 300, "compose-drafts"},
     CLICK(T_SESSTITLE, "Session B", 500),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for B"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "Draft for B"},
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "end"},
     // D: a steer sent while the response streams waits in the
     // transcript, below its last message, until withdrawn, back into
     // the box, and never reaches the agent. Another, too late for the
@@ -16936,6 +18997,294 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 3 lines, 0 lost."},
     {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: notes.txt"},
     {OP_SHOT, 0, 0, 0, 300, "compose-filesent"},
+    // E3: a PDF dropped is attached as a file too, its text extracted by
+    // the engine, a line for each page's marker and one for its text
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_DROP, 0, 0, 2, 800, "dropped.pdf"},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "Describe the files."},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_TURNS, 1, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 4 lines, 0 lost."},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: dropped.pdf"},
+    // Mentions: '@' at a word's start opens the picker of the session
+    // folder's files and folders, which typing narrows, Up/Down pick in,
+    // and Tab or a bare Enter insert without sending, a file's text
+    // coming with its token; Esc dismisses it while the caret stays in
+    // that word. Three files of the checklist's own, so that the names
+    // cannot be confused with what it writes elsewhere, and made before
+    // the picker's first '@', since its index is walked then and only
+    // rebuilt on a turn's edge or a minute after
+    {OP_TOUCH, 0, 0, 0, 300, "mention-a.txt"},
+    {OP_TOUCH, 0, 0, 0, 300, "mention-b.txt"},
+    {OP_TOUCH, 0, 0, 0, 300, "mention-send.txt"},
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention"},
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"), TYPE1("-"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, 1, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_DOWN, 0, 200),
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: the picker closed
+    // A file already in the draft says so in the picker, and Down moves
+    // off it: the row's path is what the checks name, not its index
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    {OP_CHECK, CHK_MENTIONTAG, 1, 0, 0, ""},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-b.txt"},
+    {OP_CHECK, CHK_MENTIONTAG, 0, 0, 0, ""},
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    {OP_CHECK, CHK_MENTIONTAG, 1, 0, 0, ""},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // Enter on the picker inserts the pick and sends nothing, even with
+    // the caret at the end of a message that is otherwise ready
+    {OP_TEXT, 0, 0, 0, 300, "hi "},
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hi @mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Describe the files."},
+    // Esc dismisses the picker, and the box leaves that word alone
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_ESCAPE, 0, 400),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hi @mention-a.txt @mention"},
+    TYPE1("x"),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hi @mention-a.txt @mentionx"},
+    // Mid-text: the pick replaces the token alone, the words after it
+    // staying. They are typed first, since Up is the only key here that
+    // moves the caret to the start of the line; the token brings a
+    // trailing space of its own, which stands beside the sentence's
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, " for details"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, " for details"},
+    KEY(GKEY_UP, 0, 300),
+    {OP_TEXT, 0, 0, 0, 300, "see "},
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "see @mention-a.txt  for details"},
+    // Left as the next steps expect: no text, no attachment
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    CLICK(T_NAMED, "attach remove", 600),
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    // The picker's source, by name: the index of the whole tree, which a
+    // one-folder listing standing in for it would draw just as well
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "index"},
+    // A query that matches nothing leaves the popup up, its one line
+    // saying why there is no row: the zero-row popup the fix repaired
+    TYPE1("z"), TYPE1("z"), TYPE1("z"), TYPE1("z"), TYPE1("z"), TYPE1("z"),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: no rows at all
+    {OP_CHECK, CHK_MENTIONSTATUS, 0, 0, 0, "no files match"},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // The mute is that word's, not that offset's: Esc dismisses '@' at the
+    // start of the box, and once the box is cleared, '@' at the start
+    // opens the picker again
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},
+    KEY(GKEY_ESCAPE, 0, 400),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // the same offset, opened again
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // A pick is one undo: the delete of the token and the insert of its
+    // text are one record, and undoing it puts the typed query back
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    RCLICK(500),
+    PICK(T_CMUNDO),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention"},
+    // The chip the pick made outlives the undo: mentionreconcile runs at
+    // send, not on every edit, which the plan accepts (its orphaned chip,
+    // docs/plans/at-mentions.md). Taken off by its x, as a user would
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    CLICK(T_NAMED, "attach remove", 600),
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    CLICK(T_PROMPT, "", 300),  // the box again: the chip's x took the keys
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // A pasted '@' opens nothing: the box takes a burst of bytes as a
+    // paste, and dismisses the word it landed in, so the next Enter is
+    // the box's own. '@media' is typed, copied, cut, then pasted back
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("d"), TYPE1("i"), TYPE1("a"),
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCOPY),
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    RCLICK(500),
+    PICK(T_CMPASTE),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@media"},
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: no rows, none opened
+    // Left as the steps after expect: no text, no attachment
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    // A mention sent: the token stays in the message, and the file's text
+    // goes with it, as the Attach button's does, so the agent has the
+    // contents as well as the path. The note under the message names the
+    // file, as it does for the Attach button's, which is the feature's
+    // payoff: the file's text reached the agent with the message
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"), TYPE1("-"), TYPE1("s"), TYPE1("e"), TYPE1("n"), TYPE1("d"),
+    {OP_CHECK, CHK_MENTION, 1, 0, 0, ""},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-send.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_WAIT, W_TURNS, 2, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@mention-send.txt"},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: mention-send.txt"},
+    // Left as the steps after expect: no text, no attachment
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    // The folder listing that stands in for the index while a tree too big
+    // for one frame is walked, on this machine: the tree above is walked
+    // in the frame that opens the picker, so it never gets here. Held, the
+    // walk stays at its start, and the picker lists the folder; a pick
+    // from it attaches as the index's does, and a folder typed is listed
+    // in its turn
+    {OP_MENTIONHOLD, 0, 1, 0, 300, ""},
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"), TYPE1("-"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, 1, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    TYPE1("@"), TYPE1("."), TYPE1("c"), TYPE1("l"), TYPE1("a"), TYPE1("u"),
+    TYPE1("d"), TYPE1("e"), TYPE1("/"),
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, ".claude/skills"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention-list"},
+    // Left as the steps after expect: no text, no attachment, the walk free
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    CLICK(T_NAMED, "attach remove", 600),
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_MENTIONHOLD, 0, 0, 0, 300, ""},
+    // A file whose contents cannot come, a binary one (gui.py writes it):
+    // its token goes in with a path-only chip, and a note that typing
+    // leaves; the message, with that chip alone, goes as its text, the
+    // chip with it
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("z"), TYPE1("b"), TYPE1("i"), TYPE1("n"),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "zbinary.dat"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@zbinary.dat "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "added as a path \xe2\x80\x94 binary"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention-pathonly"},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_WAIT, W_TURNS, 3, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@zbinary.dat"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    // Another session, by letters of its title (A's, renamed above),
+    // ranked with the files: /export's Session-A.md scores the same, and a
+    // file comes first on a tie. Its token is the title, quoted for its
+    // space, attaching nothing, and the message goes with the session's
+    // id, which the note under it says the agent was given
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("s"), TYPE1("e"), TYPE1("s"), TYPE1("s"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, 2, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "Session-A.md"},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "Session A"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention-session"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@\"Session A\" "},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 200, "say hi"},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_WAIT, W_TURNS, 4, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@\"Session A\" say hi"},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Mentioned: Session A"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // [ui] mentions = false: '@' is plain text, and no picker opens
+    {OP_MENTIONS, 0, 0, 0, 300, ""},
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("s"), TYPE1("e"), TYPE1("s"), TYPE1("s"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: no rows, none opened
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@sessa"},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_MENTIONS, 0, 1, 0, 300, ""},
     // C: enough of a conversation for /compact, with a focus
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -16949,7 +19298,8 @@ static DriveOp composeops[] = {
     {OP_TEXT, 0, 0, 0, 200, "/compact keep the API"},
     KEY(GKEY_ENTER, 0, 300),
     {OP_WAIT, W_COMPACTED, 0, 0, 20000, ""},
-    {OP_CHECK, CHK_COMPACTED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_COMPACTED, 0, 0, 0, "keep the API"},
+    {OP_CHECK, CHK_WRAPBLANK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-compacted"},
     // Quitting keeps a draft typed just before
     CLICK(T_PROMPT, "", 200),
@@ -16980,7 +19330,7 @@ static DriveOp compose2ops[] = {
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for C"},
     {OP_SHOT, 0, 0, 0, 300, "compose-restored"},
-    {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 11000, ""},  // the box's caret stops blinking
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_COMPOSEQUIET, 0, 0, 0, ""},
     {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
@@ -17005,6 +19355,7 @@ static DriveOp firstops[] = {
 #undef PICK
 #undef SELALL
 #undef CTRLG
+#undef TYPE1
 #undef FIRSTRUN
 #undef LAYOUT
 #undef SHOWPANE
@@ -17112,6 +19463,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_PARENTLINK:  return rectcenter(g->rects[RECT_PARENTLINK]);
     case T_MSGLINK:     return rectcenter(g->rects[RECT_MSGLINK]);
     case T_UNDO:        return rectcenter(g->rects[RECT_UNDO]);
+    case T_HOLD:        return rectcenter(g->rects[RECT_HOLD]);
     case T_REWINDTURN:  return rectcenter(g->rects[RECT_REWINDTURN]);
     case T_REWINDOK:    return rectcenter(g->rects[RECT_REWINDOK]);
     case T_FORCE:       return rectcenter(g->rects[RECT_FORCE]);
@@ -17134,6 +19486,12 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_TOPTEXT: {
         Rect r = g->rects[RECT_TRANSCRIPT];
         return v2((r.x0+r.x1)/2, r.y0 + 24*g->scale);
+    }
+    case T_TERMTEXT:
+        return termtextat(g, g->ops[g->drivepc-1].text);
+    case T_TERMGRID: {
+        ImRect r = g->termgrid;
+        return r.Max.x>r.Min.x ? v2((r.Min.x+r.Max.x)/2, (r.Min.y+r.Max.y)/2) : v2(-1, -1);
     }
     case T_EMPTY: {
         Rect r = g->rects[RECT_TOOLBAR];
@@ -17159,8 +19517,10 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SIDELINK:      return rectcenter(g->rects[RECT_SIDELINK]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
     case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
+    case T_SHELLBTN:      return rectcenter(g->rects[RECT_SHELLBTN]);
     case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
     case T_THINKBTN:      return rectcenter(g->rects[RECT_THINKBTN]);
+    case T_FINDNEXT:      return rectcenter(g->rects[RECT_FINDNEXT]);
     case T_GAUGE:         return rectcenter(g->rects[RECT_GAUGE]);
     case T_PAGECOMBO:     return rectcenter(g->rects[RECT_PAGECOMBO]);
     case T_DELETE:        return rectcenter(g->rects[RECT_DELETE]);
@@ -17444,7 +19804,8 @@ static b32 docktreecheck(Gui *g)
         return 0;
     }
     b32 ok = dockshare(root, ImGuiAxis_X, 1, LAYOUT_RIGHT) &&
-             dockshare(rest, ImGuiAxis_X, 0, LAYOUT_LEFT) &&
+             dockshare(rest, ImGuiAxis_X, 0, dockcapped(LAYOUT_LEFT, LAYOUT_LEFTMAX,
+                                                        rest->Size.x, g->scale)) &&
              dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT) &&
              dockshare(right, ImGuiAxis_Y, 1, LAYOUT_PLAN) &&
              dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO);
@@ -17471,13 +19832,15 @@ static b32 docktreecheck(Gui *g)
         {PANE_JOBS,       rtop},
         {PANE_LOG,        rtop},
         {PANE_PLAN,       right->ChildNodes[1]},
+        {PANE_TERMINAL,   right->ChildNodes[1]},
         {PANE_CHANGES,    right->ChildNodes[1]},
         {PANE_HELP,       rtop},
         {PANE_SETTINGS,   rtop},
         {PANE_HOSTS,      rtop},
     };
     return dockplacescheck(g, places, countof(places)) &&
-           tabselected("Jobs") && !g->panes[PANE_METRICS];
+           tabselected("Jobs") && tabselected("Plan") && g->panes[PANE_TERMINAL] &&
+           !g->panes[PANE_METRICS];
 }
 
 // The layout saved under the name text, back as it was saved: the same
@@ -17526,13 +19889,16 @@ static b32 compactcheck(Gui *g)
     ImGuiDockNode *left = root ? root->ChildNodes[0] : 0;
     ImGuiDockNode *center = root ? root->ChildNodes[1] : 0;
     ImGuiDockNode *top = center ? center->ChildNodes[0] : 0;
-    if (!left || !top) {
+    ImGuiDockNode *foot = center ? center->ChildNodes[1] : 0;  // Prompt over Terminal
+    if (!left || !top || !foot || !foot->ChildNodes[0] || !foot->ChildNodes[1]) {
         guilog(g, "drive: the dock space is not split in two columns");
         return 0;
     }
-    if (!dockshare(root, ImGuiAxis_X, 0, LAYOUT_LEFT*(1-LAYOUT_RIGHT)) ||
+    if (!dockshare(root, ImGuiAxis_X, 0, dockcapped(LAYOUT_LEFT*(1-LAYOUT_RIGHT),
+                                                    LAYOUT_LEFTMAX, root->Size.x, g->scale)) ||
         !dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO) ||
-        !dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT)) {
+        !dockshare(center, ImGuiAxis_Y, 1, 2*LAYOUT_PROMPT) ||
+        !dockshare(foot, ImGuiAxis_Y, 0, 0.5f)) {
         guilog(g, "drive: the compact layout's splits are not in their shares");
         return 0;
     }
@@ -17547,13 +19913,14 @@ static b32 compactcheck(Gui *g)
         {PANE_HELP,       top},
         {PANE_SETTINGS,   top},
         {PANE_HOSTS,      top},
-        {PANE_PROMPT,     center->ChildNodes[1]},
+        {PANE_PROMPT,     foot->ChildNodes[0]},
+        {PANE_TERMINAL,   foot->ChildNodes[1]},
     };
     return dockplacescheck(g, places, countof(places)) &&
            top->IsCentralNode() && tabselected("Todo") &&
            tabselected("Transcript") && g->panes[PANE_JOBS] &&
-           g->panes[PANE_PLAN] && !g->panes[PANE_LOG] &&
-           center->ChildNodes[1]->IsHiddenTabBar();
+           g->panes[PANE_PLAN] && !g->panes[PANE_LOG] && g->panes[PANE_TERMINAL] &&
+           foot->ChildNodes[0]->IsHiddenTabBar();
 }
 
 // The Focus layout, as applied: Transcript, Todo and Plan as tabs in
@@ -17574,7 +19941,7 @@ static b32 focuscheck(Gui *g)
     DockPlace places[PANE_COUNT];
     i32 len = 0;
     for (i32 i = 0; i < PANE_COUNT; i++) {
-        if (i != PANE_METRICS) {
+        if (i!=PANE_METRICS && i!=PANE_TERMINAL) {
             places[len++] = {i, i==PANE_PROMPT ? bottom : top};
         }
     }
@@ -17691,6 +20058,26 @@ static b32 toolsas(View *v, i32 want)
         }
     }
     return rows > 0;
+}
+
+// Whether every shell row the user did not choose is folded, and every
+// other tool row as tools = auto says, with at least one shell row that
+// auto would have open.
+static b32 shellas(View *v)
+{
+    i32 opened = 0;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role!=VIEW_TOOL || m->chosen || m->prov) {
+            continue;
+        }
+        b32 shell = m->tool->name == "shell";
+        opened += shell && !toolauto(m);
+        if (m->collapsed != (shell ? 1 : toolauto(m))) {
+            return 0;
+        }
+    }
+    return opened > 0;
 }
 
 // Whether every reasoning the user did not choose is folded (want 1) or
@@ -17838,6 +20225,18 @@ static Str lastmark(Gui *g, Arena *a)
     return {};
 }
 
+// Terminals open, in every session.
+static i64 drivetermcount(Gui *g)
+{
+    i64 n = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        for (i32 i = 0; i < s->terms.n; i++) {
+            n += s->terms.tabs[i]->state != TT_NONE;
+        }
+    }
+    return n;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
@@ -17926,6 +20325,34 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_MCPSIGNED:
         return !g->mcpname.len && g->mcpmsgfor=="web" && g->mcpmsg.len;
+    case W_MCPTOOLS:
+        for (Json *s = g->mcptfor=="web" && g->mcptlist ? g->mcptlist->child : 0; s;
+             s = s->next) {
+            for (Json *t = jsonget(s, "toollist")->child; t; t = t->next) {
+                if (jsonstr(jsonget(t, "tool")) == g->ops[g->drivepc-1].text) {
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    case W_MCPTOOLSET:
+        return !g->mcppendfor.data && !g->cfgset && !g->cfgget &&
+               mcprow(g, "web", "tools")==g->ops[g->drivepc-1].text;
+    case W_EPSTATE: {
+        // Its text: "NAME|STATUS", or the status of endpoint gpt
+        u32 dot  = 0;
+        Str t    = g->ops[g->drivepc-1].text;
+        b32 named = contains(t, "|");
+        Str name = named ? cut(t, '|').head : Str("gpt");
+        Str want = named ? cut(t, '|').tail : t;
+        b32 copilot = cfgepkind(g, name)=="copilot";
+        return startswith(epstatus(g, &g->frame, name, &dot, copilot), want);
+    }
+    case W_EPSIGNED: {
+        Str t    = g->ops[g->drivepc-1].text;
+        Str name = t.len ? t : Str("gpt");
+        return !g->mcpname.len && g->mcpmsgfor==name && g->mcpmsg.len;
+    }
     case W_NAMEDUPDATED: {
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && (h->updating==UPD_FAILED ||
@@ -17965,6 +20392,17 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_CTR:
         return ctrwait(g, g->ops[g->drivepc-1].text);
+    case W_TERM: {
+        Arena a = g->frame;
+        return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
+    }
+    case W_TERMBUSY: {
+        TermTab *tt   = termfront(g);
+        b32      idle = g->ops[g->drivepc-1].text == Str("idle");
+        return tt && tt->busy!=idle;
+    }
+    case W_TERMCOUNT:
+        return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
     case W_PLAN: {
@@ -18024,6 +20462,9 @@ static b32 drivewaitdone(Gui *g)
         return g->ambershown;
     case W_ETA:
         return g->etashown;
+    case W_STRIPFULL:
+        return (g->stripform==STRIP_FULL || g->stripform==STRIP_BELOW) &&
+               g->striprate && v->petaat;
     case W_BACKOFF:
         return g->sess && v->state==LIVE_BACKOFF;
     case W_GONE:
@@ -18321,6 +20762,39 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         got = g->slashsel<p.len ? slashpickinfo(&a, p[g->slashsel], sk).name : Str{};
         ok  = g->slashshown && got==want;
     } break;
+    case CHK_MENTION: {
+        // The rows the picker drew, none once it closed: dx -1 for none,
+        // 0 for one or more (the popup opened), else exactly dx
+        i32 n  = g->mentionrows;
+        i32 dx = (i32)op->dx;
+        Buf b(&a, 24);
+        print(&b, (i64)n);
+        got = finish(&b);
+        ok  = dx < 0 ? n==0 : dx==0 ? n>0 : n==dx;
+    } break;
+    case CHK_MENTIONSEL:
+        // The pick's path, which a re-rank of its rows cannot move
+        got = keepstr(&g->mentionpath);
+        ok  = g->mentionrows>0 && got==want;
+        break;
+    case CHK_MENTIONKIND:
+        // Where the rows came from, by name: the index of the whole tree,
+        // or one folder listed in its place, which a count of rows alone
+        // cannot tell apart
+        got = g->mentionkind==MENTION_INDEX ? Str("index") :
+              g->mentionkind==MENTION_LIST  ? Str("list") : Str("none");
+        ok  = g->mentionshown && got==want;
+        break;
+    case CHK_MENTIONSTATUS:
+        // Its one line, as drawn, which with no row to list is all it has
+        // to say: the popup draws with no rows rather than closing
+        got = keepstr(&g->mentionstatus);
+        ok  = g->mentionshown && got==want;
+        break;
+    case CHK_MENTIONTAG:
+        got = g->mentiontag ? Str("attached") : Str("not attached");
+        ok  = g->mentionrows>0 && g->mentiontag==(b32)op->dx;
+        break;
     case CHK_TITLE:
         got = v->title;
         ok  = got == want;
@@ -18523,7 +20997,10 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TOOLSOPEN:  return g->toolset==TOOLS_OPEN && toolsas(v, 0);
     case CHK_TOOLSFOLD:  return g->toolset==TOOLS_FOLD && toolsas(v, 1);
-    case CHK_TOOLSAUTO:  return g->toolset==TOOLS_AUTO && !v->showtools && toolsas(v, -1);
+    case CHK_TOOLSAUTO:  return g->toolset==TOOLS_AUTO && !v->showtools && !v->foldshell &&
+                                toolsas(v, -1);
+    case CHK_FOLDSHELL:  return g->toolset==TOOLS_AUTO && v->foldshell && !v->showtools &&
+                                shellas(v);
     case CHK_SHOWTOOLS:  return g->toolset==TOOLS_AUTO && v->showtools && toolsas(v, 0);
     case CHK_SHOWTHINK:  return g->thinkset==THINK_FOLD && v->showthink && thinkas(v, 0);
     case CHK_THINKBACK:  return !v->showthink && thinkas(v, 1);
@@ -18547,6 +21024,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FINDHIDDEN:
         return g->findopen && !g->search->hits.len;
     case CHK_FINDCLOSED:
+    case CHK_FINDARROWESC:
         return !g->findopen && !g->findactive && !v->busy;
     case CHK_GAUGEREAL: {
         Arena a = g->frame;
@@ -18680,6 +21158,11 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_SLASHSEL:
     case CHK_TITLE:
     case CHK_LASTUSER:
+    case CHK_MENTION:
+    case CHK_MENTIONKIND:
+    case CHK_MENTIONSTATUS:
+    case CHK_MENTIONSEL:
+    case CHK_MENTIONTAG:
         return composecheck(g, chk, &g->ops[g->drivepc-1]);
     case CHK_COMPOSEQUIET: {
         i64 n = g->total.frames - g->driveframes;
@@ -18697,8 +21180,35 @@ static b32 drivecheck(Gui *g, i32 chk)
         return !g->edsess && !g->edproc;
     case CHK_MODELS:
         return g->modelsshown;
-    case CHK_COMPACTED:
-        return lastof(v, VIEW_COMPACT) != 0;
+    case CHK_COMPACTED: {
+        // The card, and the focus asked for on it, in full in its body
+        Arena    a     = g->frame;
+        ViewMsg *m     = lastof(v, VIEW_COMPACT);
+        Str      focus = g->ops[g->drivepc-1].text;
+        b32      ok    = m && (!focus.len || (m->card->focus==focus &&
+                                startswith(m->text, concat(&a, "**Focus:** ", focus))));
+        if (m && !ok) {
+            guilog(g, concat(&a, "drive: the compaction card's focus: ", m->card->focus));
+        }
+        return ok;
+    }
+    case CHK_WRAPBLANK: {
+        // Too narrow for the whole: the break comes at the blank, never
+        // after the quote, comma or period that follow (FetchGui.cmake)
+        Str         t  = "one \"two\"three,four.five";
+        ImFont     *f  = ImGui::GetFont();
+        f32         fs = ImGui::GetFontSize();
+        f32         w  = f->CalcTextSizeA(fs, FLT_MAX, 0, t.cdata, t.cdata+t.len-2).x;
+        iz          at = f->CalcWordWrapPosition(fs, t.cdata, t.cdata+t.len, w) - t.cdata;
+        if (at > 4) {
+            Arena a = g->frame;
+            Buf   b(&a, 64);
+            print(&b, "drive: word wrap broke at byte ");
+            print(&b, (i64)at);
+            guilog(g, finish(&b));
+        }
+        return at <= 4;
+    }
     case CHK_ORPHAN: {
         GuiSession *s = g->sess;
         return s && s->view && s->view->parent.len && !sessparent(s).len &&
@@ -18739,6 +21249,10 @@ static b32 drivecheck(Gui *g, i32 chk)
             guilog(g, concat(&a, "drive: export status: ", g->exp.status));
         }
         return ok;
+    }
+    case CHK_PATHASK: {
+        Str t = {(u8 *)g->pask.buf, (iz)__builtin_strlen(g->pask.buf)};
+        return g->pask.shown && endswith(t, g->ops[g->drivepc-1].text);
     }
     case CHK_HOSTTRIED: {
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
@@ -18954,6 +21468,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         return k && k->tool->answer==VASK_ALLOWED && k->tool->by=="user" &&
                a && find(a->text, "allowed")>=0;
     }
+    case CHK_ASKHELD: {
+        ViewMsg *k = lastmsg(g, VIEW_ASK);
+        return k && k->tool->answer==VASK_PENDING && !k->tool->deadline;
+    }
     case CHK_ASKTIMEOUT: {
         ViewMsg *k = lastmsg(g, VIEW_ASK);
         ViewMsg *a = lastmsg(g, VIEW_ASSISTANT);
@@ -19004,9 +21522,22 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_RETRYSHOWN:
         return g->retryshown;
     case CHK_ETASHOWN:
-        return g->etashown;
+        return g->etashown && g->striprate &&
+               (g->stripform==STRIP_FULL || g->stripform==STRIP_BELOW);
+    case CHK_STRIPFIT:
+        if (g->stripover) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: a status readout ran past the Prompt "
+                                 "pane's edge: ", g->stripwhat));
+        }
+        if (g->stripbob) {
+            guilog(g, "drive: the status readouts changed lines in the same room");
+        }
+        return g->stripcramped && !g->stripover && !g->stripbob && g->etashown;
     case CHK_CLOCKSHOWN:
         return g->clockshown;
+    case CHK_WORKED:
+        return g->workedshown;
     case CHK_RAILFOLD:
         return g->railfold>0 && g->railfold<=v->msgs.len &&
                v->msgs[g->railfold-1].collapsed && g->railseen;
@@ -19164,6 +21695,18 @@ static b32 drivecheck(Gui *g, i32 chk)
         Str   page = g->cfgdiag ? Str("diagnostics") : cfgpagekey(&a, g->cfgpkind, g->cfgpname);
         return page == want;
     }
+    case CHK_CFGVAL: {
+        Cut kind = cut(g->ops[g->drivepc-1].text, ' ');
+        Cut name = cut(kind.tail, ' ');
+        Cut key  = cut(name.tail, '=');
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (r->kind==kind.head && r->name==name.head && r->key==key.head) {
+                return r->value == key.tail;
+            }
+        }
+        return 0;
+    }
     case CHK_ROOTS:
         for (iz i = 0; i < g->cfgrows.len; i++) {
             CfgRow *r = &g->cfgrows[i];
@@ -19221,12 +21764,13 @@ static b32 drivecheck(Gui *g, i32 chk)
                r->value==concat(&a, g->longval, "!");
     }
     case CHK_CFGKEPT:
-        // The field gone to by Tab kept the focus through the config.get
-        // after the edit left behind, and what was typed in it on either
-        // side of it
+        // The field gone to by Tab, the role's next after its prompt (which
+        // is whichever key the table puts there), kept the focus through
+        // the config.get after the edit left behind, and what was typed in
+        // it on either side of it
         for (iz i = 0; i < g->cfgrows.len; i++) {
             CfgRow *r = &g->cfgrows[i];
-            if (r->active && r->typed && r->key==Str("endpoint") &&
+            if (r->active && r->typed && r->key!=Str("prompt") &&
                     Str{(u8 *)r->buf, (iz)__builtin_strlen(r->buf)}==g->ops[g->drivepc-1].text) {
                 return 1;
             }
@@ -19525,7 +22069,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_INFO:
         return c.OpenPopupStack.Size>0 && g->infoshown>=1 && g->infoagents>=1 &&
-               g->infomems>=1;
+               g->infomems>=1 && g->infowork;
     case CHK_QUEUED:
         return g->queuedshown && v->state==LIVE_QUEUED && v->queuepos==1;
     case CHK_FALLBACK:
@@ -19611,6 +22155,172 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_GITQUIET:
         return g->changesshown && drivequiet(g, "idle with the changes shown", 2);
+    case CHK_TERMFOCUS:
+        return g->termfocused && GImGui->ActiveId==g->termid;
+    case CHK_TERMSCREEN: {
+        Arena a      = g->frame;
+        Str   screen = termscreen(g, &a);
+        b32   ok     = find(screen, g->ops[g->drivepc-1].text) >= 0;
+        if (!ok) {
+            guilog(g, concat(&a, "drive: the terminal shows:\n", screen));
+        }
+        return ok;
+    }
+    case CHK_TERMSIZE:
+        return termsizecheck(g);
+    case CHK_TERMNONE: {
+        TermTab *tt = termfront(g);
+        return g->sess && (!tt || tt->state==TT_NONE);
+    }
+    case CHK_TERMWAIT:
+        return termfront(g) && g->termwaitshown==(g->ops[g->drivepc-1].dx!=0);
+    case CHK_TERMSIZETIP:
+        return termfront(g) && g->termsizeshown==(g->ops[g->drivepc-1].dx!=0);
+    case CHK_TERMCLOSE: {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: the quit dialog counts busy terminal tabs: ");
+        print(&b, (i64)g->closeterms);
+        guilog(g, finish(&b));
+        return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
+    }
+    case CHK_TERMREGIONS: {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: terminal blocks reserved: ");
+        print(&b, (i64)g->termregions);
+        guilog(g, finish(&b));
+        return (f32)g->termregions == g->ops[g->drivepc-1].dx;
+    }
+    case CHK_DCLICKTIME: {
+        // The delayed single click must stay longer (0.5 s by default)
+        ImGuiIO &io = ImGui::GetIO();
+        f32      t  = g->ops[g->drivepc-1].dx;
+        io.MouseDoubleClickTime  = t;
+        io.MouseSingleClickDelay = t<0.4f ? 0.5f : t + 0.2f;
+        return 1;
+    }
+    case CHK_TERMSEL: {
+        TermTab *tt = termfront(g);
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        Arena a   = g->frame;
+        iz    n   = ariel_copy(tt->t, 0, 0);
+        u8   *buf = allocbytes(&a, n>0 ? n : 1);
+        n = n>0 ? ariel_copy(tt->t, buf, n) : 0;
+        Buf b(&a, 64 + n);
+        print(&b, "drive: the terminal's selection is \"");
+        print(&b, Str{buf, n});
+        print(&b, "\"");
+        guilog(g, finish(&b));
+        return Str{buf, n} == g->ops[g->drivepc-1].text;
+    }
+    case CHK_TERMVIEW: {
+        TermTab *tt = termfront(g);
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        ariel_View v = ariel_view(tt->t);
+        Arena      a = g->frame;
+        Buf        b(&a, 64);
+        print(&b, "drive: the terminal's view is ");
+        print(&b, (i64)v.offset);
+        print(&b, " rows back");
+        guilog(g, finish(&b));
+        return (v.offset > 0) == (g->ops[g->drivepc-1].dx != 0);
+    }
+    case CHK_TERMHIST: {
+        TermTab *tt = termfront(g);
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        ariel_View v = ariel_view(tt->t);
+        Arena      a = g->frame;
+        Buf        b(&a, 64);
+        print(&b, "drive: the terminal's history is ");
+        print(&b, (i64)(v.total - tt->rows));
+        print(&b, " rows");
+        guilog(g, finish(&b));
+        return (f32)(v.total - tt->rows) == g->ops[g->drivepc-1].dx;
+    }
+    case CHK_TERMHOME: {
+        // With dx, a tab of Plan's node (Standard); else the lower side of
+        // a vertical split, near its share, whose upper side holds the
+        // prompt (Compact's even split, or dockaddterm's)
+        ImGuiWindow   *w = ImGui::FindWindowByName(panenames[PANE_TERMINAL]);
+        ImGuiWindow   *p = ImGui::FindWindowByName(panenames[PANE_PROMPT]);
+        ImGuiDockNode *n = w ? w->DockNode : 0;
+        ImGuiDockNode *s = n ? n->ParentNode : 0;
+        if (g->ops[g->drivepc-1].dx != 0) {
+            ImGuiWindow *plan = ImGui::FindWindowByName(panenames[PANE_PLAN]);
+            return n && plan && plan->DockNode==n;
+        }
+        if (!s || !p || !p->DockNode || s->SplitAxis!=ImGuiAxis_Y || s->ChildNodes[1]!=n) {
+            return 0;
+        }
+        b32 under = 0;
+        for (ImGuiDockNode *q = p->DockNode; q; q = q->ParentNode) {
+            under |= q == s->ChildNodes[0];
+        }
+        f32 share = s->ChildNodes[0]->Size.y / s->Size.y;
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: the terminal's split gives the prompt's side ");
+        printfloat(&b, share, 2);
+        guilog(g, finish(&b));
+        return under && share>0.45f && share<0.7f;
+    }
+    case CHK_TERMKID: {
+        GuiSession *r = g->sess ? termroot(g, g->sess) : 0;
+        return r && r!=g->sess && g->sess->view && g->sess->view->parent==r->sid &&
+               r->terms.n && termfront(g)==termsetfront(&r->terms);
+    }
+    case CHK_TERMTABS: {
+        GuiSession *s = g->sess ? termroot(g, g->sess) : 0;
+        Arena       a = g->frame;
+        Buf         b(&a, 256);
+        for (i32 i = 0; s && i<s->terms.n; i++) {
+            print(&b, i ? Str("|") : Str(""));
+            print(&b, i==s->terms.front ? Str("*") : Str(""));
+            print(&b, termlabel(s->terms.tabs[i]));
+        }
+        Str got = finish(&b);
+        if (!(got == g->ops[g->drivepc-1].text)) {
+            guilog(g, concat(&a, "drive: the terminal tabs are ", got));
+            return 0;
+        }
+        return 1;
+    }
+    case CHK_TERMCOUNT:
+        return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
+    case CHK_TERMQUIET:
+        return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
+    case CHK_TERMFORCE: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        g->termforcecols = (i32)op->dx;
+        g->termforcerows = (i32)op->dy;
+        return 1;
+    }
+    case CHK_TERMGRID: {
+        DriveOp    *op = &g->ops[g->drivepc-1];
+        TermTab *tt = termfront(g);
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        ariel_Modes mo = ariel_modes(tt->t);
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: the terminal is ");
+        print(&b, (i64)mo.cols);
+        print(&b, "x");
+        print(&b, (i64)mo.rows);
+        print(&b, " in ");
+        print(&b, (i64)g->termverts);
+        print(&b, " vertices");
+        guilog(g, finish(&b));
+        return mo.cols==(i32)op->dx && mo.rows==(i32)op->dy && g->termverts>0xffff;
+    }
     case CHK_PLANTEXT:
         return tabselected("Plan") && g->planshown>0 && g->plan.doc &&
                find(g->plan.doc->v->msgs[0].text, g->ops[g->drivepc-1].text)>=0;
@@ -19753,6 +22463,26 @@ static b32 drivecheck(Gui *g, i32 chk)
         return s && in && s->git.state==GITW_REPO && startswith(s->git.branch, want) &&
                s->wtbranch==s->git.branch && s->wtname.len &&
                endswith(s->git.branch, s->wtname);
+    }
+    case CHK_PALETTE: {
+        DriveOp *op    = &g->ops[g->drivepc-1];
+        PalWin  *p     = &g->palw;
+        Str      first = {(u8 *)p->first, (iz)__builtin_strlen(p->first)};
+        b32      any   = !op->text.len || (op->dy==0 && first==op->text);
+        for (iz i = 0; op->dy!=0 && !any && i<p->order.len; i++) {
+            any = p->items[p->order[i]].title == op->text;
+        }
+        b32      ok    = p->shown && p->rows>0 && (op->dx==0 || p->rows==(i32)op->dx) && any;
+        if (!ok) {
+            Arena a = g->frame;
+            Buf   b(&a, 128);
+            print(&b, "drive: the palette: ");
+            print(&b, (i64)g->palw.rows);
+            print(&b, " rows, the first ");
+            print(&b, first);
+            guilog(g, finish(&b));
+        }
+        return ok;
     }
     case CHK_PATHPICK: {
         DriveOp *op    = &g->ops[g->drivepc-1];
@@ -20058,7 +22788,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         Arena    a = g->frame;
         GuiHost *h = findhost(g, GH_REMOTE, "Deb");
         return h && h->up && h->r && h->deploying==1 && !h->deployfail &&
-               !g->dtoasthost && hostlabel(g, &a, h)=="Deb (WSL)";
+               !g->htoasthost && hostlabel(g, &a, h)=="Deb (WSL)";
     }
     case CHK_WSLSECTION:
         return cfghas(g, "remote", "Deb") && remoterow(g, "Deb", "wsl")=="Deb" &&
@@ -20070,6 +22800,24 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_MCPSIGNED:
         return g->mcpsignins==1 && g->mcpmsg=="Signed in" && !g->mcpbad;
+    case CHK_EPSIGNED: {
+        // Its text: "NAME|N", signed in N times in all, or endpoint gpt's
+        // second
+        Str t    = g->ops[g->drivepc-1].text;
+        Str name = t.len ? cut(t, '|').head : Str("gpt");
+        Int n    = parseint(t.len ? cut(t, '|').tail : Str("2"));
+        return n.ok && g->mcpsignins==n.val && g->mcpmsgfor==name &&
+               g->mcpmsg=="Signed in" && !g->mcpbad;
+    }
+    case CHK_MCPTOOLSET: {
+        Arena a    = g->frame;
+        Str   want = g->ops[g->drivepc-1].text;
+        b32   incl = 0;
+        Read  rd   = os_read(g->os, &a, cfgfile(g, &a), 1<<20);
+        b32   file = rd.err==READ_OK && (find(rd.data, "tools = -echo")>=0) == (want=="-echo");
+        return file && mcprow(g, "web", "tools")==want &&
+               mcponly(mcptoolsnow(g, "web", &incl), "echo") == !want.len;
+    }
     case CHK_MCPCALL: {
         GuiSession *s = g->sess;
         View       *v = s ? s->view : 0;
@@ -20184,6 +22932,75 @@ static void drivesummary(Gui *g)
     guilog(g, finish(&b));
 }
 
+// A PDF of so many pages (at most 30), each with a line of text, for the
+// checklist to drop: its objects, then the table of where each begins.
+static Str droppdf(Arena *a, i32 pages)
+{
+    assert(pages>=1 && pages<=30);
+    Buf  b(a, 1024);
+    iz   offs[64] = {};
+    i32  n    = 0;
+    i32  font = 3 + 2*pages;
+    print(&b, "%PDF-1.4\n");
+    offs[n++] = b.len;
+    print(&b, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offs[n++] = b.len;
+    print(&b, "2 0 obj\n<< /Type /Pages /Kids [");
+    for (i32 i = 0; i < pages; i++) {
+        print(&b, i ? Str(" ") : Str(""));
+        print(&b, (i64)(3 + 2*i));
+        print(&b, " 0 R");
+    }
+    print(&b, "] /Count ");
+    print(&b, (i64)pages);
+    print(&b, " >>\nendobj\n");
+    for (i32 i = 0; i < pages; i++) {
+        Buf c(a, 64);
+        print(&c, "BT /F1 12 Tf 72 700 Td (Dropped page ");
+        print(&c, (i64)i + 1);
+        print(&c, ") Tj ET");
+        Str ops = finish(&c);
+        offs[n++] = b.len;
+        print(&b, (i64)(3 + 2*i));
+        print(&b, " 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                  "/Resources << /Font << /F1 ");
+        print(&b, (i64)font);
+        print(&b, " 0 R >> >> /Contents ");
+        print(&b, (i64)(4 + 2*i));
+        print(&b, " 0 R >>\nendobj\n");
+        offs[n++] = b.len;
+        print(&b, (i64)(4 + 2*i));
+        print(&b, " 0 obj\n<< /Length ");
+        print(&b, (i64)ops.len);
+        print(&b, " >>\nstream\n");
+        print(&b, ops);
+        print(&b, "\nendstream\nendobj\n");
+    }
+    offs[n++] = b.len;
+    print(&b, (i64)font);
+    print(&b, " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+    iz xref = b.len;
+    print(&b, "xref\n0 ");
+    print(&b, (i64)n + 1);
+    print(&b, "\n0000000000 65535 f \n");
+    for (i32 i = 0; i < n; i++) {
+        Buf o(a, 16);
+        print(&o, (i64)offs[i]);
+        Str num = finish(&o);
+        for (iz k = num.len; k < 10; k++) {
+            putbyte(&b, '0');
+        }
+        print(&b, num);
+        print(&b, " 00000 n \n");
+    }
+    print(&b, "trailer\n<< /Size ");
+    print(&b, (i64)n + 1);
+    print(&b, " /Root 1 0 R >>\nstartxref\n");
+    print(&b, (i64)xref);
+    print(&b, "\n%%EOF\n");
+    return finish(&b);
+}
+
 // A baseline grayscale JPEG of w by h mid-gray pixels, for the checklist
 // to drop: under one-symbol Huffman tables, each block a zero bit for
 // its DC and another for its end.
@@ -20243,6 +23060,15 @@ static void drivestep(Gui *g)
             Buf   b(&a, 128);
             print(&b, "drive: FAIL gave up waiting for ");
             print(&b, waitnames[g->drivewait]);
+            Str text = g->ops[g->drivepc-1].text;
+            if (text.len) {
+                print(&b, ": ");
+                printjsonstr(&b, text);
+            }
+            if (g->drivewait == W_TERM) {
+                print(&b, "\ndrive: the terminal shows:\n");
+                print(&b, termscreen(g, &a));
+            }
             guilog(g, finish(&b));
             g->drivechecks++;
             g->drivefails++;
@@ -20475,7 +23301,9 @@ static void drivestep(Gui *g)
         // A .txt is dy numbered lines of text instead
         Str png = endswith(op->text, ".jpg") ? flatjpeg(&a, w, h) :
                   pngencodez(&a, px, w, h, 0);
-        if (endswith(op->text, ".txt")) {
+        if (endswith(op->text, ".pdf")) {
+            png = droppdf(&a, (i32)op->dy);
+        } else if (endswith(op->text, ".txt")) {
             Buf t(&a, 64*(iz)op->dy);
             for (i32 i = 1; i <= (i32)op->dy; i++) {
                 print(&t, "Line ");
@@ -20767,6 +23595,15 @@ static void drivestep(Gui *g)
         g->drivetoasts = g->toastsshown;
         g->drivegone   = g->toastsgone;
         break;
+    case OP_MENTIONHOLD:
+        g->mentionhold = op->dx != 0;
+        if (g->mentionhold && g->sess) {
+            mentionidxdrop(g, g->sess);  // begun again, and held unwalked
+        }
+        break;
+    case OP_MENTIONS:
+        g->nomentions = op->dx == 0;
+        break;
     case OP_TOASTCLICK:
         g->drivefocus = 1;  // as the window comes forward
         e.kind = GEV_TOAST;
@@ -20858,6 +23695,9 @@ static void drivestep(Gui *g)
     case OP_MARKSESS:
         g->drivesess = g->sess;
         break;
+    case OP_NODIALOG:
+        g->nodialog = 1;
+        break;
     case OP_PLACE:
         if (op->dx != 0) {
             // As if saved on a display right of every display there is
@@ -20900,7 +23740,7 @@ static b32 guiwanted(Str *args, i32 nargs)
 {
     static Str const cmds[] = {
         "run", "serve", "attach", "hosts", "connect", "deploy", "eval", "mcp",
-        "approve",
+        "approve", "endpoint",
     };
     if (nargs<2 || args[1]=="gui") {
         return 1;
@@ -21155,6 +23995,7 @@ static Str guiusage =
 "                 Plan window, the toggle and /plan\n"
 "  --changes      the branch on the session bar and the Changes pane, in a\n"
 "                 --cwd that is a git repository\n"
+"  --terminal     the Terminal pane: Ctrl+`, typing, a resize, exit\n"
 "  --mcp          an MCP server's page in Settings: its state, Sign in\n"
 "                 (a stand-in browser), a call from a session, Sign out\n"
 "  --hosttask     subagents on another host: opened and answered here, a\n"
@@ -21245,6 +24086,9 @@ static void readconfig(Gui *g, Arena scratch)
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
+    g->nomentions = cfgbool(cfgget(cfg, "ui", "", "mentions", 0)) == 0;
+    g->termscroll  = termscrollparse(cfgget(cfg, "terminal", "", "scrollback", 0));
+    g->termcopysel = cfgbool(cfgget(cfg, "terminal", "", "copy_on_select", 0)) == 1;
     g->pathpre    = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
     g->pathpost   = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
     g->configured = cfgconfigured(cfg);
@@ -21273,6 +24117,9 @@ static b32 startinproc(Gui *g, Arena scratch)
         guilog(g, finish(&b));
     }
     g->engine = newengine(os, &g->perm, cfg, g->statedir, g->inbox, g->skillsdirs);
+    if (g->engine) {
+        g->engine->gui = 1;  // a desktop session's login ran its profile
+    }
     if (!g->engine || !enginestart(g->engine)) {
         g->engineerr = "cannot start the engine";
         return 0;
@@ -21334,6 +24181,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->layout   = dockpreset(PRESET_STANDARD);
     g->zoom     = 1;
     g->fontbase = FONT_BASE;
+    g->termscroll = 10000;  // until the configuration says
     for (i32 i = 0; i < PANE_COUNT; i++) {
         g->panes[i] = !panehidden(i);
     }
@@ -21350,6 +24198,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
     b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0, thin = 0;
+    b32 terminal = 0;
     b32 containers = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
@@ -21395,6 +24244,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             plan = probe = 1;
         } else if (a == "--changes") {
             changes = probe = 1;
+        } else if (a == "--terminal") {
+            terminal = probe = 1;
         } else if (a == "--mcp") {
             mcp = probe = 1;
         } else if (a == "--hosttask") {
@@ -21477,9 +24328,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp || hosttask || changes || thin || containers) {
+            first || mcp || hosttask || changes || thin || containers || terminal) {
         g->drive = 1;
-        if (containers) {
+        if (terminal) {
+            g->ops  = termops;
+            g->nops = countof(termops);
+        } else if (containers) {
             g->ops  = ctrops;
             g->nops = countof(ctrops);
         } else if (thin) {

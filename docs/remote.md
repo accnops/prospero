@@ -45,10 +45,15 @@ directory, a folder copied into it with `cp` before it starts), and its
 state directory here,
 `STATE/containers/NAME/state`, bound at `/prospero/state` with a tmpfs
 over its `run` so that the host's socket never lands on a shared
-mount. `container.ini` beside it keeps the image, workspace, network
-and the sessions last listed, for the Trash while it is stopped. The
-window reaches it as the exec remote `ctr:NAME`, `RUNTIME exec -i
-prospero-NAME`, deployed as any exec remote is, its model calls
+mount. Where this machine runs SELinux (`/sys/fs/selinux` exists, as on
+RHEL, Rocky, AlmaLinux and Fedora), a container may write no bound
+folder that isn't labelled for it, so the state and `/out` get `:Z`, a
+label of that container's own, and a bound folder `:z`, which the
+runtime relabels `container_file_t` once, shared, so that the user's own
+programs and other containers still use it. `container.ini` beside it
+keeps the image, workspace, network and the sessions last listed, for
+the Trash while it is stopped. The window reaches it as the exec
+remote `ctr:NAME`, `RUNTIME exec -i prospero-NAME`, deployed as any exec remote is, its model calls
 relayed, and starts it first when it is stopped. Its Trash is the
 window's: the last session there stops it (`stop -t 5`), restoring one
 starts it, and Delete, emptying the Trash or the purge after the main
@@ -154,13 +159,23 @@ the id it sends), its defaults, whether it searches,
 and its machine name, but never a URL, key or `max_*` setting. The
 thin engine keeps up to eight offers, a gone client's too, as layers
 of its configuration under the user's file, each endpoint at
-`relay://NAME` (`relay+anthropic://NAME` for kind anthropic). A model
+`relay://NAME` (`relay+KIND://NAME` for another kind than openai:
+`relay+anthropic://`, `relay+responses://`, `relay+chatgpt://`,
+`relay+copilot://`). A model
 call to one of them goes back as `relay` records, part by part as the
 host makes room, to a client that offers that endpoint with that kind:
 the session's last, else the newest whose listing has the model, else
 the newest (a server may take names it does not list). The client's own
 engine makes it (`relay.call`), admitted in line with its own
-sessions, at the API's paths alone, and answers with `relay.data`. A
+sessions, at the API's paths alone, with its own key or, for kind
+chatgpt or copilot, its own sign-in (so a thin engine uses the
+subscription of the computer that relays for it, and needs no sign-in
+of its own), and answers with `relay.data`. For kind copilot the thin
+engine names the API by the path (`v1/chat/completions`,
+`v1/responses`, `v1/messages`), and says in the call's `initiator`
+(`user` or `agent`) and `interaction` (`conversation-agent`,
+`-subagent` or `-compaction`) who began it, which the relaying engine
+passes on to Copilot, with nothing else in those fields. A
 turn's body goes as a delta against the session's last one to the
 same client, deflated when that is smaller. With no client to relay,
 the session waits in state `relay` for at most the endpoint's

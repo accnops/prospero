@@ -45,6 +45,56 @@ A folder dropped on the window opens the dialog with that folder
 filled in. `prospero DIR` in a terminal starts a session in DIR at
 once.
 
+## The sidebar's order
+
+The sidebar lists sessions by recent activity: the one with the latest
+message sent, turn begun or turn ended comes first, a session's
+subagents counting as its own. Opening, renaming, moving or archiving a
+session doesn't count, so reading an old session leaves it where it
+is. Groups keep their own order, and subagents stay oldest first under
+their parents. The sort button at the top of the sidebar switches to
+Date created, newest first, and back, and the window remembers the
+choice. A session's tooltip says when it was last active.
+
+While the pointer is over the sidebar, rows hold still: a session that
+ends its turn meanwhile moves once the pointer leaves, never from under
+a click. A session from before Prospero kept this time starts at when
+it was made, until its next turn.
+
+Every heading folds by a click, and so does a session with subagents,
+by its dot. A folded one's dot has a ring around it; an open one has a
+thin rail down from its dot, beside what it holds: click anywhere along
+the rail to fold it, which brings its heading back into view if it had
+scrolled away.
+
+The pointer on a session's row shows its actions at the right:
+**Archive** (Unarchive under Archived) and **Move to Trash**, or in the
+Trash, **Restore** and **Delete Permanently**. The grip at the far right
+says the row drags: drag it, or the row anywhere, as below. The row
+lifts out as a card that follows the pointer and says where it would
+go.
+
+## Going to a session
+
+Session → Go to... (Ctrl+K, Cmd+K on macOS) opens a palette over the
+window, in any layout, Focus too, where the sidebar is hidden. Type
+words from a session's title, group, folder or host, or a piece of its
+id: every word must match, and title matches rank first. Up and Down
+move the pick, Enter shows it with its prompt box ready, and Esc, a
+click outside, or Ctrl+K again closes the palette.
+
+What you type finds more than sessions, each kind under its own
+heading after the sessions: layouts and panes ("focus layout", "show
+jobs"), settings, as the Settings pane's search finds them, and Help's
+sections. Enter applies the layout, shows the pane, opens Settings at
+the setting, or Help at the section.
+
+With nothing typed, it lists the sessions viewed in this window, the
+latest first, then the rest by recent activity, leaving out the one
+shown: Ctrl+K then Enter goes back to the previous session. Subagents
+and archived sessions are listed only when typed words match them, and
+sessions in the Trash never are.
+
 ## Talking to the agent
 
 Enter sends the prompt. The transcript shows your messages as
@@ -54,9 +104,13 @@ tags show as text. The agent gets exactly what you typed. With the
 mouse over a message, its header shows when it was sent, or when the
 agent finished it, in local time, with the date if not today. The buttons
 beside the prompt box are icons,
-named in their tooltips: Send (a paper plane), and Attach (a paper
-clip). While the agent works, Send becomes Steer (a curved arrow), and
-Stop (a square) shows below it. What you send while it works waits at
+named in their tooltips: Send (a paper plane), Attach (a paper clip),
+Open working folder (a folder) and Terminal, which shows the Terminal
+pane with the session's shell in its folder, as Ctrl+` does, on
+whatever host the session runs ([Hosts](help:hosts)). While the agent
+works, Send becomes Steer (a curved arrow), and Stop (a square) shows
+below it. The status line above the box begins with the session's
+mode, model and shell, each a list to switch it. What you send while it works waits at
 the end of the transcript, dimmed and marked "Next step", until the
 agent reads it at its next step (or marked "Queued", for a turn of its
 own, as it is when sent too late for this turn), and its Withdraw
@@ -71,13 +125,41 @@ context they are, and the estimate allows for that as more batches
 come. After one long prompt, the next on the same model, in any
 session, has an estimate from the start.
 
+Once a turn ends, the agent's last message of it says how long the turn
+worked: the time in requests the model answered, in tool calls and
+compacting. Waiting for you (an ask, a question, a plan to approve), for
+the endpoint's line, and between attempts is left out, and subagents
+that ran at once count once. The Info button (the circled i) adds up
+the session's work: the time, how much of the model's was before its
+first tokens (reading the prompt), the tools' and the subagents', the
+tokens sent, read from the cache and received, the requests, and the
+output's rate after the first token. Once a session was opened, its
+tooltip in the sidebar gives its time too.
+
 Attach adds files to the message: drop them on the window, paste them,
 or pick them with the paper clip. Images go to a model that takes
 them, as pictures. Any other file goes as text, as `read` shows it:
 numbered lines, the first 2000 or so, then a note to read on. The
 session keeps a copy in its own folder, so the agent can read the rest
-without asking. A binary file (one with a NUL byte) is refused. The
-transcript shows a folded "Attached:" line under the message.
+without asking. A PDF goes as its text, extracted, a `--- page N ---`
+line starting each page; the session keeps the PDF beside it, and a
+model that takes images also gets the pictures on the pages it is shown,
+as the message's own (at most ten images to a message). An encrypted
+PDF is refused, and so is any other binary file (one with a NUL byte).
+The transcript shows a folded "Attached:" line under the message.
+
+On an Anthropic endpoint the agent's `read` shows it a PDF whole, its
+text and an image of each page. Other models, and a PDF too long to
+send whole, get its text, extracted, a `--- page N ---` line starting
+each page, read on 2000 lines at a time; a model that takes images
+also sees the pictures on the pages it reads, a scan's pages included.
+An encrypted PDF is refused.
+
+`@` in the prompt mentions a file or folder instead: a picked file's text is
+attached too, and the path stays in the message, so the agent can read the
+file or list the folder itself (see [Keyboard and mouse](help:keys)). A
+word after `@` lists other sessions too, by title: picked, the agent is
+given that session's id, to message it with `send_message`.
 
 A long command or subagent keeps the agent from reading what you
 send until it ends. Run in background, on its row, or Ctrl+B (also in
@@ -117,8 +199,8 @@ anything else for a few seconds.
 
 ## Modes
 
-The mode list above the transcript, beside the model and the shell,
-has three modes:
+The mode list on the Prompt's status line, beside the model and the
+shell, has three modes:
 
 - **Build**: the agent works on the task, changing files as it goes.
 - **Plan**: the agent explores and writes a plan for you to approve
@@ -162,14 +244,24 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Move to group**: an existing group, New group..., or Remove from
   group. Groups head the sidebar; a group's own menu renames,
   archives, ungroups, reorders or moves it to the Trash. Or drag the
-  session, with its subagents, onto a group's heading, onto Archived
-  (shown while you drag), onto another session to join it there, below
-  the list to take it out of its group, or onto the Move to Trash strip
-  at the foot of the sidebar. Escape cancels a drag. A session never moves
-  to another host, and the sidebar stays newest first.
+  session, with its subagents, onto a group's heading, onto Archived,
+  onto another session to join it there, or below the list to take it
+  out of its group. While you drag, a strip at the foot of the sidebar
+  offers Archive, New group... (named as you drop it) and Move to Trash,
+  however long the list. Hold the drag just above it, or just under the
+  pane's top, to scroll the list; an arrow over the strip says there is
+  more below. Escape cancels a drag. A session never moves
+  to another host, and dropping it never changes the sidebar's order.
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
   a copy of its folder.
+- **Fork into another folder...**: a fork that works in a folder you
+  pick, on the same host, while this session stays where it was. Its
+  agent is told of the move, and that paths earlier in the conversation
+  meant the old folder. The new folder's instruction files, memory and
+  skills apply. Edits made before the fork can't be rewound from the
+  fork, and "always allow" answers for paths in the old folder are
+  dropped. Only between turns.
 - **Start a side chat**: a fork you can make while the agent works
   (below).
 - **Start a worktree session...**: a fresh session, nested under this
@@ -194,21 +286,25 @@ Right-click a session in the sidebar, or open the Session menu, for:
   **Delete...**.
 - **Copy session ID**.
 - **Open working folder**: the folder the session works in, in Finder
-  or Explorer, as the folder button above the transcript opens it. **Open session records**: its folder in the state
+  or Explorer, as the folder button beside the prompt box opens it (in
+  a container, only a folder here mounted at `/work`). **Open session records**: its folder in the state
   directory, with its log, plan and command output.
-- **Open in terminal**: a terminal window in the folder the session
-  works in, as the terminal button above the transcript and the Info
-  popup's open one, running the
+- **Open in external terminal**: a terminal window in the folder the
+  session works in, apart from the Terminal pane, running the
   session's shell (a POSIX sh as a login shell), or where that is
   `/bin/sh` or bash on Linux and macOS, the terminal's own. Its
   `[shell]` section's `env.NAME`, `path_prepend` and `path_append`
   apply, as to the agent's commands, and a WSL shell opens in its
   `distro` (but not on macOS, where Terminal keeps its own
   environment). On a remote it is a shell there, over
-  ssh (`ssh -t`, so it may ask for a password) or WSL. The terminal is
+  ssh (`ssh -t`, so it may ask for a password) or WSL, and in a
+  container a shell inside it by its runtime (`docker exec -it`), as
+  the agent's user there. The terminal is
   `[ui] terminal`, else Terminal on macOS, Windows Terminal (or a
   console) on Windows, and elsewhere `$TERMINAL` or the first of the
   usual ones found.
+- **New terminal tab** (Ctrl+Shift+`): another shell in its folder, in
+  a tab of the Terminal pane.
 - **Close**: stop its background jobs and subagents, deny what it asks
   from then on, and let it go from memory in this window. Opening it
   again reads it back.
@@ -275,8 +371,8 @@ session, which can then review and merge its branch.
 
 ## The Trash
 
-A session moved to the Trash, by its menu, its group's, or a drag onto
-the strip at the foot of the sidebar, is kept under the Trash heading
+A session moved to the Trash, by its menu, its group's, its row's
+trash icon, or a drag onto the strip at the foot of the sidebar, is kept under the Trash heading
 for `[sessions] trash_days` (30 by default), then removed for good.
 Each row says how long it has left. It does not open there: its menu's
 **Restore** puts it back where it was, as does dragging it out onto a

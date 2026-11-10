@@ -7,16 +7,23 @@ static void test_container(Test *t)
     Arena  a = t->perm;
     CfgEnv v = newcfgenv(&a);
 
-    // Finding a runtime on the PATH, docker before podman
+    // Finding a runtime on the PATH, docker before podman. Windows splits
+    // PATH at semicolons and looks for .exe programs.
+    Str sep = HOST_WINDOWS ? Str(";") : Str(":");
+    Str exe = HOST_WINDOWS ? Str(".exe") : Str("");
+    Str podman = concat(&a, "/u/bin/podman", exe);
+    Str docker = concat(&a, "/d/bin/docker", exe);
     os_write(v.os, a, "/u/bin/podman", "x");
-    os_write(v.os, a, "/d/bin/docker", "x");
-    CtrRuntime rt = ctrfind(v.os, &a, v.scratch, "auto", "/none:/u/bin");
+    os_write(v.os, a, podman, "x");
+    os_write(v.os, a, docker, "x");
+    CtrRuntime rt = ctrfind(v.os, &a, v.scratch, "auto",
+                            concat(&a, "/none", concat(&a, sep, "/u/bin")));
     expect(t, "ctrfind podman", concat(&a, rt.name, concat(&a, " ", rt.path)),
-           "podman /u/bin/podman");
-    rt = ctrfind(v.os, &a, v.scratch, "", "/u/bin:/d/bin");
-    expect(t, "ctrfind docker first", rt.path, "/d/bin/docker");
-    rt = ctrfind(v.os, &a, v.scratch, "podman", "/d/bin:/u/bin");
-    expect(t, "ctrfind named", rt.path, "/u/bin/podman");
+           concat(&a, "podman ", podman));
+    rt = ctrfind(v.os, &a, v.scratch, "", concat(&a, "/u/bin", concat(&a, sep, "/d/bin")));
+    expect(t, "ctrfind docker first", rt.path, docker);
+    rt = ctrfind(v.os, &a, v.scratch, "podman", concat(&a, "/d/bin", concat(&a, sep, "/u/bin")));
+    expect(t, "ctrfind named", rt.path, podman);
     rt = ctrfind(v.os, &a, v.scratch, "docker", "/u/bin");
     expect(t, "ctrfind missing", concat(&a, rt.name, concat(&a, ":", rt.path)), "docker:");
     rt = ctrfind(v.os, &a, v.scratch, "/u/bin/podman", "");
@@ -53,6 +60,15 @@ static void test_container(Test *t)
     argv = ctrcreateargv(&a, &c, "f00d", "/s/state", {}, {}, {});
     expect(t, "ctrcreate copy, a volume", istr(&a, find(joinwords(&a, argv), "|-v|/work|-w|")>0),
            "1");
+    // Under SELinux: its state labelled its own, the user's folder shared
+    c.workspace = CTR_MOUNT;
+    c.selinux   = 1;
+    argv = ctrcreateargv(&a, &c, "f00d", "/s/state", {}, {}, {});
+    expect(t, "ctrcreate selinux", istr(&a, find(joinwords(&a, argv),
+           "|-v|/s/state:/prospero/state:Z|--tmpfs|/prospero/state/run|"
+           "-v|/h/src:/work:z|-w|")>0), "1");
+    c.workspace = CTR_COPY;
+    c.selinux   = 0;
 
     // Reached as an exec remote, its words quoted
     expect(t, "ctrexec", ctrexec(&a, &c), "\"/d/bin/docker\" exec -i prospero-p-0011aabb");
@@ -60,6 +76,41 @@ static void test_container(Test *t)
     l.exec = ctrexec(&a, &c);
     expect(t, "ctrexec argv", joinwords(&a, linkargv(&a, {}, l, "x")),
            "/d/bin/docker|exec|-i|prospero-p-0011aabb|/bin/sh|-c|cd; x");
+
+    // Its folder here, only where it is mounted at /work
+    expect(t, "ctrhostpath copy", ctrhostpath(&a, &c, "/work", 0), "");
+    c.workspace = CTR_MOUNT;
+    Ctr none = {};
+    none.workspace = CTR_MOUNT;
+    expect(t, "ctrhostpath no folder", ctrhostpath(&a, &none, "/work", 0), "");
+    c.folder = "/h/src";
+    expect(t, "ctrhostpath work", ctrhostpath(&a, &c, "/work", 0), "/h/src");
+    expect(t, "ctrhostpath work/", ctrhostpath(&a, &c, "/work/", 0), "/h/src");
+    expect(t, "ctrhostpath sub", ctrhostpath(&a, &c, "/work/a/b/", 0), "/h/src/a/b");
+    expect(t, "ctrhostpath worker", ctrhostpath(&a, &c, "/worker", 0), "");
+    expect(t, "ctrhostpath outside", ctrhostpath(&a, &c, "/tmp", 0), "");
+    c.folder = "C:\\h\\src\\";
+    expect(t, "ctrhostpath windows", ctrhostpath(&a, &c, "/work/a/b", 1), "C:\\h\\src\\a\\b");
+    c.workspace = CTR_COPY;
+    c.folder    = "/h/src";
+
+    // A terminal there: as root, or as this user with HOME its own; the
+    // session's shell, else /bin/sh's, a login shell
+    expect(t, "ctrterm", joinwords(&a, ctrterm(&a, &c, "/work/x", {})),
+           "/d/bin/docker|exec|-it|-w|/work/x|prospero-p-0011aabb|/bin/sh|-l");
+    {
+        Ctr u = c;
+        u.user = "1000:1001";
+        Slice<Str> sh = {};
+        sh = push(&a, sh, Str("/bin/bash"));
+        sh = push(&a, sh, Str("-l"));
+        expect(t, "ctrterm user", joinwords(&a, ctrterm(&a, &u, "/work", sh)),
+               "/d/bin/docker|exec|-it|-u|1000:1001|-e|HOME=/prospero/home|-w|/work|"
+               "prospero-p-0011aabb|/bin/bash|-l");
+        u.user = "0";
+        expect(t, "ctrterm root", joinwords(&a, ctrterm(&a, &u, "/", {})),
+               "/d/bin/docker|exec|-it|-u|0|-w|/|prospero-p-0011aabb|/bin/sh|-l");
+    }
 
     // container.ini, kept and read back
     c.created = 1793546320000;
@@ -107,6 +158,11 @@ static void test_container(Test *t)
            "-v|/s/state:/prospero/state|--tmpfs|/prospero/state/run|-v|/work|"
            "-v|/sc/containers/t-00c0ffee:/out|-w|/work|--entrypoint|sleep|alpine|"
            "2147483647");
+    k.selinux = 1;
+    argv = ctrcreateargv(&a, &k, "f00d", "/s/state", {}, {}, {});
+    expect(t, "ctrcreate task selinux", istr(&a, find(joinwords(&a, argv),
+           "|-v|/work|-v|/sc/containers/t-00c0ffee:/out:Z|")>0), "1");
+    k.selinux = 0;
     expect(t, "ctrsave task", istr(&a, ctrsave(v.os, v.scratch, "/st", &k)), "1");
     expect(t, "ctrini out", istr(&a, find(cfgfile(v.os, "/st/containers/t-00c0ffee/container.ini"),
                                           "\nout = /sc/containers/t-00c0ffee\n")>0), "1");
@@ -153,23 +209,31 @@ static void test_container(Test *t)
                   "/20261102-120001-dupe", "/.part", "/20261102-120002-kid0",
                   "/20261102-120003-orph", "/20261102-120004-kid1"};
     for (i32 i = 0; i < countof(dirs); i++) {
-        os_mkdirs(v.os, a, concat(&a, kept, dirs[i]));
+        Str dir = concat(&a, kept, dirs[i]);
+        os_mkdirs(v.os, a, dir);
     }
     os_mkdirs(v.os, a, "/st/sessions/20261102-120001-dupe");
     os_mkdirs(v.os, a, "/st/sessions/20261102-110000-0001");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120002-kid0/events.jsonl"),
+    Str path = concat(&a, kept, "/20261102-120002-kid0/events.jsonl");
+    os_write(v.os, a, path,
              "{\"ev\":\"session\",\"parent\":\"20261102-120000-abcd\"}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120003-orph/events.jsonl"),
+    path = concat(&a, kept, "/20261102-120003-orph/events.jsonl");
+    os_write(v.os, a, path,
              "{\"ev\":\"session\",\"parent\":\"20261102-100000-gone\",\"remote\":1}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120004-kid1/events.jsonl"),
+    path = concat(&a, kept, "/20261102-120004-kid1/events.jsonl");
+    os_write(v.os, a, path,
              "{\"ev\":\"session\",\"parent\":\"20261102-120003-orph\"}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120000-abcd/events.jsonl"),
+    path = concat(&a, kept, "/20261102-120000-abcd/events.jsonl");
+    os_write(v.os, a, path,
              "{\"sid\":\"20261102-120000-abcd\",\"ev\":\"session\",\"cwd\":\"/work\","
              "\"parent\":\"20261102-110000-0001\",\"call\":\"c1\",\"depth\":1,"
              "\"remote\":1,\"via\":\"exec\",\"relay\":\"ab\"}\n{\"ev\":\"turn.end\"}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120000-abcd/out/x.txt"), "x");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120001-dupe/events.jsonl"), "theirs\n");
-    os_write(v.os, a, concat(&a, kept, "/.part/events.jsonl"), "{}\n");
+    path = concat(&a, kept, "/20261102-120000-abcd/out/x.txt");
+    os_write(v.os, a, path, "x");
+    path = concat(&a, kept, "/20261102-120001-dupe/events.jsonl");
+    os_write(v.os, a, path, "theirs\n");
+    path = concat(&a, kept, "/.part/events.jsonl");
+    os_write(v.os, a, path, "{}\n");
     os_write(v.os, a, "/st/sessions/20261102-120001-dupe/events.jsonl", "mine\n");
     ctrkeep(v.os, v.scratch, "/st", "t-0000beef");
     expect(t, "ctrkeep log", cfgfile(v.os, "/st/sessions/20261102-120000-abcd/events.jsonl"),

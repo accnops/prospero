@@ -1,0 +1,303 @@
+# The behaviors ariel chose where terminals differ, one section each.
+
+INIT 5,10
+
+!Pending wrap: cleared by motion (STD-070)
+PUSH "0123456789\e[1;5H"
+  ?cursor = 0,4
+PUSH "\e[1;10H5\e[DX"
+  ?screen_row 0 = "01234567X5"
+RESET
+PUSH "0123456789\e[K"
+  ?cursor = 0,9
+PUSH "Y"
+  ?screen_row 0 = "012345678Y"
+  ?cursor = 0,9
+
+!Pending wrap: kept by HT, saved by DECSC
+RESET
+PUSH "0123456789\t"
+  ?cursor = 0,9
+PUSH "\e7\e[3;3H\e8Z"
+  ?screen_row 1 = "Z"
+  ?cursor = 1,1
+
+!Pending wrap: BS steps back from the margin
+RESET
+PUSH "0123456789\bX"
+  ?screen_row 0 = "01234567X9"
+
+!Wide character at the margin: spacer and wrap
+RESET
+PUSH "012345678\xe4\xb8\xad"
+  ?screen_row 0 = "012345678"
+  ?screen_cell 0,9 = {} width=1
+  ?lineinfo 0 = wrapped
+  ?screen_cell 1,0 = {0x4e2d} width=2
+  ?cursor = 1,2
+
+!Wide character at the margin, DECAWM off: dropped
+RESET
+PUSH "\e[?7l012345678\xe4\xb8\xad"
+  ?screen_row 0 = "012345678"
+  ?cursor = 0,9
+PUSH "\e[?7h"
+
+!Overwriting half of a wide character blanks the other
+RESET
+PUSH "\xe4\xb8\xad\xe4\xb8\xad\e[1;2HX"
+  ?screen_row 0 = " X中"
+PUSH "\e[1;3HY"
+  ?screen_row 0 = " XY"
+
+!BCE: erasing takes the background only
+RESET
+PUSH "\e[1;4;31;44mA\e[K"
+  ?screen_cell 0,1 = {} attrs={} fg=rgb(229,229,229) bg=rgb(0,0,238)
+
+!DECSTBM homes the cursor; origin mode is relative to it
+RESET
+PUSH "\e[3;3H\e[2;4r"
+  ?cursor = 0,0
+PUSH "\e[?6h"
+  ?cursor = 1,0
+PUSH "\e[5A"
+  ?cursor = 1,0
+PUSH "\e[?6l\e[r"
+
+!Cursor motion stops at the margins only from inside
+RESET
+PUSH "\e[2;4r\e[5;1H\e[10A"
+  ?cursor = 1,0
+PUSH "\e[1;1H\e[10B"
+  ?cursor = 3,0
+PUSH "\e[r"
+
+!47 switches screens without saving or clearing
+RESET
+PUSH "main\e[?47h"
+  ?screen_row 0 = ""
+  ?cursor = 0,4
+PUSH "alt\e[?47l"
+  ?screen_row 0 = "main"
+PUSH "\e[?47h"
+  ?screen_row 0 = "    alt"
+PUSH "\e[?47l"
+
+!1047 clears the alternate screen on leaving
+RESET
+PUSH "\e[?1047halt\e[?1047l\e[?47h"
+  ?screen_row 0 = ""
+PUSH "\e[?47l"
+
+!1048 saves and restores the cursor
+RESET
+PUSH "\e[2;3H\e[?1048h\e[5;5H\e[?1048l"
+  ?cursor = 1,2
+
+!1049 saves the cursor, clears the alternate screen, restores
+RESET
+PUSH "\e[2;3H\e[?1049h"
+  ?cursor = 1,2
+PUSH "x\e[?1049l\e[?1049h"
+  ?screen_row 1 = ""
+PUSH "\e[?1049l"
+  ?cursor = 1,2
+
+!Saved cursors are per screen
+RESET
+PUSH "\e[2;2H\e7\e[?1049h\e[4;4H\e7\e[?1049l\e8"
+  ?cursor = 1,1
+
+!IRM pushes characters right, losing the margin
+RESET
+PUSH "0123456789\e[1;1H\e[4hab\e[4l"
+  ?screen_row 0 = "ab01234567"
+
+!UK and DEC graphics sets
+RESET
+PUSH "\e(A#\e(B#\e)0\x0eq\x0fq"
+  ?screen_chars 0,0,1,10 = 0xa3,0x23,0x2500,0x71
+
+!REP after a control repeats nothing
+RESET
+PUSH "x\r\e[3b"
+  ?screen_row 0 = "x"
+
+!DECSTR turns autowrap back on and keeps the screen
+RESET
+PUSH "text\e[?7l\e[4h\e[1m\e[!p"
+  ?screen_row 0 = "text"
+PUSH "\e[1;9Habc"
+  ?screen_row 1 = "c"
+  ?screen_cell 1,0 = {0x63} attrs={}
+
+!RIS resets everything
+RESET
+PUSH "text\e]2;t\a\e[?1049h\e[1m\ec"
+  ?mode altscreen = 0
+  ?screen_row 0 = ""
+  ?title = ""
+  ?cursor = 0,0
+
+!ED 2 keeps the cursor and clears everything
+RESET
+PUSH "a\r\nb\r\nc\e[2J"
+  ?screen_row 0 = ""
+  ?screen_row 2 = ""
+  ?cursor = 2,1
+
+!Tab stops every 8; new columns get them when the screen widens
+RESET
+PUSH "\e[3g\t"
+  ?cursor = 0,9
+RESIZE 5,20
+PUSH "\r\t"
+  ?cursor = 0,16
+PUSH "\ec\t\t"
+  ?cursor = 0,16
+
+!Zero-width code points that join nothing are dropped
+RESET
+PUSH "\xe2\x80\x8bA\xef\xbb\xbf"
+  ?cursor = 0,1
+  ?screen_chars 0,0,1,10 = 0x41
+
+!Ambiguous width is narrow, Private Use too
+RESET
+PUSH "\xc2\xb1\xee\x80\x80"
+  ?cursor = 0,2
+
+!VS15 changes nothing
+RESET
+PUSH "\xe2\x8c\x9a\xef\xb8\x8e"
+  ?cursor = 0,2
+
+!A mark joins nothing once its base character moved or was erased
+RESET
+PUSH "0\e[S\xe2\x80\x8d"
+  ?screen_row 0 = ""
+  ?screen_cell 0,0 = {} width=1
+  ?cursor = 0,1
+RESET
+PUSH "e\e[1K\xcc\x81"
+  ?screen_cell 0,0 = {} width=1
+  ?cursor = 0,1
+
+!Mouse 9 reports presses alone, without modifiers
+RESET
+PUSH "\e[?9h"
+MOUSE press 1 0,0 ctrl
+  encoded "\e[M !!"
+MOUSE release 1 0,0
+  encoded ""
+MOUSE motion 0 0,1
+  encoded ""
+MOUSE press 4 0,0
+  encoded "\e[M`!!"
+
+!Mouse 1000 reports presses and releases, not motion
+RESET
+PUSH "\e[?1000h"
+MOUSE press 2 1,1 shift alt
+  encoded "\e[M-\"\""
+MOUSE motion 0 1,2
+  encoded ""
+MOUSE release 2 1,2
+  encoded "\e[M##\""
+MOUSE press 0 1,1
+  encoded ""
+
+!Mouse 1002 reports motion with a button held, once per cell
+RESET
+PUSH "\e[?1002h\e[?1006h"
+MOUSE motion 0 0,0
+  encoded ""
+MOUSE press 1 0,0
+  encoded "\e[<0;1;1M"
+MOUSE motion 0 0,0
+  encoded ""
+MOUSE motion 0 0,1
+  encoded "\e[<32;2;1M"
+MOUSE motion 0 0,1
+  encoded ""
+MOUSE motion 0 0,2 ctrl
+  encoded "\e[<48;3;1M"
+MOUSE release 1 0,2
+  encoded "\e[<0;3;1m"
+MOUSE motion 0 0,3
+  encoded ""
+
+!Held buttons: motion reports the lowest, until each is released
+RESET
+PUSH "\e[?1002h\e[?1006h"
+MOUSE press 3 0,0
+MOUSE press 1 0,0
+MOUSE motion 0 1,0
+  encoded "\e[<32;1;2M"
+MOUSE release 1 1,0
+  encoded "\e[<0;1;2m"
+MOUSE motion 0 2,0
+  encoded "\e[<34;1;3M"
+MOUSE release 3 2,0
+MOUSE motion 0 3,0
+  encoded ""
+
+!Mouse 1003 reports motion without a button
+RESET
+PUSH "\e[?1003h\e[?1006h"
+MOUSE motion 0 4,5
+  encoded "\e[<35;6;5M"
+MOUSE motion 0 4,5
+  encoded ""
+PUSH "\e[?1006l"
+MOUSE motion 0 4,6
+  encoded "\e[MC'%"
+
+!The wheel has no release; buttons 8-11 report as 128+
+RESET
+PUSH "\e[?1000h\e[?1006h"
+MOUSE press 5 0,0
+  encoded "\e[<65;1;1M"
+MOUSE release 5 0,0
+  encoded ""
+MOUSE press 7 0,0
+  encoded "\e[<67;1;1M"
+MOUSE press 8 0,0
+  encoded "\e[<128;1;1M"
+MOUSE release 8 0,0
+  encoded "\e[<128;1;1m"
+
+!Switching modes forgets held buttons; leaving one off stops reports
+RESET
+PUSH "\e[?1002h\e[?1006h"
+MOUSE press 1 0,0
+PUSH "\e[?1003h"
+MOUSE motion 0 0,1
+  encoded "\e[<35;2;1M"
+PUSH "\e[?1003l"
+  ?mode mouse = 0
+MOUSE press 1 0,0
+  encoded ""
+PUSH "\e[?1000h\e[?1002l"
+  ?mode mouse = 1000
+
+!X10 reaches column 223 and no further; positions left of the grid clamp
+RESET
+PUSH "\e[?1000h"
+MOUSE press 1 0,222
+  encoded "\e[M \xff!"
+MOUSE press 1 0,223
+  encoded ""
+MOUSE press 1 -3,-1
+  encoded "\e[M !!"
+
+!Mouse 1016 reports pixels, once per pixel
+RESET
+PUSH "\e[?1003h\e[?1016h"
+MOUSE motion 0 0,0 px 5,7
+  encoded "\e[<35;6;8M"
+MOUSE motion 0 0,0 px 6,7
+  encoded "\e[<35;7;8M"
+MOUSE motion 0 0,0 px 6,7
+  encoded ""

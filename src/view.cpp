@@ -49,13 +49,18 @@
 // folds a background job's start and a long shell output; fold and open
 // apply to every row. A row the user opened or closed keeps that, through
 // its end too. A session's own toggles (viewshowtools, viewshowthink)
-// open every row of their kind, hidden reasoning included, until turned
-// off, leaving the configuration alone.
+// open every row of their kind, hidden reasoning included, and another
+// (viewfoldshell) folds every shell row, over the tools toggle too,
+// each until turned off, leaving the configuration alone.
 //
-// A search (ViewSearch) finds text in the messages' sources, ignoring
-// ASCII case, folded rows included but not hidden reasoning. It keeps up
-// with the view a budget of bytes at a time, searching again only from
-// the first message that changed, which while streaming is at the end.
+// A search (ViewSearch) finds text in what the messages show, as copied
+// text has it, not in their markdown, so that text copied from the
+// transcript finds itself: ASCII case ignored, and any run of whitespace
+// matching any other. Hits are kept as the source ranges they cover.
+// Only rows that show are searched, not folded ones nor hidden
+// reasoning. It keeps up with the view a budget of bytes at a time,
+// searching again only from the first message that changed, which while
+// streaming is at the end.
 //
 // A change of width keeps what is at the top edge there (viewanchor,
 // anchory): the message, the source offset its line there begins at, and
@@ -191,13 +196,15 @@ enum : i32 {
     LIVE_WORKTREE,    // waiting for git to make its worktree
     LIVE_COMPACTING,  // a summary request runs
     LIVE_RELAY,       // paused: no connected computer relays its calls
+    LIVE_AUTH,        // its endpoint's ChatGPT sign-in is refreshed
     LIVE_CLOSED,
     LIVE_COUNT,
 };
 
 static Str livenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "mcp", "worktree", "compacting", "relay", "closed",
+    "ask", "queued", "task", "mcp", "worktree", "compacting", "relay", "auth",
+    "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
 
@@ -331,6 +338,7 @@ struct ViewCard {
     i64  before;     // tokens, estimated
     i64  after;
     Str  model;      // the summary's
+    Str  focus;      // what a /compact asked it to keep, one line
     i64  ms;
     i32  count;      // messages summarized, outputs elided, files rewound
     i32  conflicts;  // files a rewind left alone
@@ -433,6 +441,33 @@ struct ViewImage {
     i32 h;
 };
 
+// What a session spent working, as its records' own times say: in
+// requests that answered, in tool calls, and compacting. Waits on the
+// user, for the endpoint's line, and backing off between attempts are
+// left out, as no record's time holds them: a call's clock starts once
+// it is allowed. Calls that ran at once (subagents) count once.
+struct ViewWork {
+    i64 model;     // ms in requests that answered
+    i64 first;     //   of which before their first token, where known
+    i64 genms;     // and after it, where known,
+    i64 genout;    //   and those requests' output tokens
+    i64 tools;     // ms in tool calls
+    i64 tasks;     //   of which in subagents' (task)
+    i64 compact;   // ms compacting
+    i64 in;        // tokens: every prompt's,
+    i64 out;       //   every reply's,
+    i64 cached;    //   the prompts' read from the cache,
+    i64 written;   //   and written to it (Anthropic)
+    i32 requests;
+};
+
+// A tool call's span, epoch ms
+struct ViewSpan {
+    i64 beg;
+    i64 end;
+    b32 task;
+};
+
 struct ViewMsg {
     Str       text;       // source, in the text arena
     i32       role;
@@ -456,6 +491,7 @@ struct ViewMsg {
     i64       ts1;        //   ms, or 0 where it did not stream
     i64       ts;         // the user's taken in, the agent's finished:
                           //   epoch ms, 0 if not known
+    i64       worked;     // the agent's last of a turn: the turn's work, ms
     Str       label;      // the header, if not the role's name
     Str       from;       // a message's sender, a session's id, or the
                           // endpoint's URL of a mark of a model, or the
@@ -533,8 +569,10 @@ struct View {
     b32             overflow;   // fake agent: events were dropped
     i32             thinking;   // THINK_*: how reasoning shows
     i32             toolmode;   // TOOLS_*: how tool rows fold
-    b32             showtools;  // the session's toggles: every tool row
-    b32             showthink;  //   or reasoning open, whatever the mode
+    b32             foldshell;  // the session's toggles: every shell row
+                                //   folded, every tool row or reasoning
+    b32             showtools;  //   open, whatever the mode
+    b32             showthink;
     f32             lastw;      // the width laid out last
     f32             head;       // a message's header line, as drawn
 
@@ -589,6 +627,7 @@ struct View {
     i64             watchms;    // and waits this long in all
     i64             pdone;      // prompt processing, tokens of total
     i64             ptotal;
+    f64             ptps;       // and its rate, tokens per second
     i64             petaat;     //   and when it ends, as estimated, 0 if not
     i64             ctx;        // the context gauge: the model's window,
     i64             compactat;  //   where compaction begins,
@@ -636,6 +675,13 @@ struct View {
     b32             endresume;   // the next turn began by itself
     b32             endcompact;  // a compaction's turn (compact) ended
     b32             turncompact; // the running turn is one
+
+    // Its work (viewwork), the session's and the running turn's
+    ViewWork        work;
+    i64             turnwork;    // ms in the running turn
+    iz              turnmsg;     // its first message's index
+    ViewSpan        spans[32];   // the step's tool calls, not yet merged
+    i32             nspans;
 };
 
 static ViewCache *newviewcache(Arena *perm, Region *r, iz max)
@@ -768,6 +814,8 @@ static b32 toolfolded(View *v, ViewMsg *m)
     } else if (t->status == VTOOL_STREAMING) {
         return 1;
     } else if (t->name=="skill" && !(t->ended && t->status!=VTOOL_OK)) {
+        return 1;
+    } else if (v->foldshell && t->name=="shell") {
         return 1;
     } else if (v->showtools) {
         return 0;
@@ -1120,6 +1168,18 @@ static b32 viewshowtools(View *v, b32 on)
     return 1;
 }
 
+// The session's toggle: every shell row folded, or else as the setting
+// and the tools toggle say. Returns whether anything changed.
+static b32 viewfoldshell(View *v, b32 on)
+{
+    if (v->foldshell == on) {
+        return 0;
+    }
+    v->foldshell = on;
+    retool(v);
+    return 1;
+}
+
 // Keep a selection inside the messages that exist.
 static void clampsel(View *v)
 {
@@ -1221,6 +1281,35 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
         return concat(perm, concat(&scratch, "in ", shell), concat(&scratch, ": ", oneline(&scratch, cmd)));
     } else if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
+    } else if (name=="todo_write" && jsonget(j, "todos")->type==JSON_MISSING) {
+        // Changes to the list: "done write it; start test it; add 2"
+        Buf b(&scratch, 256);
+        static Str const keys[] = {"done", "start", "add", "remove"};
+        for (i32 k = 0; k < countof(keys); k++) {
+            Json *v = jsonget(j, keys[k]);
+            if (v->type == JSON_STRING && v->str.len && v->str[0]=='[') {
+                v = jsonparse(&scratch, v->str).root;
+            }
+            i64 n = 0;
+            Str one = v->type==JSON_STRING ? v->str : Str{};
+            for (Json *e = v->type==JSON_ARRAY ? v->child : 0; e; e = e->next, n++) {
+                one = e->type==JSON_STRING ? e->str : jsonstr(jsonget(e, "content"));
+            }
+            n = v->type==JSON_STRING ? 1 : n;
+            if (!n) {
+                continue;
+            }
+            print(&b, b.len ? Str("; ") : Str{});
+            print(&b, keys[k]);
+            putbyte(&b, ' ');
+            if (n == 1) {
+                print(&b, oneline(&scratch, one));
+            } else {
+                print(&b, n);
+                print(&b, " items");
+            }
+        }
+        return clone(perm, finish(&b));
     } else if (name == "todo_write") {
         // The list may come as a string holding JSON
         Json *t = jsonget(j, "todos");
@@ -1344,8 +1433,23 @@ static i64 linecount(Str s)
     return countnl(s) + (s[s.len-1] != '\n');
 }
 
+// The number in result just after mark, as in "line 12." or "line 12
+// (...)": the digits only. Not ok if mark is missing.
+static Int numafter(Str result, Str mark)
+{
+    iz at = find(result, mark);
+    if (at < 0) {
+        return {};
+    }
+    iz b = at + mark.len;
+    iz e = b;
+    for (; e<result.len && result[e]>='0' && result[e]<='9'; e++) {}
+    return parseint(span(result.data+b, result.data+e));
+}
+
 // A finished edit or write as a fenced unified diff (markdown), from its
-// arguments and the line its result names; null if not one. Its
+// arguments and what its result says; null if not one. A replace_all
+// edit shows its first place, and how many more there were. Its
 // temporaries are left in the arena too.
 static Str tooldiff(Arena *a, Str name, Str args, Str result)
 {
@@ -1408,16 +1512,11 @@ static Str tooldiff(Arena *a, Str name, Str args, Str result)
             difflines(&d, '+', jsonstr(jsonget(e, "text")));
         }
     } else if (name == "edit") {
-        Str olds = jsonstr(jsonget(j, "old_string"));
-        Str news = jsonstr(jsonget(j, "new_string"));
-        iz  at   = find(result, "line ");
-        Int line = at<0 ? Int{} : parseint(cuthead(result, at+5));
-        if (!line.ok) {  // "line 12." or "line 12 (...)": the digits only
-            iz e = at + 5;
-            for (; e<result.len && result[e]>='0' && result[e]<='9'; e++) {}
-            line = at<0 ? Int{} : parseint(span(result.data+at+5, result.data+e));
-        }
-        i64 n = line.ok ? line.val : 1;
+        Str olds  = jsonstr(jsonget(j, "old_string"));
+        Str news  = jsonstr(jsonget(j, "new_string"));
+        Int line  = numafter(result, "line ");
+        Int count = numafter(result, ": replaced ");
+        i64 n     = line.ok ? line.val : 1;
         print(&d, "--- ");
         print(&d, path);
         print(&d, "\n+++ ");
@@ -1433,6 +1532,13 @@ static Str tooldiff(Arena *a, Str name, Str args, Str result)
         print(&d, " @@\n");
         difflines(&d, '-', olds);
         difflines(&d, '+', news);
+        if (count.ok && count.val>1) {
+            // replace_all made the same change elsewhere too
+            i64 more = count.val - 1;
+            print(&d, "\\ the same change in ");
+            print(&d, more);
+            print(&d, more==1 ? Str(" more place\n") : Str(" more places\n"));
+        }
     } else if (name == "write") {
         Str content = jsonstr(jsonget(j, "content"));
         i64 lines   = linecount(content);
@@ -1995,6 +2101,86 @@ static i32 livestate(Str s)
     return LIVE_IDLE;
 }
 
+// The step's tool calls, merged, into the work: a call's span ends at
+// its record, and calls that overlap (subagents at once) count once.
+static void workflush(View *v)
+{
+    ViewSpan *sp = v->spans;
+    i32       n  = v->nspans;
+    for (i32 i = 1; i < n; i++) {  // by start, a few at most
+        for (i32 k = i; k>0 && sp[k].beg<sp[k-1].beg; k--) {
+            ViewSpan t = sp[k];
+            sp[k]   = sp[k-1];
+            sp[k-1] = t;
+        }
+    }
+    for (i32 pass = 0; pass < 2; pass++) {
+        i64 sum = 0, beg = 0, end = 0;
+        b32 any = 0;
+        for (i32 i = 0; i < n; i++) {
+            if (pass && !sp[i].task) {
+                continue;
+            }
+            if (any && sp[i].beg<=end) {
+                end = sp[i].end>end ? sp[i].end : end;
+                continue;
+            }
+            sum += any ? end-beg : 0;
+            beg  = sp[i].beg;
+            end  = sp[i].end;
+            any  = 1;
+        }
+        sum += any ? end-beg : 0;
+        if (pass) {
+            v->work.tasks += sum;
+        } else {
+            v->work.tools += sum;
+            v->turnwork   += sum;
+        }
+    }
+    v->nspans = 0;
+}
+
+static void workspan(View *v, i64 end, i64 ms, b32 task)
+{
+    if (ms <= 0) {
+        return;
+    }
+    if (v->nspans == countof(v->spans)) {
+        workflush(v);
+    }
+    v->spans[v->nspans++] = {end - ms, end, task};
+}
+
+// A request that answered, from its assistant record.
+static void workrequest(View *v, Json *j)
+{
+    workflush(v);
+    i64   ms    = jsonint(jsonget(j, "ms"), 0);
+    Json *first = jsonget(j, "first_ms");
+    Json *u     = jsonget(j, "usage");
+    i64   out   = jsonint(jsonget(u, "out"), 0);
+    ms = ms<0 ? 0 : ms;
+    v->work.model += ms;
+    v->turnwork   += ms;
+    v->work.requests++;
+    if (first->type == JSON_NUMBER) {
+        i64 f = jsonint(first, 0);
+        f = f<0 ? 0 : f>ms ? ms : f;
+        v->work.first += f;
+        if (out > 0) {
+            v->work.genms  += ms - f;
+            v->work.genout += out;
+        }
+    }
+    if (u->type == JSON_OBJECT) {
+        v->work.in      += jsonint(jsonget(u, "in"), 0);
+        v->work.out     += out;
+        v->work.cached  += jsonint(jsonget(u, "cached"), 0);
+        v->work.written += jsonint(jsonget(u, "written"), 0);
+    }
+}
+
 // Apply one parsed record. Returns 1 if what the view shows changed.
 static b32 viewrecord(View *v, Arena scratch, EvRec *r)
 {
@@ -2134,9 +2320,10 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             Buf body(&scratch, 512);
             for (Json *k = files->child; k; k = k->next) {
                 Str name = jsonstr(jsonget(k, "name"));
+                Str own  = cut(cuthead(name, name.len<6 ? name.len : 6), '-').tail;
                 i64 n    = jsonint(jsonget(k, "lines"), 0);
                 print(&names, names.len ? Str(", ") : Str(""));
-                print(&names, cut(cuthead(name, 6), '-').tail);
+                print(&names, endswith(own, ".pdf.txt") ? cuttail(own, 4) : own);  // a PDF's text
                 print(&body, "- `");
                 print(&body, name);
                 print(&body, "`: ");
@@ -2152,6 +2339,33 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[k].fold      = 1;
             v->msgs[k].collapsed = 1;
             v->msgs[k].label     = concat(&v->aux, "Attached: ", finish(&names));
+        }
+        // The sessions it mentioned, as a folded note: their titles, and
+        // the ids the agent was given for them
+        Json *refs = jsonget(j, "sessions");
+        if (refs->child) {
+            Buf names(&scratch, 256);
+            Buf body(&scratch, 512);
+            for (Json *k = refs->child; k; k = k->next) {
+                Str sid   = jsonstr(jsonget(k, "sid"));
+                Str title = jsonstr(jsonget(k, "title"));
+                print(&names, names.len ? Str(", ") : Str(""));
+                print(&names, title.len ? title : sid);
+                print(&body, "- `");
+                print(&body, sid);
+                print(&body, "`");
+                if (title.len) {
+                    print(&body, ": ");
+                    print(&body, title);
+                }
+                print(&body, "\n");
+            }
+            print(&body, "\nThe agent has each one's id, which send_message takes.");
+            i32 k = addmsg(v, VIEW_NOTE, finish(&body));
+            v->msgs[k].seq       = r->seq;
+            v->msgs[k].fold      = 1;
+            v->msgs[k].collapsed = 1;
+            v->msgs[k].label     = concat(&v->aux, "Mentioned: ", finish(&names));
         }
         if (skill.len) {
             iz  end  = find(text, "\n</skill>");
@@ -2172,6 +2386,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->attempt = 0;
         v->busy    = 1;
         v->turnts  = r->ts;
+        workflush(v);
+        v->turnwork = 0;
+        v->turnmsg  = v->msgs.len;
         v->pdone   = v->ptotal = 0;
         v->turncompact = jsonstr(jsonget(j, "via")) == "compact";
         // The message that began it: a prompt just before, or, for a
@@ -2265,6 +2482,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         dropprov(v);
         // Its usage: what the context holds after it, the prompt and the
         // reply, and how much of the prompt the server had cached
+        workrequest(v, j);
         Json *u = jsonget(j, "usage");
         if (u->type == JSON_OBJECT) {
             i64 in  = jsonint(jsonget(u, "in"), 0);
@@ -2383,6 +2601,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->hasexit = ex->type == JSON_NUMBER;
         t->exit    = (i32)jsonint(ex, 0);
         t->ms      = jsonint(jsonget(j, "ms"), 0);
+        workspan(v, r->ts, t->ms, t->name=="task");
         t->spill   = clone(&v->aux, jsonstr(jsonget(j, "spill")));
         t->bytes   = jsonint(jsonget(j, "bytes"), 0);
         t->job     = jsonint(jsonget(j, "job"), t->job);
@@ -2608,6 +2827,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="skills"       ? Str("To the agent: skills") :
                        kind=="budget"       ? Str("To the agent: wrap up") :
                        kind=="side"         ? Str("To the agent: a side chat") :
+                       kind=="moved"        ? Str("To the agent: another folder") :
+                       kind=="worktree"     ? Str("To the agent: a worktree") :
                        kind=="memory"       ? Str("To the agent: memory") :
                        Str("To the agent");
         }
@@ -2626,6 +2847,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         c->after  = jsonint(jsonget(j, "after"), 0);
         c->model  = clone(&v->aux, jsonstr(jsonget(j, "model")));
         c->ms     = jsonint(jsonget(j, "ms"), 0);
+        workflush(v);
+        v->work.compact += c->ms>0 ? c->ms : 0;
+        v->turnwork     += c->ms>0 ? c->ms : 0;
         Str text  = {};
         if (kind == "summary") {
             i64 cut = jsonint(jsonget(j, "cutseq"), v->cutseq);
@@ -2637,6 +2861,18 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             }
             v->cutseq = cut>v->cutseq ? cut : v->cutseq;
             text = jsonstr(jsonget(j, "summary"));
+            // A /compact's focus heads the card and its body, so what was
+            // asked stays visible beside what came of it
+            Str focus = trim(jsonstr(jsonget(j, "focus")));
+            if (focus.len) {
+                c->focus = oneline(&v->aux, focus);
+                Buf b(&scratch, focus.len + text.len + 64);
+                print(&b, "**Focus:** ");
+                print(&b, focus);
+                print(&b, "\n\n");
+                print(&b, text);
+                text = finish(&b);
+            }
         } else {
             Buf b(&scratch, 1024);
             for (Json *e = jsonget(j, "elided")->child; e; e = e->next) {
@@ -3005,6 +3241,16 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->endresume  = jsonflag(jsonget(j, "resume"), 0);
         v->endcompact = v->turncompact;
         v->turncompact = 0;
+        // Its work, on the agent's last message of it
+        workflush(v);
+        for (iz i = v->msgs.len-1; i>=v->turnmsg && i>=0; i--) {
+            if (v->msgs[i].role == VIEW_ASSISTANT) {
+                v->msgs[i].worked = v->turnwork;
+                v->msgs[i].ver++;
+                break;
+            }
+        }
+        v->turnwork = 0;
         if (why != "done") {
             Arena a = scratch;
             Buf   b(&a, 128 + err.len);
@@ -3074,6 +3320,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->lastdata = r->ts;
         v->pdone    = jsonint(jsonget(j, "done"), 0);
         v->ptotal   = jsonint(jsonget(j, "total"), 0);
+        v->ptps     = jsonfloat(jsonget(j, "tps"), 0);
         v->petaat   = eta->type==JSON_NUMBER ? r->ts + jsonint(eta, 0) : 0;
         return 1;
     }
@@ -3604,6 +3851,25 @@ static Str blocksep(DocBlock *prev, DocBlock *b)
     return "\n\n";
 }
 
+// What copied text has for a block's own marker, if it has one: a list
+// item's, indented by its depth, or a rule.
+static void blockmarker(Buf *b, DocBlock *k)
+{
+    if (k->item) {
+        for (i32 n = 1; n < k->depth; n++) print(b, "  ");
+        if (k->task) {
+            print(b, k->task==2 ? Str("- [x] ") : Str("- [ ] "));
+        } else if (k->number < 0) {
+            print(b, "- ");
+        } else {
+            print(b, (i64)k->number);
+            print(b, ". ");
+        }
+    } else if (k->type == DOC_HR) {
+        print(b, "---");
+    }
+}
+
 // The selected part [s, e) of a message as plain text: piece texts, code
 // byte-exact, with list markers and block separators restored.
 static void copytext(Buf *b, Doc *d, i32 s, i32 e)
@@ -3624,20 +3890,8 @@ static void copytext(Buf *b, Doc *d, i32 s, i32 e)
             print(b, sep);
         }
         b32 any = 0;
-        if (k->item && starts) {
-            for (i32 n = 1; n < k->depth; n++) print(b, "  ");
-            if (k->task) {
-                print(b, k->task==2 ? Str("- [x] ") : Str("- [ ] "));
-            } else if (k->number < 0) {
-                print(b, "- ");
-            } else {
-                print(b, (i64)k->number);
-                print(b, ". ");
-            }
-            any = 1;
-        }
-        if (k->type==DOC_HR && starts) {
-            print(b, "---");
+        if ((k->item || k->type==DOC_HR) && starts) {
+            blockmarker(b, k);
             any = 1;
         }
         if (!k->npiece && starts) {
@@ -3761,6 +4015,10 @@ static Str copyblock(View *v, Arena *perm, i32 msg, i32 block)
 
 // Searching
 
+enum : i32 {
+    FIND_PARSECOST = 4,  // parsing a document, per byte, as bytes searched
+};
+
 struct FindHit {
     i32 msg;
     i32 off;
@@ -3778,7 +4036,7 @@ struct FindSeen {
 
 struct ViewSearch {
     View            *v;
-    Str              q;         // lowercase ASCII
+    Str              q;         // findnorm'd: lowercase ASCII, spaces one
     iz               qmax;
     Arena            hitmem;    // each alone in its arena, to grow in place
     byte            *hitbase;
@@ -3802,14 +4060,31 @@ static ViewSearch *newsearch(Arena *perm, Region *hits, Region *seen, iz qmax)
     return s;
 }
 
+// Text as a search compares it: ASCII lowercase, every run of whitespace
+// a single space. A byte at a time, after prev, the byte last kept (0 if
+// none): it is normalized in place, and returns whether to keep it.
+static b32 findnorm(u8 *c, u8 prev)
+{
+    if (whitespace(*c)) {
+        *c = ' ';
+        return prev != ' ';
+    }
+    *c = lowercase(*c);
+    return 1;
+}
+
 // Search a view for q from the start, as searchstep goes on to.
 static void searchreset(ViewSearch *s, View *v, Str q)
 {
     q = q.len>s->qmax ? takehead(q, s->qmax) : q;
+    iz n = 0;
     for (iz i = 0; i < q.len; i++) {
-        s->q.data[i] = lowercase(q[i]);
+        u8 c = q[i];
+        if (findnorm(&c, n ? s->q.data[n-1] : 0)) {
+            s->q.data[n++] = c;
+        }
     }
-    s->q.len      = q.len;
+    s->q.len      = n;
     s->v          = v;
     s->hitmem.beg = s->hitbase;
     s->seenmem.beg = s->seenbase;
@@ -3829,12 +4104,79 @@ static b32 seeneq(FindSeen a, FindSeen b)
            a.hidden==b.hidden && a.folded==b.folded;
 }
 
+// A message's text as a search sees it: what it shows, as copied text
+// has it (piece texts, list markers, blocks apart), findnorm'd, so that
+// text copied from the transcript finds itself however its markdown
+// was written. Each byte keeps the source range it came from: one byte
+// of source, an entity's whole, or none (at a place) for text made up.
+struct FindText {
+    u8  *text;
+    i32 *beg;
+    i32 *end;
+    iz   len;
+};
+
+static void findput(FindText *f, u8 c, i32 beg, i32 end)
+{
+    if (findnorm(&c, f->len ? f->text[f->len-1] : 0)) {
+        f->text[f->len] = c;
+        f->beg[f->len]  = beg;
+        f->end[f->len]  = end;
+        f->len++;
+    }
+}
+
+static FindText findtext(Arena *a, Doc *d)
+{
+    iz cap = 0;
+    for (iz i = 0; i < d->blocks.len; i++) {
+        cap += 1 + 2*DOC_MAXDEPTH + 16;  // separator and marker, at most
+    }
+    for (iz i = 0; i < d->pieces.len; i++) {
+        cap += d->pieces[i].text.len;
+    }
+    FindText f = {};
+    f.text = alloc<u8>(a, cap);
+    f.beg  = alloc<i32>(a, cap);
+    f.end  = alloc<i32>(a, cap);
+    for (iz i = 0; i < d->blocks.len; i++) {
+        DocBlock *k = &d->blocks[i];
+        if (i) {
+            findput(&f, ' ', k->off0, k->off0);
+        }
+        u8  mem[2*DOC_MAXDEPTH + 16];
+        Buf mb = {};
+        mb.data = mem;
+        mb.cap  = countof(mem);
+        blockmarker(&mb, k);
+        for (iz j = 0; j < mb.len; j++) {
+            findput(&f, mb.data[j], k->off0, k->off0);
+        }
+        for (i32 j = 0; j < k->npiece; j++) {
+            Piece *p = &d->pieces[k->piece0+j];
+            for (iz c = 0; c < p->text.len; c++) {
+                if (p->flags & PIECE_SYNTH) {
+                    findput(&f, p->text[c], p->off, p->off);
+                } else if (p->len != p->text.len) {
+                    findput(&f, p->text[c], p->off, p->off+p->len);
+                } else {
+                    findput(&f, p->text[c], p->off+(i32)c, p->off+(i32)c+1);
+                }
+            }
+        }
+    }
+    return f;
+}
+
 // Bring the hits up to date with the view: searched again from the first
 // message that changed, at most about budget bytes of text at a time.
 // Only what shows is searched: not hidden reasoning, nor a folded row,
 // whose text (reasoning above all) would bury the matches wanted.
+// A message is searched in what it shows (findtext), from its document,
+// which stays in the cache for the next search, a text typed further,
+// and for showing it; one not made yet costs its parse too.
 // Returns whether they are, else it goes on from there next call.
-static b32 searchstep(ViewSearch *s, iz budget)
+static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
 {
     View *v = s->v;
     iz    n = s->seen.len<v->msgs.len ? s->seen.len : v->msgs.len;
@@ -3859,21 +4201,25 @@ static b32 searchstep(ViewSearch *s, iz budget)
             return 0;
         }
         ViewMsg *m = &v->msgs[i];
-        Str      t = m->text;
         s->seen = push(&s->seenmem, s->seen, seenof(v, m));
         if (!q.len || msghidden(v, m) || m->collapsed) {
             continue;
         }
-        budget -= t.len + 1;
-        u8 q0 = q[0];
+        b32 cached = m->doc && m->docver==m->ver && m->docgen==v->c->gen;
+        budget -= (cached ? 1 : FIND_PARSECOST)*m->text.len + 1;
+        Arena    a = scratch;
+        FindText t = findtext(&a, msgdoc(v, (i32)i));
+        u8       q0 = q[0];
         for (iz at = 0; at+q.len <= t.len; at++) {
-            if (lowercase(t[at]) != q0) {
+            if (t.text[at] != q0) {
                 continue;
             }
             iz k = 1;
-            for (; k<q.len && lowercase(t[at+k])==q[k]; k++) {}
+            for (; k<q.len && t.text[at+k]==q[k]; k++) {}
             if (k == q.len) {
-                FindHit h = {(i32)i, (i32)at, (i32)q.len};
+                i32 beg = t.beg[at];
+                i32 end = t.end[at+q.len-1];
+                FindHit h = {(i32)i, beg, end>beg ? end-beg : 0};
                 s->hits = push(&s->hitmem, s->hits, h);
                 at += q.len - 1;
             }

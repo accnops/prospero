@@ -19,7 +19,8 @@
 // key = env:NAME or key = file:PATH, resolved when used. A plaintext
 // secret in the user's own file is used, with a warning; in an included
 // (shared) file it is an error and ignored, as is file:PATH there,
-// which could send any of the user's files, and any setting of a
+// which could send any of the user's files (as could a role's
+// prompt_file, refused in a file from the web), and any setting of a
 // [remote] section, which chooses a program to run and where (ssh,
 // path, state, config, deploy), of a [shell] section, which chooses a
 // program to run, or of the [desktop] section, which lets the agent use
@@ -233,7 +234,7 @@ struct CfgKind {
 
 static CfgKind cfgkinds[] = {
     {"",         0, "Defaults for new sessions"},
-    {"endpoint", 1, "A server of models: OpenAI-compatible, or Anthropic's"},
+    {"endpoint", 1, "A server of models: OpenAI-compatible, Anthropic's, OpenAI's Responses API, ChatGPT's, or GitHub Copilot"},
     {"model",    1, "Settings for one model, named as its endpoint lists it"},
     {"role",     1, "Instructions, a model and tools for one kind of work"},
     {"guard",    0, "Where the file tools may go without asking"},
@@ -245,6 +246,7 @@ static CfgKind cfgkinds[] = {
     {"worktree", 0, "Worktree sessions: each in a git worktree and branch of its own"},
     {"sessions", 0, "Sessions deleted: how long the Trash keeps them"},
     {"ui",       0, "How the GUI looks, and when it tells you of a session"},
+    {"terminal", 0, "The Terminal pane: the shell its tabs run, their history and copying"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
     {"host",     0, "The engine as a background host (prospero serve)"},
@@ -273,15 +275,33 @@ static CfgKey cfgschema[] = {
      "Model for new sessions: ENDPOINT/MODEL, or MODEL as the endpoint "
      "names it, at the endpoint above, else at one that lists it"},
 
+    {"endpoint", "kind", CFG_ENUM, "openai", {},
+     "openai anthropic responses chatgpt copilot",
+     "endpoint", "The API it speaks: openai (Chat Completions), anthropic "
+     "(Messages), responses (OpenAI's Responses), chatgpt (Responses at "
+     "ChatGPT, signed in with a ChatGPT account instead of a key), or "
+     "copilot (GitHub Copilot, signed in with a GitHub account, each model "
+     "in the format it takes)"},
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
-     "Base URL: chat requests go to URL/v1/chat/completions, or for kind "
-     "anthropic to URL/v1/messages, but to URL itself when it ends in "
-     "/chat/completions or /messages, with no /v1 added"},
-    {"endpoint", "kind", CFG_ENUM, "openai", {}, "openai anthropic", "endpoint",
-     "The API it speaks: openai (Chat Completions) or anthropic (Messages)"},
+     "Base URL: chat requests go to URL/v1/chat/completions, for kind "
+     "anthropic to URL/v1/messages, for responses and chatgpt to "
+     "URL/v1/responses, but to URL itself when it ends in "
+     "/chat/completions, /messages or /responses, with no /v1 added; for "
+     "copilot, under URL with no /v1 added"},
     {"endpoint", "key", CFG_SECRET, "", {}, {}, "endpoint",
      "API key sent as a bearer token, or as x-api-key for kind anthropic, "
-     "as env:NAME, or file:PATH to read it from a file"},
+     "as env:NAME, or file:PATH to read it from a file; kinds chatgpt and "
+     "copilot sign in instead"},
+    {"endpoint", "client_id", CFG_STRING, "", {}, {}, "endpoint",
+     "Signing in, for kinds chatgpt and copilot: the OAuth client to sign "
+     "in as, by default the Codex CLI's for chatgpt, and Prospero's own "
+     "GitHub app for copilot, which GitHub gives only its older models. "
+     "Another client's id is used at your own risk"},
+    {"endpoint", "integration_id", CFG_STRING, "", {}, {}, "endpoint",
+     "For kind copilot: the Copilot-Integration-Id to send, the product "
+     "GitHub then takes the requests for and gives the models of. By "
+     "default none, so GitHub goes by the client signed in as. Another "
+     "product's is used at your own risk"},
     {"endpoint", "connect_timeout", CFG_SECONDS, "15", "5", {}, "timeouts",
      "Seconds to connect"},
     {"endpoint", "first_byte_timeout", CFG_SECONDS, "300", "1800", {},
@@ -340,12 +360,29 @@ static CfgKey cfgschema[] = {
     {"model", "thinking_display", CFG_ENUM, "summarized", {},
      "summarized omitted", "model",
      "Anthropic: summarized reasoning to show, or omitted"},
-    {"model", "effort", CFG_ENUM, "", {}, "low medium high xhigh max", "model",
-     "Anthropic: how much the model thinks and writes, by default its own "
-     "default"},
+    {"model", "effort", CFG_ENUM, "", {}, "none minimal low medium high xhigh max",
+     "model", "How much the model thinks and writes, by default its own "
+     "default: Anthropic's output_config.effort (low to max), the "
+     "Responses API's reasoning.effort (none to xhigh), or on an "
+     "OpenAI-compatible chat endpoint, where effort_as says"},
+    {"model", "effort_as", CFG_STRING, "reasoning_effort", {}, {}, "model",
+     "Where effort goes on an OpenAI-compatible chat endpoint: "
+     "reasoning_effort (the request's own field, which llama.cpp and vLLM "
+     "pass to the chat template), reasoning.effort (OpenRouter), "
+     "template.NAME (chat_template_kwargs), or none; a template.NAME set "
+     "for the same argument wins over effort"},
+    {"model", "effort_map", CFG_STRING, "", {}, {}, "model",
+     "Effort words rewritten for templates with words of their own, "
+     "EFFORT:VALUE separated by blanks, such as high:xhigh none:off or "
+     "low:25 high:100: numbers sent as numbers, true and false as booleans"},
     {"model", "vision", CFG_BOOL, "true", {}, {}, "model",
      "Whether the model takes images: the desktop tool's screenshots and "
      "image files read"},
+    {"model", "pdf", CFG_BOOL, "true", {}, {}, "model",
+     "Whether read sends a PDF to the model as a document, its text and "
+     "its pages' images, on an endpoint of kind anthropic (not copilot, "
+     "even on the anthropic wire); else, or when off, read shows its text, "
+     "extracted, and the images on its pages"},
     {"model", "coordinates", CFG_ENUM, "pixels", {}, "pixels norm1000", "model",
      "How the model gives points in a screenshot: pixels of the image it "
      "was sent, or norm1000, thousandths of its width and height (Qwen-VL, "
@@ -395,6 +432,10 @@ static CfgKey cfgschema[] = {
      "What the role is for, for an agent choosing one for a subagent"},
     {"role", "prompt", CFG_STRING, "", {}, {}, "role",
      "Instructions added to the system prompt"},
+    {"role", "prompt_file", CFG_STRING, "", {}, {}, "role",
+     "A file of instructions added to the system prompt after prompt, read "
+     "when a session starts: absolute, under ~, or relative to the file "
+     "that sets it, at most 256 KiB; not from an include by URL"},
     {"role", "endpoint", CFG_STRING, "", {}, {}, "role",
      "Endpoint for the role, by default the session's, or a subagent's parent's"},
     {"role", "model", CFG_STRING, "", {}, {}, "role",
@@ -411,13 +452,15 @@ static CfgKey cfgschema[] = {
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
      "More directories the file tools may use, separated by ;"},
-    {"guard", "ask_timeout", CFG_SECONDS, "30", {}, {}, "guard",
+    {"guard", "ask_timeout", CFG_SECONDS, "60", {}, {}, "guard",
      "Seconds to wait for an answer when a tool asks to leave the roots, "
-     "then deny"},
+     "or asks for anything else, then deny; 0 waits until answered while "
+     "a window has the session open (with none, asks are denied at once)"},
     {"guard", "question_timeout", CFG_SECONDS, "300", {}, {}, "guard",
      "Seconds to wait for answers to the agent's questions (ask_user), "
      "counted again whenever the user works on them, then skip them; in "
-     "plan mode they wait with no limit"},
+     "plan mode they wait with no limit; 0 waits until answered while a "
+     "window has the session open (with none, they are skipped at once)"},
     {"guard", "temp", CFG_ENUM, "allow", {}, "allow ask", "guard",
      "The system's temporary directory: allow the file tools there without "
      "asking, or ask as for any directory outside the roots"},
@@ -498,6 +541,12 @@ static CfgKey cfgschema[] = {
     {"skills", "paths", CFG_PATHS, "", {}, {}, "skills",
      "More directories of skills, each holding NAME/SKILL.md, separated "
      "by ;, after the project's and before the user's"},
+    {"skills", "hidden", CFG_STRING, "", {}, {}, "skills",
+     "Names of skills for /NAME alone, kept from the agent as "
+     "disable-model-invocation would, separated by blanks"},
+    {"skills", "disabled", CFG_STRING, "", {}, {}, "skills",
+     "Names of skills left out altogether, from the agent and from "
+     "/NAME, separated by blanks; prospero is Prospero's own"},
 
     {"memory", "enabled", CFG_BOOL, "true", {}, {}, "memory",
      "Give new sessions in a project the memory tool and the project's "
@@ -522,18 +571,21 @@ static CfgKey cfgschema[] = {
      "Ask the user before every desktop action, denying it when nobody "
      "answers in time; false lets the agent act unattended"},
     {"desktop", "ask_timeout", CFG_SECONDS, "60", {}, {}, "desktop",
-     "Seconds to wait for an answer to a desktop action, then deny"},
+     "Seconds to wait for an answer to a desktop action, then deny; 0 "
+     "waits until answered while a window has the session open (with "
+     "none, actions are denied at once)"},
 
-    {"web", "search", CFG_ENUM, "none", {}, "none searxng exa anthropic", "web",
+    {"web", "search", CFG_ENUM, "none", {}, "none searxng exa keenable anthropic", "web",
      "The service web_search uses: none (no web_search), searxng (an "
-     "instance at url), exa (Exa's MCP endpoint, which needs no key) or "
+     "instance at url), exa (Exa's MCP endpoint, which needs no key), "
+     "keenable (Keenable's search API, which needs no key) or "
      "anthropic (a model of an anthropic endpoint searches, as model says)"},
     {"web", "url", CFG_URL, "", {}, {}, "web",
      "For searxng: the instance's URL, with json among the formats in its "
      "settings.yml (search: formats)"},
     {"web", "key", CFG_SECRET, "", {}, {}, "web",
-     "For exa: an API key, as env:NAME or file:PATH, for more searches "
-     "than Exa allows without one"},
+     "For exa or keenable: an API key, as env:NAME or file:PATH, for "
+     "more searches than the service allows without one"},
     {"web", "model", CFG_STRING, "", {}, {}, "web",
      "For anthropic: the model that searches, ENDPOINT/MODEL at an "
      "endpoint of kind anthropic, by default claude-haiku-5-5 at the "
@@ -588,18 +640,36 @@ static CfgKey cfgschema[] = {
      "lack the editor, so name it in full here, or add its directory to "
      "[tools] path_prepend"},
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
-     "The terminal that a session's Open in terminal opens in its folder: "
+     "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "
      "a program (wt.exe, konsole, kitty). Empty: Terminal on macOS, Windows "
      "Terminal or else a console of its own on Windows, and elsewhere "
      "$TERMINAL or the first found of ptyxis, gnome-terminal, kgx, konsole, "
      "xfce4-terminal, x-terminal-emulator, alacritty, kitty, wezterm, foot, "
      "ghostty and xterm"},
+    {"ui", "mentions", CFG_BOOL, "true", {}, {}, "ui",
+     "Whether @ at a word's start in the compose box opens the picker of "
+     "the session's files and folders and other sessions; false leaves @ "
+     "as plain text, and a message carries no mentioned sessions' ids"},
     {"ui", "notify", CFG_LIST, "allow done", {}, "allow done none", "ui",
      "Desktop notifications while you look elsewhere: allow when an "
      "ask waits for you (a permission, a plan to approve, the agent's "
      "questions), done when a session stops by itself "
      "(finished, failed or out of budget); none for neither"},
+
+    {"terminal", "shell", CFG_STRING, "", {}, {}, "terminal",
+     "The program a terminal tab runs, with its arguments, a \"quoted\" "
+     "one holding blanks, ~/ for the home directory where unquoted. "
+     "Empty: the session's shell, unless it is the "
+     "system's sh, else $SHELL. A POSIX shell starts as a login shell, "
+     "except on Linux for this computer's sessions, whose desktop login "
+     "ran the profile already"},
+    {"terminal", "scrollback", CFG_INT, "10000", {}, {}, "terminal",
+     "Lines of history a new terminal tab keeps above its screen, 0 to "
+     "100000"},
+    {"terminal", "copy_on_select", CFG_BOOL, "false", {}, {}, "terminal",
+     "Whether selecting text in a terminal copies it at once, without "
+     "the copy key"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "
@@ -702,8 +772,10 @@ static CfgKey cfgschema[] = {
     {"mcp", "trust", CFG_BOOL, "false", {}, {}, "mcp",
      "Let the agent use the server's tools without asking first"},
     {"mcp", "tools", CFG_STRING, "", {}, {}, "mcp",
-     "Only these of the server's tools, by its names for them, separated "
-     "by blanks; by default all"},
+     "The server's tools sessions get, by its names for them, read left "
+     "to right: a name keeps a tool and -NAME leaves one out, and a list "
+     "that begins with -NAME starts from all of them, as in \"-delete\"; "
+     "by default all"},
     {"mcp", "enabled", CFG_BOOL, "true", {}, {}, "mcp",
      "Offer the server's tools to new sessions"},
     {"mcp", "startup_timeout", CFG_SECONDS, "30", {}, {}, "mcp",
@@ -1006,6 +1078,39 @@ static b32 cfgenvname(Str s)
     return 1;
 }
 
+// effort_as: reasoning_effort, reasoning.effort, none or template.NAME.
+static b32 cfgeffortas(Str v)
+{
+    return v=="reasoning_effort" || v=="reasoning.effort" || v=="none" ||
+           cfgtemplatename(v).len;
+}
+
+// effort_map: EFFORT:VALUE words, each EFFORT one of effort's choices.
+static b32 cfgeffortmap(Str v)
+{
+    for (Cut c = {{}, v, 1}; c.ok;) {
+        c = cut(c.tail, ' ');
+        Str w = trim(c.head);
+        if (!w.len) {
+            continue;
+        }
+        Cut kv = cut(w, ':');
+        if (!kv.ok || !kv.tail.len ||
+                !cfghasword("none minimal low medium high xhigh max", kv.head)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// The asks' timeouts, which may be 0: no deadline, waiting until the
+// user answers, while anyone attends the session to.
+static b32 cfgwaitkey(CfgKey *k)
+{
+    return (k->kind=="guard" && (k->key=="ask_timeout" || k->key=="question_timeout")) ||
+           (k->kind=="desktop" && k->key=="ask_timeout");
+}
+
 static b32 cfgtilde(Str p)
 {
     return p=="~" || startswith(p, "~/") || startswith(p, "~\\");
@@ -1023,7 +1128,8 @@ static b32 cfgruns(CfgKey *k, Str v)
                (k->key=="shell" && !cfghasword("auto sh powershell cmd", v) &&
                 (HOST_WINDOWS || v!="bash"));
     }
-    return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");
+    return (k->kind=="ui" && (k->key=="editor" || k->key=="terminal")) ||
+           (k->kind=="terminal" && k->key=="shell");
 }
 
 // Whether only the user's own file may give a key a value: what runs on
@@ -1107,9 +1213,18 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return cfgrefprefix(v) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="mcp" && k->key=="redirect_uri") {
         return loopbackuri(v).ok ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="endpoint" && k->key=="integration_id") {
+        return relayname(v) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="sessions" && k->key=="trash_days") {
         Int n = parseint(v);
         return n.ok && n.val>=0 && n.val<=36500 ? CFG_OK : CFG_BAD;
+    } else if (cfgwaitkey(k)) {
+        Float f = parsefloat(v);
+        return f.ok && f.val>=0 && f.val<1e7 ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="model" && k->key=="effort_as") {
+        return cfgeffortas(v) ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="model" && k->key=="effort_map") {
+        return cfgeffortmap(v) ? CFG_OK : CFG_BAD;
     }
     switch (k->type) {
     case CFG_STRING:
@@ -1220,8 +1335,17 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     }
     if (k->kind=="mcp" && k->key=="redirect_uri") {
         return "expected http://127.0.0.1:PORT/PATH or http://localhost:PORT/PATH";
+    } else if (k->kind=="endpoint" && k->key=="integration_id") {
+        return "expected a name of letters, digits, '.', '_' and '-', at most 64";
     } else if (k->kind=="sessions" && k->key=="trash_days") {
         return "expected days, 0 or more (at most 36500): 0 turns the Trash off";
+    } else if (cfgwaitkey(k)) {
+        return "expected seconds, 0 or more: 0 waits until answered";
+    } else if (k->kind=="model" && k->key=="effort_as") {
+        return "expected reasoning_effort, reasoning.effort, template.NAME or none";
+    } else if (k->kind=="model" && k->key=="effort_map") {
+        return "expected EFFORT:VALUE words, such as high:xhigh none:off, "
+               "each EFFORT one of none, minimal, low, medium, high, xhigh, max";
     }
     Buf b(a, 128);
     switch (k->type) {
@@ -1578,6 +1702,76 @@ static Str cfgtemplate(Config *c, Arena *perm, Str name)
     return finish(&b);
 }
 
+// Where [model] effort goes on an OpenAI-compatible chat request: key
+// and json, a top-level field and its value, or kwargs with it added, as
+// effort_as says, its word first rewritten by effort_map. A template
+// argument set for the same thing (reasoning_effort, or effort_as's
+// NAME) wins, so nothing is added: kwargs already says it.
+struct CfgEffort {
+    Str key;     // reasoning_effort, reasoning, or null for none
+    Str json;    // its value
+    Str kwargs;  // chat_template_kwargs, as given or with effort added
+};
+
+static CfgEffort cfgeffort(Arena *perm, Str effort, Str as, Str map, Str kwargs)
+{
+    CfgEffort r = {};
+    r.kwargs = kwargs;
+    as = as.len ? as : Str("reasoning_effort");
+    if (!effort.len || as=="none" || !cfgeffortas(as)) {
+        return r;
+    }
+    Str v = effort;
+    for (Cut c = {{}, map, 1}; c.ok;) {
+        c = cut(c.tail, ' ');
+        Cut kv = cut(trim(c.head), ':');
+        if (kv.ok && kv.head==effort && kv.tail.len) {
+            v = kv.tail;
+            break;
+        }
+    }
+    Str  name = cfgtemplatename(as);
+    Str  set  = name.len ? name : Str("reasoning_effort");
+    {
+        Arena tmp = *perm;  // the parse, gone before perm is used again
+        Json *kw  = kwargs.len ? jsonparse(&tmp, kwargs).root : 0;
+        if (kw && jsonget(kw, set)->type!=JSON_MISSING) {
+            return r;  // template.NAME says it
+        }
+    }
+
+    // The value alone, then put in its place
+    Buf     vb(perm, 16 + v.len);
+    JsonOut vw = {&vb};
+    putcfgtemplate(&vw, v, 0);
+    Str     val = finish(&vb);
+    Buf     b(perm, 64 + kwargs.len + name.len + val.len);
+    if (name.len) {
+        if (kwargs.len > 2) {
+            print(&b, takehead(kwargs, kwargs.len-1));  // up to its "}"
+            putbyte(&b, ',');
+        } else {
+            putbyte(&b, '{');
+        }
+        putbyte(&b, '"');
+        print(&b, name);  // an identifier: no escapes
+        print(&b, "\":");
+        print(&b, val);
+        putbyte(&b, '}');
+        r.kwargs = finish(&b);
+    } else if (as == "reasoning.effort") {
+        r.key = "reasoning";
+        print(&b, "{\"effort\":");
+        print(&b, val);
+        putbyte(&b, '}');
+        r.json = finish(&b);
+    } else {
+        r.key  = "reasoning_effort";
+        r.json = val;
+    }
+    return r;
+}
+
 // Whether the configuration names a model, by default or with a
 // [model NAME] section, or a [remote NAME] host to run on: a GUI with
 // none shows its settings and hosts on its first run.
@@ -1666,6 +1860,17 @@ static i64 cfgms(Config *c, Str kind, Str name, Str key, b32 local)
     Float f  = parsefloat(trim(cfgget(c, kind, name, key, local)));
     i64   ms = f.ok ? (i64)(f.val * 1000) : 0;
     return ms>0 ? ms : 1;
+}
+
+// An ask's timeout (cfgwaitkey) in milliseconds, 0 for none: wait until
+// answered.
+static i64 cfgwaitms(Config *c, Str kind, Str key)
+{
+    Float f = parsefloat(trim(cfgget(c, kind, {}, key, 0)));
+    if (f.ok && f.val==0) {
+        return 0;
+    }
+    return cfgms(c, kind, {}, key, 0);
 }
 
 // A secret setting, resolved: env:NAME reads the environment, and
@@ -1757,6 +1962,37 @@ static b32 cfgfromweb(IniFile *f)
         }
     }
     return 0;
+}
+
+#define CFG_PROMPTMAX (256<<10)
+
+// The file a role's prompt_file names, e: ~ the home directory, and a
+// relative path against the directory of the file that sets it. Null
+// when unset, or when it comes from the web, which could otherwise send
+// any of the user's files to the model.
+static Str cfgpromptpath(Config *c, Arena *perm, IniEntry *e)
+{
+    Str p = e ? trim(e->value) : Str{};
+    if (!p.len || cfgfromweb(e->file)) {
+        return {};
+    } else if (cfgtilde(p)) {
+        Str home = userhome(c->os, perm);
+        return home.len ? concat(perm, home, cuthead(p, 1)) : Str{};
+    }
+    return inipath(perm, inidir(e->file->path), p);
+}
+
+// A role's prompt_file, read and trimmed: null when unset, unreadable,
+// or over CFG_PROMPTMAX.
+static Str cfgrolepromptfile(Config *c, Arena *perm, Str name)
+{
+    IniEntry *e    = name.len ? inilookup(c->ini, "role", name, "prompt_file") : 0;
+    Str       path = cfgpromptpath(c, perm, e);
+    if (!path.len) {
+        return {};
+    }
+    Read r = os_read(c->os, perm, path, CFG_PROMPTMAX);
+    return r.err==READ_OK ? trim(r.data) : Str{};
 }
 
 // A credential's item, by its value: env:NAME, whoever wrote it, or
@@ -1979,7 +2215,14 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
                        !inientry(l->section, "url");
     b32      mcpcmd  = k && l->key=="mcp" && cfgheeded(user, l->section, "command");
     b32      mcpurl  = k && l->key=="mcp" && cfgheeded(user, l->section, "url");
-    b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl;
+    // A section of neither only adjusts projects' servers of its name:
+    // odd only when it adjusts nothing
+    b32      mcpadj  = k && l->key=="mcp" &&
+                       (inientry(l->section, "tools") || inientry(l->section, "enabled") ||
+                        inientry(l->section, "timeout") ||
+                        inientry(l->section, "startup_timeout"));
+    b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl &&
+                       (mcpcmd || !mcpadj);
     IniEntry *search = k && l->key=="web" ? inientry(l->section, "search") : 0;
     b32      webbad  = search && trim(search->value)=="searxng" &&
                        !inientry(l->section, "url");
@@ -2011,7 +2254,9 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         print(&b, "mcp ");
         print(&b, l->value);
         print(&b, mcpcmd ? Str(" has both a command and a url: set one of them")
-                         : Str(" has neither a command nor a url"));
+                         : Str(" has neither a command nor a url, so it only "
+                               "adjusts projects' servers of that name, with tools, "
+                               "enabled, timeout or startup_timeout"));
     } else if (webbad) {
         print(&b, "[web] search is searxng but has no url: set it to the "
                   "instance's URL");
@@ -2102,6 +2347,15 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         cfgreport(ini, perm, f, l, INI_ERROR, l->keybeg, msg);
         return;
     }
+    if (s->kind=="role" && l->key=="prompt_file" && trim(l->value).len &&
+            cfgfromweb(f)) {
+        cfgreport(ini, perm, f, l, INI_ERROR, l->valbeg,
+                  cfgmuted(f) ? Str{} :
+                  Str("a prompt file in an include by URL is ignored, since "
+                      "it could send any of your files to the model: set it "
+                      "in your own file or a local include"));
+        return;
+    }
     i32 j = cfgjudge(key, l->value, shared);
     if (j != CFG_OK) {
         Str msg = {};
@@ -2153,6 +2407,17 @@ static void cfglikecheck(Ini *ini, Arena *perm, Str name, IniEntry *e)
 
 // Check a load against the schema, adding diagnostics to it. The user's
 // file may be null.
+// Whether an [mcp] key is one a section with no command or url never
+// gives a project's server of its name, which that name alone matches
+// (any project may name a server after one of the user's).
+static b32 cfgnotoverlay(Str key)
+{
+    return key=="trust" || key=="token" || key=="client_id" ||
+           key=="client_secret" || key=="scope" || key=="client_name" ||
+           key=="redirect_uri" || key=="cwd" || startswith(key, "header.") ||
+           startswith(key, "env.");
+}
+
 static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
 {
     for (IniFile *f = ini->files; f; f = f->next) {
@@ -2209,6 +2474,45 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                         msg = concat(perm, path.len ? path : trim(cuthead(v, 5)),
                                      path.len ? Str(" cannot be read, or is empty")
                                               : Str(": no home directory is known"));
+                    }
+                    cfgreport(ini, perm, e->file, e->line, INI_WARNING,
+                              e->line->valbeg, msg);
+                }
+            }
+            b32 adjusts = inientry(s, "tools") || inientry(s, "enabled") ||
+                          inientry(s, "timeout") || inientry(s, "startup_timeout");
+            if (s->kind=="mcp" && s->name.len && v.len && cfgnotoverlay(e->key) && adjusts &&
+                    !(inientry(s, "command") && trim(inientry(s, "command")->value).len) &&
+                    !(inientry(s, "url") && trim(inientry(s, "url")->value).len)) {
+                Str msg = {};
+                if (!cfgmuted(e->file)) {
+                    Buf b(perm, 256);
+                    print(&b, "[mcp ");
+                    print(&b, s->name);
+                    print(&b, "] has no command or url, so it only adjusts "
+                              "projects' servers of that name, which never get ");
+                    print(&b, e->key);
+                    print(&b, ": a project chooses where they run");
+                    msg = finish(&b);
+                }
+                cfgreport(ini, perm, e->file, e->line, INI_WARNING, e->line->keybeg, msg);
+            }
+            if (s->kind=="role" && e->key=="prompt_file" && v.len &&
+                    !cfgfromweb(e->file)) {
+                Str   path = cfgpromptpath(c, perm, e);
+                Arena tmp  = *perm;
+                Read  r    = {};
+                r.err = READ_NOTFOUND;
+                if (path.len) {
+                    r = os_read(c->os, &tmp, path, CFG_PROMPTMAX);
+                }
+                if (r.err != READ_OK) {
+                    Str msg = {};
+                    if (!cfgmuted(e->file)) {
+                        msg = !path.len ? Str("no home directory is known")
+                            : r.err==READ_TOOBIG
+                            ? concat(perm, path, " is over 256 KiB, so it is ignored")
+                            : concat(perm, path, " cannot be read, so it is ignored");
                     }
                     cfgreport(ini, perm, e->file, e->line, INI_WARNING,
                               e->line->valbeg, msg);

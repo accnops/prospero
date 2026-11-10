@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.25)
 if(NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
   set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Oldest macOS to run on")
 endif()
-project(prospero VERSION 0.12.0 LANGUAGES C CXX)
+project(prospero VERSION 0.16.1 LANGUAGES C CXX)
 
 # Unity build: each executable is one translation unit, a platform layer
 # (src/main_*.cpp) that includes the portable core (src/prospero.cpp). The
@@ -19,6 +19,16 @@ set(PROSPERO_NAME prospero CACHE STRING "Executable name")
 option(PROSPERO_GUI "Build the GUI (OFF: the headless engine only)" ON)
 option(PROSPERO_DEVTOOLS "The GUI's developer tools, the Metrics pane (always in Debug builds)" OFF)
 option(PROSPERO_STATIC "Link fully statically (Linux: deployed engines)" OFF)
+# Where SDL3, FreeType and mbedTLS come from: FETCH, from deps/ when
+# present, else downloaded, or LOCAL, the system's, by find_package
+# alone, for distribution packages. The rest, which no distribution has
+# new enough, are fetched either way.
+set(PROSPERO_DEPS FETCH CACHE STRING
+    "SDL3, FreeType and mbedTLS: FETCH (bundled or downloaded) or LOCAL (system)")
+set_property(CACHE PROSPERO_DEPS PROPERTY STRINGS FETCH LOCAL)
+if(NOT PROSPERO_DEPS MATCHES "^(FETCH|LOCAL)$")
+  message(FATAL_ERROR "PROSPERO_DEPS is FETCH or LOCAL, not ${PROSPERO_DEPS}")
+endif()
 # The edition: "community", what a source build and the GitHub releases
 # are, or "itch", the itch.io builds (tools/itch.py), named plain
 # "Prospero", with the engines zip (tools/engines.py) embedded, so that
@@ -27,6 +37,8 @@ set(PROSPERO_EDITION community CACHE STRING "Edition: community or itch")
 set_property(CACHE PROSPERO_EDITION PROPERTY STRINGS community itch)
 set(PROSPERO_ENGINES_ZIP "" CACHE FILEPATH
     "For the itch edition: prospero-engines-VERSION.zip, embedded")
+# The cached value may name variables, as ${PROJECT_VERSION}, expanded here
+string(CONFIGURE "${PROSPERO_ENGINES_ZIP}" PROSPERO_ENGINES_ZIP)
 if(PROSPERO_EDITION STREQUAL "community")
   set(prospero_display_name "Prospero Community Edition")
 elseif(PROSPERO_EDITION STREQUAL "itch")
@@ -36,7 +48,7 @@ elseif(PROSPERO_EDITION STREQUAL "itch")
   endif()
   if(NOT IS_ABSOLUTE "${PROSPERO_ENGINES_ZIP}" OR NOT EXISTS "${PROSPERO_ENGINES_ZIP}")
     message(FATAL_ERROR "the itch edition needs PROSPERO_ENGINES_ZIP, the "
-                        "engines zip's absolute path")
+                        "engines zip's absolute path, not \"${PROSPERO_ENGINES_ZIP}\"")
   endif()
 else()
   message(FATAL_ERROR "PROSPERO_EDITION is community or itch, not ${PROSPERO_EDITION}")
@@ -64,6 +76,21 @@ target_compile_options(prospero_core_flags INTERFACE
 target_compile_definitions(prospero_core_flags INTERFACE
   PROSPERO_VERSION="${PROJECT_VERSION}"
 )
+
+# What tree a build is of, as git describe says, for --version and
+# About: worked out at each build, since the commit moves without a new
+# configure, and written only when it changes (cmake/GitDescribe.cmake).
+# Empty for a release, and for a tree with neither git nor .describe.
+# Each target with the core flags waits for it.
+set(PROSPERO_GEN "${CMAKE_CURRENT_BINARY_DIR}/gen")
+add_custom_target(prospero_describe
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+    -DOUT=${PROSPERO_GEN}/describe.h -DVERSION=${PROJECT_VERSION}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GitDescribe.cmake
+  BYPRODUCTS ${PROSPERO_GEN}/describe.h
+  VERBATIM)
+target_include_directories(prospero_core_flags INTERFACE ${PROSPERO_GEN})
+add_dependencies(prospero_core_flags prospero_describe)
 
 # Debug builds trap on undefined behavior, which includes failed asserts,
 # and optimize the core a little (-Og), for speed nearer Release's on
@@ -152,6 +179,19 @@ if(PROSPERO_GUI)
   include(FetchGui)
 endif()
 
+# ariel, the terminal emulator behind the Terminal pane (ariel/), a C
+# library kept self-contained so it can move out of this repository. Only
+# the GUI and the unit tests link it. Its assertions trap in every build,
+# since it parses untrusted bytes in the process holding every session.
+if(PROSPERO_GUI)
+  if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
+    set(ARIEL_TESTS ON CACHE BOOL "" FORCE)
+  endif()
+  set(ARIEL_TOOLS OFF CACHE BOOL "")
+  add_subdirectory(ariel)
+  target_compile_definitions(ariel PRIVATE ARIEL_TRAP)
+endif()
+
 if(WIN32 AND PROSPERO_GUI)
   # The GUI build has CRT startup, since FreeType, md4c and ImGui need a
   # CRT, though the core still never calls it. windows.h, D3D11 and the
@@ -197,7 +237,7 @@ if(WIN32 AND PROSPERO_GUI)
   # in a translation unit of its own (src/deskwin32.cpp)
   add_executable(prospero WIN32 src/main_win32.cpp src/deskwin32.cpp)
   target_link_libraries(prospero PRIVATE
-    prospero_gui imgui md4c kernel32 advapi32 winhttp comdlg32 ole32
+    prospero_gui imgui md4c ariel kernel32 advapi32 winhttp comdlg32 ole32
     user32 gdi32
   )
   target_link_options(prospero PRIVATE -static -municode)
@@ -221,7 +261,7 @@ else()
   add_executable(prospero src/main_posix.cpp)
   target_link_libraries(prospero PRIVATE httpedge Threads::Threads)
   if(PROSPERO_GUI)
-    target_link_libraries(prospero PRIVATE imgui md4c)
+    target_link_libraries(prospero PRIVATE imgui md4c ariel)
   endif()
   # Every tool process starts under a reaper, this executable, so its
   # startup is on the critical path: loading libstdc++ dynamically costs
@@ -424,14 +464,15 @@ if(WIN32 AND NOT PROSPERO_GUI AND UV)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/imports.py $<TARGET_FILE:prospero>)
 endif()
 
-if(NOT CMAKE_CROSSCOMPILING)
+# PROSPERO_CROSS_TESTS: a cross toolchain whose programs run here
+if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
   enable_testing()
   add_executable(prospero_test src/main_test.cpp)
   target_link_libraries(prospero_test PRIVATE prospero_core_flags wuffs)
   target_compile_definitions(prospero_test PRIVATE PROSPERO_ARENACHECK=1)
   if(PROSPERO_GUI)
     # The GUI's pure modules: scheduler, markdown, layout, view model.
-    target_link_libraries(prospero_test PRIVATE md4c)
+    target_link_libraries(prospero_test PRIVATE md4c ariel)
     target_compile_definitions(prospero_test PRIVATE PROSPERO_GUI=1)
   endif()
   if(PROSPERO_HAS_NOSTDLIBXX)
@@ -520,6 +561,12 @@ if(NOT CMAKE_CROSSCOMPILING)
       add_test(NAME signcheck COMMAND ${UV} run
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/signcheck.py)
     endif()
+    # The built-in PDF reader over a corpus of generated PDFs, built once
+    # into the build tree (tests/pdfcorpus.py), skipped without pdflatex
+    add_test(NAME pdfcorpus COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/pdfcheck.py --prospero $<TARGET_FILE:prospero>
+      --build ${CMAKE_BINARY_DIR})
+    set_tests_properties(pdfcorpus PROPERTIES SKIP_RETURN_CODE 77)
     # The sources, for one arena given to a call twice: as the place for
     # its results and, by value, as its scratch
     add_test(NAME arenalint COMMAND ${UV} run

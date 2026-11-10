@@ -14,6 +14,19 @@ modified dependency, put its source under `deps/` (`deps/imgui`,
 `deps/md4c`, `deps/freetype`, `deps/sdl3`, `deps/mbedtls`,
 `deps/cpp-httplib`, and `deps/wuffs` holding `wuffs-v0.4.c`).
 
+Distribution packages can use the system's SDL3 (3.4 or later),
+FreeType (2.14 or later) and mbedTLS (3.6, not 4) instead, found with
+`find_package` alone, never downloaded:
+
+    $ cmake -B build -DPROSPERO_DEPS=LOCAL
+
+On Ubuntu 26.04 these are `libsdl3-dev`, `libfreetype-dev` and
+`libmbedtls-dev`, and on Fedora `SDL3-devel`, `freetype-devel` and
+`mbedtls-devel`. The rest are still fetched, or taken from `deps/`,
+since distributions lack the versions Prospero needs: ImGui's docking
+branch, md4c 0.6 (admonitions), cpp-httplib with its mbedTLS backend,
+and Wuffs 0.4.
+
 The Windows GUI is its own Win32 layer over Direct3D 11, and HTTP goes
 through WinHTTP, so it uses the system's certificates and proxies. The
 toolchain files in `cmake/` cross-compile for Windows with Mingw-w64
@@ -48,7 +61,9 @@ its window title says so, and an empty transcript asks those who use
 Prospero professionally to buy the [itch.io][itch] build. That build,
 `-DPROSPERO_EDITION=itch`, is plain Prospero, and needs
 `-DPROSPERO_ENGINES_ZIP=PATH`, the engines zip (below), which it
-carries built in, so that deploy needs no engines directory.
+carries built in, so that deploy needs no engines directory. PATH may
+name `${PROJECT_VERSION}`, quoted from the shell, so that it follows
+version bumps: `'-DPROSPERO_ENGINES_ZIP=.../prospero-engines-${PROJECT_VERSION}.zip'`.
 
 ## Releases
 
@@ -73,7 +88,7 @@ Each release on GitHub carries five files:
   in a directory with a `.desktop` file, its icon, and a README.txt. It
   is built in an Ubuntu 22.04 container, with everything but glibc
   linked statically, so it needs glibc 2.34 or later (Ubuntu 22.04,
-  Debian 12, Fedora 35, RHEL 10), and shows its window through Wayland
+  Debian 12, Fedora 35, RHEL 9), and shows its window through Wayland
   or X11, which it loads at run time.
 
 Each program is its own engine, so `prospero deploy` from a release
@@ -120,9 +135,15 @@ one with the Developer ID, packed, then embedded in `Prospero.app`
 (signed, tested, on a notarized disk image), in the Windows program
 (built in the toolchain image, signed with `aas-sign`, as `Prospero.exe`
 in a zip), and in the Linux GUI for x86_64 and aarch64. Those are built
-in Ubuntu 22.04 images from `tools/linuxgui`, x86_64 emulated, by the
-same scripts the release's Linux builds use, so they have the same
-glibc floor. Without
+in the toolchain image too, by its glibc 2.28 cross compilers and the
+same `tools/linuxgui/build.sh` the release's Linux builds use, so they
+need only glibc 2.28 or later: RHEL 8 and its rebuilds (Rocky,
+AlmaLinux), Debian 10 and Ubuntu 18.10 too. SDL builds there against
+Debian 12's X11, Wayland, libdecor and D-Bus headers, unpacked into the
+sysroots from a snapshot (`tools/toolchain/sysroot.py`), and loads
+those libraries at run time, so they set no floor. The x86_64 build's
+tests run through Docker's emulation, with the sysroot's loader and
+libraries. Without
 `aas-sign`, the Developer ID in the keychain, or notary credentials
 (`--notary-profile`, from `xcrun notarytool store-credentials`), it
 builds nothing. `--push` uploads the four with [butler][], which needs

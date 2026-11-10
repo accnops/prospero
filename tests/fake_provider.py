@@ -20,6 +20,13 @@ A compaction request (its system prompt is the summarizer's) is counted
 apart, as model "M#compact", and answered by the scenario's function
 named SCENARIO_compact if there is one, else with a short summary.
 
+OpenAI's Responses API (POST /v1/responses) takes the same model names
+and runs the same scenarios: a request is checked as the API would with
+nothing stored (store false, no item ids, strict false tools, reasoning
+back with the encrypted_content this server gave it), turned into a Chat
+Completions request as llama.cpp turns it, and the scenario's chunks are
+answered as Responses events.
+
 Anthropic's Messages API (POST /v1/messages) takes the same model names,
 and its scenarios, named an_*, answer with its events. It checks each
 request as the real API would, and stricter: the key (AN_KEY, as x-api-key)
@@ -66,6 +73,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -88,6 +96,11 @@ class State:
         self.caches = {}    # Anthropic: model -> {prefix hash: tokens}
         self.listings = []  # Anthropic: headers of /v1/models requests
         self.web = []       # web tools: requests to /web/ and /searxng/
+        self.encs = {}      # Responses: encrypted_content -> its reasoning
+        self.cg = {"n": 0, "codes": {}, "access": set(), "refresh": set(),
+                   "log": []}  # ChatGPT's sign-in and backend
+        self.cp = {"n": 0, "devices": {}, "approved": set(), "tokens": {},
+                   "log": []}  # GitHub's device flow and Copilot's API
         self.stop = threading.Event()
 
     def register(self, model, **listing):
@@ -460,6 +473,24 @@ def sc_pings(model, n, req):
     yield from finish(model)
 
 
+def sc_prefill_rate(model, n, req):
+    # Prompt processing at 2000 tok/s past 30000 cached tokens: first
+    # with the server's time_ms, which runs faster than the wall clock
+    # here, then (the second request) without it, at half a second a
+    # batch: 4000 tok/s.
+    yield S.head()
+    clock = n == 0
+    for i in range(5):
+        p = {"total": 40000, "cache": 30000, "processed": 30000 + 2000*i}
+        if clock:
+            p["time_ms"] = 1000*i
+        else:
+            yield S.sleep(0.5 if i else 0)
+        yield S.data({"choices": [], "prompt_progress": p})
+    yield from text(model, "Read at a known rate.")
+    yield from finish(model)
+
+
 def sc_stall_head(model, n, req):
     if n == 0:
         yield S.stall(30)
@@ -697,6 +728,41 @@ def sc_job_tools(model, n, req):
         yield from answer(model, "Killed the job.")
 
 
+def sc_job_announce(model, n, req):
+    # Says it will wait for its job, and stops: not nudged on, since the
+    # job's end brings it back (#32)
+    if n == 0:
+        cmd = "sleep 1; echo built"
+        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+    elif n == 1:
+        yield from answer(model, "Let me wait for the build to finish.")
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+def sc_job_poll(model, n, req):
+    # Polls a job that writes nothing new, and sleeps for it (#32)
+    if n == 0:
+        cmd = "echo $$ > jobpid; echo one; sleep 30"
+        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+    elif n == 1:
+        yield S.sleep(0.5)  # for its output to arrive
+        yield from tool(model, n, "job_output", {"job": 1})
+    elif n == 2:
+        yield from tool(model, n, "job_output", {"job": 1})
+    elif n == 3:
+        yield from tool(model, n, "shell", {"command": "sleep 0.1"})
+    elif n == 4:
+        yield from tool(model, n, "shell", {"command": "sleep 0.1; echo hi"})
+    elif n == 5:
+        yield from tool(model, n, "job_kill", {"job": 1})
+    else:
+        yield from answer(model, "Stopped it.")
+
+
+sc_job_poll_noresume = sc_job_poll
+
+
 def sc_job_busy(model, n, req):
     # A job that ends while the turn still runs: told at the next step
     if n == 0:
@@ -757,6 +823,36 @@ def sc_todo(model, n, req):
         yield from tool(model, n, "todo_write", {"todos": json.dumps(done)})
     else:
         yield from answer(model, "All done.")
+
+
+def sc_todo_ops(model, n, req):
+    # The list sent with other calls, then changed item by item: done
+    # starts the next, a bad name changes nothing, add and remove
+    pend = lambda c: {"content": c, "status": "pending"}
+    if n == 0:
+        yield from calls(model, n, [
+            ("todo_write", {"todos": [pend("write a"), pend("write b")]}),
+            ("write", {"path": "a.txt", "content": "a\n"})])
+    elif n == 1:
+        yield from calls(model, n, [
+            ("todo_write", {"done": ["write a"]}),
+            ("write", {"path": "b.txt", "content": "b\n"})])
+    elif n == 2:
+        yield from tool(model, n, "todo_write", {"done": "write z"})
+    elif n == 3:
+        yield from tool(model, n, "todo_write", {"done": ["WRITE  b"], "add": ["check"]})
+    elif n == 4:
+        yield from tool(model, n, "todo_write", {"remove": ["check"]})
+    elif n == 5:
+        # The whole list again, only a status changed
+        yield from calls(model, n, [
+            ("todo_write", {"todos": [{"content": "write a", "status": "done"},
+                                      {"content": "write b", "status": "pending"}]}),
+            ("write", {"path": "c.txt", "content": "c\n"})])
+    elif n == 6:
+        yield from tool(model, n, "todo_write", {"done": ["write b"]})
+    else:
+        yield from answer(model, "Both written.")
 
 
 def sc_todo_job(model, n, req):
@@ -1045,6 +1141,15 @@ def sc_skill_prompt(model, n, req):
     yield from answer(model, f"Answer number {n}.")
 
 
+def sc_skills_config(model, n, req):
+    # "use NAME" calls the skill tool once; anything else is answered
+    u = last_user_text(req) or ""
+    if u.startswith("use ") and since_user(req) == 0:
+        yield from tool(model, n, "skill", {"name": u[4:]})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
 def sc_prospero_skill(model, n, req):
     # The built-in skill: its instructions, then each topic the prompt
     # names, separated by |; a prompt invoking a skill is just answered
@@ -1150,6 +1255,7 @@ def sc_ask(model, n, req):
 
 
 sc_ask_allow = sc_ask_deny = sc_ask_timeout = sc_ask_steer = sc_ask_close = sc_ask
+sc_ask_touch = sc_ask_wait = sc_ask_hold = sc_ask
 sc_config_roots = sc_ask
 
 
@@ -1275,17 +1381,65 @@ def sc_compaction(model, n, req):
         yield from real_answer(model, req, "All files read.")
 
 
+def sc_compact_heed_now(model, n, req):
+    # Two turns of sc_compaction's reads, each compacting
+    if n % 9 < 8:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n % 9}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
 def sc_compact_guard(model, n, req):
     yield from sc_compaction(model, n, req)
 
 
 def sc_compact_guard_compact(model, n, req):
-    # A summary far too long to leave any room
+    # A summary far too long to leave any room, but not over its limit
     yield S.head()
-    for i in range(40):
+    yield from text(model, "## Goal\nRead the files.\n\n## Critical context\n")
+    for i in range(29):
         yield from text(model, "".join(f"Detail {i}.{j}: file f{j}.txt has line "
                                        f"{i*j} of the data. " for j in range(40)))
     yield from finish(model, prompt=ptok(req))
+
+
+def sc_compact_echo(model, n, req):
+    yield from sc_compaction(model, n, req)
+
+
+def sc_compact_echo_compact(model, n, req):
+    # The summarizer copies the conversation out instead (issue #17)
+    yield S.head()
+    yield from text(model, "user: Read the files.\n\nassistant: Reading f0.txt.\n\n"
+                           "user: Your goal is to read them all.", 3)
+    yield from finish(model, prompt=ptok(req))
+
+
+def sc_compact_long(model, n, req):
+    yield from sc_compaction(model, n, req)
+
+
+def sc_compact_long_compact(model, n, req):
+    # As an instruction file asked: every message copied out, then the
+    # summary, over 16384 tokens in all (issue #17)
+    yield S.head()
+    for i in range(40):
+        yield from text(model, "".join(f"user: line {i}.{j} of file f{j}.txt, "
+                                       f"copied out verbatim. " for j in range(50)))
+    yield from text(model, "\n\n## Goal\nRead the files.\n\n## Next steps\nRead the rest.")
+    yield from finish(model, prompt=ptok(req))
+
+
+def sc_compact_shorter(model, n, req):
+    yield from sc_compaction(model, n, req)
+
+
+def sc_compact_shorter_compact(model, n, req):
+    # Too long, as sc_compact_long's, until told so: then one that fits
+    if "Your last summary" in json.dumps(req):
+        yield from compact_default(model, n, req)
+    else:
+        yield from sc_compact_long_compact(model, n, req)
 
 
 def sc_compact_prune(model, n, req):
@@ -1294,6 +1448,19 @@ def sc_compact_prune(model, n, req):
         yield from real_tool(model, req, n, "read", {"path": f"f{n}.txt"})
     else:
         yield from real_answer(model, req, "Pruned and done.")
+
+
+def sc_compact_prune_short(model, n, req):
+    # Big writes, whose arguments a prune cannot touch, then small reads
+    # until the threshold, where a prune saves enough to count but leaves
+    # little room
+    if n < 4:
+        yield from real_tool(model, req, n, "write",
+                             {"path": f"w{n}.txt", "content": f"w{n} " * 28000})
+    elif n < 64:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n-4}.txt"})
+    else:
+        yield from real_answer(model, req, "Read them all.")
 
 
 def sc_overflow_compact(model, n, req):
@@ -1672,6 +1839,17 @@ def sc_role_tools_b(model, n, req):
     yield from answer(model, "Fast report.")
 
 
+def sc_role_prompt_file(model, n, req):
+    sysp = system_of(req)
+    if "# Your role: onlyfile" in sysp:
+        yield from answer(model, "Child read its file.")
+    elif step(req) == 0:
+        yield from tool(model, n, "task", {"description": "File", "prompt": "Go.",
+                                           "role": "onlyfile"})
+    else:
+        yield from answer(model, "Done.")
+
+
 def sc_park_revive(model, n, req):
     if step(req) == 0:
         yield from answer(model, "First answer.")
@@ -2005,7 +2183,7 @@ sc_question_steer_first = sc_question
 sc_question_cancel = sc_question_close = sc_question_bypass = sc_question
 sc_question_switch = sc_question_switch_b = sc_question_offered = sc_question
 sc_question_reopen = sc_question_fork = sc_question_gui = sc_question
-sc_question_timeout = sc_question_touch = sc_question_plan = sc_question
+sc_question_timeout = sc_question_touch = sc_question_plan = sc_question_wait = sc_question_hold = sc_question
 
 
 # Agents for prospero eval (tests/scenarios.py, eval_*): scripted good
@@ -2382,6 +2560,29 @@ def sc_read_image_blind(model, n, req):
         yield from answer(model, "Read it.")
 
 
+
+def sc_tool_images(model, n, req):
+    # An image read, then answers: its record becomes a set of images,
+    # and the resumed runs answer at once, "more" after reading another
+    # image
+    if last_user_text(req) == "more":
+        yield from tool(model, n, "read", {"path": "four.gif"})
+    elif step(req) == 0:
+        yield from tool(model, n, "read", {"path": "red.png"})
+    else:
+        yield from answer(model, "Saw them.")
+
+
+sc_rs_tool_images = sc_tool_images
+
+
+def sc_an_tool_images(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k == 0:
+        yield from an_call(model, req, n, "read", {"path": "red.png"})
+    else:
+        yield from an_answer(model, req, "Saw them.")
+
 def sc_desktop_cache(model, n, req):
     # Twelve screenshots, one a step: the cache's view of each request
     if step(req) < 12:
@@ -2620,6 +2821,33 @@ def sc_mcp_project(model, n, req):
         "Done again."])
 
 
+def sc_mcp_identity(model, n, req):
+    # The configuration's "fake", then, its section gone, the project's
+    yield from mcp_steps(model, n, req, [
+        ("mcp__fake__echo", {"text": "cfg"}),
+        "Turn one.",
+        ("mcp__fake__where", {}),
+        "Turn two."])
+
+
+def sc_mcp_overlay(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__proj__echo", {"text": "x"}), "Done."])
+
+
+def sc_mcp_overlay_auth(model, n, req):
+    yield from mcp_steps(model, n, req, ["Nothing to call."])
+
+
+def sc_mcp_untick(model, n, req):
+    yield from mcp_steps(model, n, req, [
+        ("mcp__fake__echo", {"text": "a"}), "One.",
+        ("mcp__fake__echo", {"text": "b"}), "Two."])
+
+
+def sc_mcp_http_two(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__docs__where", {}), "Done."])
+
+
 sc_mcp_project_policy = sc_mcp_project
 sc_mcp_project_always = sc_mcp_project
 sc_mcp_project_trust = sc_mcp_project
@@ -2678,7 +2906,8 @@ def sc_mcp_http_timeout(model, n, req):
 GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
                "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
                "Say hello", "Stall for", "Fail once", "Hold me", "Show the themes",
-               "Start subagents", "Report as a subagent", "Plan it with a todo list",
+               "Start subagents", "Start more subagents", "Report as a subagent",
+               "Plan it with a todo list",
                "Start background jobs", "Start a subagent that asks",
                "Write outside as a subagent", "Make undoable changes",
                "Read the big files", "Fail over", "Stream in the background",
@@ -2947,6 +3176,13 @@ def sc_gui(model, n, req):
         # conversation to compact on request
         words = " ".join(f"word{i}" for i in range(6000))
         yield from real_answer(model, req, "A long answer: " + words)
+    elif "Start more subagents" in prompt:
+        if step == 0:
+            yield from calls(model, n, [
+                ("task", {"description": f"Look {w}", "prompt": f"Report as a subagent: {w}."})
+                for w in ("one", "two", "three")])
+        else:
+            yield from answer(model, "All three subagents reported.")
     elif "Start subagents" in prompt:
         if step == 0:
             yield from calls(model, n, [
@@ -3530,6 +3766,9 @@ def sc_qualified_model(model, n, req):
     yield from answer(model, "Done.")
 
 
+sc_effort_chat = sc_qualified_model
+
+
 def sc_template_variant(model, n, req):
     # Long enough that a model and its variant overlap, if let
     yield S.head()
@@ -3684,6 +3923,21 @@ def plain(obj):
     return obj
 
 
+def an_sized(obj):
+    """A value with base64 data past 16 KiB counted as 16 KiB, its digest
+    in place of the rest, as the API counts an image or document by what
+    it shows, not by its bytes: a large PDF fits the window."""
+    if isinstance(obj, dict):
+        d = obj.get("data")
+        if obj.get("type") == "base64" and isinstance(d, str) and len(d) > 16384:
+            digest = hashlib.sha256(d.encode()).hexdigest()
+            return {**obj, "data": digest + d[:16384 - len(digest)]}
+        return {k: an_sized(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [an_sized(v) for v in obj]
+    return obj
+
+
 def an_system(req):
     system = req.get("system", [])
     return [{"type": "text", "text": system}] if isinstance(system, str) else system
@@ -3709,7 +3963,7 @@ def an_usage(model, req):
     size = 0
     marks = []
     for b, where in units:
-        u = json.dumps(plain(b), sort_keys=True) + where
+        u = json.dumps(plain(an_sized(b)), sort_keys=True) + where
         h.update(u.encode())
         size += len(u)
         if isinstance(b, dict) and "cache_control" in b:
@@ -3744,9 +3998,14 @@ def an_check_reasoning(req, i, k, b):
     return None
 
 
+def an_pdf_pages(data):
+    """A PDF's pages as the fake counts them: its /Type /Page objects."""
+    return len(re.findall(rb"/Type\s*/Page(?![A-Za-z])", data))
+
+
 def an_check_result(where, content):
     """Why a tool_result's content is not what the API takes: a string,
-    or a list of text and image blocks."""
+    or a list of text, image and document (a base64 PDF) blocks."""
     if content is None or isinstance(content, str):
         return None
     if not isinstance(content, list):
@@ -3762,6 +4021,19 @@ def an_check_result(where, content):
                     src.get("media_type") not in ("image/png", "image/jpeg",
                                                   "image/gif", "image/webp")):
                 return f"{at}.source: an image needs base64 data and a media type"
+        elif c.get("type") == "document":
+            src = c.get("source", {})
+            try:
+                data = base64.b64decode(src.get("data", ""), validate=True)
+            except ValueError:
+                data = b""
+            if (src.get("type") != "base64" or src.get("media_type") != "application/pdf" or
+                    not data.startswith(b"%PDF-")):
+                return f"{at}.source: a document needs a base64 PDF"
+            if b"/Encrypt" in data:
+                return f"{at}: The PDF specified is password protected."
+            if b"garbage" in data:  # damaged, as the real API finds one
+                return f"{at}.pdf.source.base64.data: The PDF specified was not valid."
         else:
             return f"{at}: unexpected block type {c.get('type')} in a tool result"
     return None
@@ -3797,6 +4069,14 @@ def an_check(req, prefill=False):
     msgs = req.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return "messages: at least one message is required"
+    pages = sum(an_pdf_pages(base64.b64decode(c["source"]["data"]))
+                for m in msgs if isinstance(m.get("content"), list)
+                for b in m["content"] if b.get("type") == "tool_result"
+                and isinstance(b.get("content"), list)
+                for c in b["content"] if c.get("type") == "document"
+                and isinstance(c.get("source", {}).get("data"), str))
+    if pages > 100:
+        return "A maximum of 100 PDF pages may be provided."
     for i, m in enumerate(msgs):
         role = m.get("role")
         if role != ("user" if i % 2 == 0 else "assistant"):
@@ -4212,6 +4492,238 @@ def sc_an_desktop(model, n, req):
         yield from an_answer(model, req, "Clicked it.")
 
 
+def sc_an_read_pdf(model, n, req):
+    # Each PDF in turn, then an answer; a resumed run's "again" at once
+    files = ["three.pdf", "two.pdf", "locked.pdf", "long.pdf"]
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if last_user_text(req) == "again" or k >= len(files):
+        yield from an_answer(model, req, "Read them.")
+    else:
+        yield from an_call(model, req, n, "read", {"path": files[k]})
+
+
+def sc_an_read_pdf_room(model, n, req):
+    # Two PDFs of 30 pages: a request has room for one
+    files = ["thirty.pdf", "thirty2.pdf"]
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k < len(files):
+        yield from an_call(model, req, n, "read", {"path": files[k]})
+    else:
+        yield from an_answer(model, req, "Read both.")
+
+
+def sc_an_read_pdf_bad(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k == 0:
+        yield from an_call(model, req, n, "read", {"path": "broken.pdf"})
+    else:
+        yield from an_answer(model, req, "It was damaged.")
+
+
+def sc_an_read_pdf_damaged(model, n, req):
+    # Damaged PDFs, extracted rather than sent
+    files = ["junk.pdf", "count.pdf", "cut.pdf"]
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k < len(files):
+        yield from an_call(model, req, n, "read", {"path": files[k]})
+    else:
+        yield from an_answer(model, req, "Read them.")
+
+
+def mkpdf(pages, encrypt=False):
+    """A PDF of so many pages, each with a line of text, as text: its
+    trailer naming an /Encrypt dictionary if encrypt."""
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [%s] /Count %d >>" %
+            (" ".join(f"{3 + 2*i} 0 R" for i in range(pages)), pages)]
+    font = 3 + 2*pages
+    for i in range(pages):
+        s = f"BT /F1 24 Tf 72 700 Td (Page {i + 1}) Tj ET"
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+                    f"<< /Font << /F1 {font} 0 R >> >> /Contents {4 + 2*i} 0 R >>")
+        objs.append(f"<< /Length {len(s)} >>\nstream\n{s}\nendstream")
+    objs.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    if encrypt:
+        objs.append("<< /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >>")
+    out, offs = "%PDF-1.4\n", []
+    for i, o in enumerate(objs):
+        offs.append(len(out))
+        out += f"{i + 1} 0 obj\n{o}\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n"
+    out += "".join(f"{o:010d} 00000 n \n" for o in offs)
+    enc = f" /Encrypt {len(objs)} 0 R" if encrypt else ""
+    out += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R{enc} >>\n"
+            f"startxref\n{xref}\n%%EOF\n")
+    return out
+
+
+def mkpdfpages(pages, images=None, title=None, pad=0):
+    """A PDF as bytes: pages of (lines of text, names of the images drawn
+    below them, one under another), images by name as (dictionary
+    entries, stream data); an Info dictionary with title if given; and
+    pad bytes of an unused stream right after the first page's objects,
+    so that a body cut inside it keeps only that page whole."""
+    images = images or {}
+    names = list(images)
+    first = 3 + 2*len(pages)
+    font = first + len(names)
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [%s] /Count %d >>" %
+            (" ".join(f"{3 + 2*i} 0 R" for i in range(len(pages))).encode(), len(pages))]
+    for i, (lines, drawn) in enumerate(pages):
+        ops, y = [], 740
+        for ln in lines:
+            ops.append(f"BT /F1 12 Tf 72 {y} Td ({ln}) Tj ET")
+            y -= 20
+        for nm in drawn:
+            y -= 110
+            ops.append(f"q 200 0 0 100 72 {y} cm /{nm} Do Q")
+            y -= 10
+        s = "\n".join(ops).encode()
+        xo = " ".join(f"/{nm} {first + names.index(nm)} 0 R" for nm in drawn)
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+                    f"<< /Font << /F1 {font} 0 R >> /XObject << {xo} >> >> "
+                    f"/Contents {4 + 2*i} 0 R >>".encode())
+        objs.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(s), s))
+    for nm in names:
+        d, data = images[nm]
+        objs.append(b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\n"
+                    b"endstream" % (d.encode(), len(data), data))
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    order = list(range(len(objs)))
+    if pad:
+        objs.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (pad, b"\0" * pad))
+        order.insert(4 if len(pages) else 2, len(objs) - 1)
+    info = ""
+    if title is not None:
+        objs.append(b"<< /Title (%s) >>" % title.encode())
+        order.append(len(objs) - 1)
+        info = f" /Info {len(objs)} 0 R"
+    out, offs = b"%PDF-1.4\n", [0] * len(objs)
+    for i in order:
+        offs[i] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (i + 1, objs[i])
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offs)
+    out += (b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n" %
+            (len(objs) + 1, info.encode(), xref))
+    return out
+
+
+def pdfrgb(w, h, color):
+    """An image XObject's entries and data: w by h of one RGB color, deflated."""
+    return (f"/Width {w} /Height {h} /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+            f"/Filter /FlateDecode", zlib.compress(bytes(color) * (w * h)))
+
+
+def sc_read_pdf_text(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read", {"path": "three.pdf"})
+    else:
+        yield from answer(model, "Read it.")
+
+
+# Pages in windows of 5 lines, read on; then the file is changed (31
+# pages) and read on past where it ended
+READ_PDF_PAGING = [
+    ("read", {"path": "thirty.pdf", "limit": 5}),
+    ("read", {"path": "thirty.pdf", "offset": 6, "limit": 5}),
+    ("write", {"path": "thirty.pdf", "content": mkpdf(31)}),
+    ("read", {"path": "thirty.pdf", "offset": 61, "limit": 5}),
+]
+
+
+def sc_read_pdf_paging(model, n, req):
+    k = step(req)
+    if k < len(READ_PDF_PAGING):
+        yield from tool(model, n, *READ_PDF_PAGING[k])
+    else:
+        yield from answer(model, "Paged through it.")
+
+
+def sc_read_pdf_images(model, n, req):
+    # Two PDFs with images, then an answer; a resumed run answers at once
+    files = ["img.pdf", "many.pdf"]
+    k = step(req)
+    if last_user_text(req) == "again" or k >= len(files):
+        yield from answer(model, "Saw them.")
+    else:
+        yield from tool(model, n, "read", {"path": files[k]})
+
+
+def sc_read_pdf_images_rs(model, n, req):
+    files = ["img.pdf", "scan.pdf"]
+    k = step(req)
+    if k < len(files):
+        yield from tool(model, n, "read", {"path": files[k]})
+    else:
+        yield from answer(model, "Saw them.")
+
+
+def sc_read_pdf_blind(model, n, req):
+    files = ["img.pdf", "scan.pdf", "blank.pdf"]
+    k = step(req)
+    if k < len(files):
+        yield from tool(model, n, "read", {"path": files[k]})
+    else:
+        yield from answer(model, "Read them.")
+
+
+def sc_read_pdf_locked(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read", {"path": "locked.pdf"})
+    else:
+        yield from answer(model, "It is locked.")
+
+
+def script_calls(req):
+    """The calls a scripted scenario makes, one a step: the prompt is a
+    JSON list of [name, args]."""
+    for m in req.get("messages", []):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+        c = str(c or "").strip()
+        if c.startswith('[["'):
+            return json.loads(c)
+    return []
+
+
+def sc_calls(model, n, req):
+    # The prompt's calls in turn, then an answer
+    items = script_calls(req)
+    k = step(req)
+    if k < len(items):
+        yield from tool(model, n, *items[k])
+    else:
+        yield from answer(model, "Done.")
+
+
+def sc_an_calls(model, n, req):
+    items = script_calls(req)
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k < len(items):
+        yield from an_call(model, req, n, *items[k])
+    else:
+        yield from an_answer(model, req, "Done.")
+
+
+sc_read_pdf_more = sc_read_pdf_bigimgs = sc_calls
+sc_an_read_pdf_edge = sc_an_read_pdf_reqbytes = sc_an_calls
+
+
+def sc_an_read_pdf_text(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k == 0:
+        yield from an_call(model, req, n, "read", {"path": "img.pdf"})
+    else:
+        yield from an_answer(model, req, "Read it.")
+
+
 def sc_an_desktop_cache(model, n, req):
     k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
     if k < 12:
@@ -4270,6 +4782,14 @@ def sc_session_ops(model, n, req):
     yield from finish(model)
 
 
+def sc_sessions_lastact(model, n, req):
+    yield S.head()
+    if last_user_text(req) == "slow":
+        yield S.sleep(1)  # busy a while, for a listing meanwhile
+    yield from text(model, f"Answer {n}.")
+    yield from finish(model)
+
+
 def sc_draft(model, n, req):
     yield from answer(model, "Sent.")
 
@@ -4307,6 +4827,27 @@ def sc_compact_manual(model, n, req):
 
 
 sc_compact_cancel = sc_compact_manual
+
+
+def sc_compact_heed(model, n, req):
+    # "read them": saves a memory, reads sub/x.txt (which loads its
+    # AGENTS.md) and eight big files, then answers; any other prompt is
+    # answered at once. Notices are user messages too, so the step is
+    # counted from the prompt.
+    msgs = req.get("messages", [])
+    at = max((i for i, m in enumerate(msgs) if m.get("role") == "user" and
+              m.get("content") in ("read them", "again", "after", "later")), default=-1)
+    k = sum(m.get("role") == "tool" for m in msgs[at+1:])
+    if at < 0 or msgs[at]["content"] != "read them":
+        yield from real_answer(model, req, "Done.")
+    elif k == 0:
+        yield from real_tool(model, req, n, *memsave("style", "Tabs, not spaces", "feedback"))
+    elif k == 1:
+        yield from real_tool(model, req, n, "read", {"path": "sub/x.txt"})
+    elif k < 10:
+        yield from real_tool(model, req, n, "read", {"path": f"f{k-2}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
 
 
 def sc_compact_cancel_compact(model, n, req):
@@ -4357,6 +4898,20 @@ def scratch_of(req):
     """The scratch directory the system prompt names, or None."""
     m = re.search(r"Put scratch files \([^)]*\) in (.+?), which", system_of(req))
     return m.group(1) if m else None
+
+
+def sc_plan_scratch(model, n, req):
+    # In plan mode: a scratch file, one through a link in the scratch
+    # directory to the working directory, and one in the working directory
+    d = scratch_of(req)
+    steps = [("write", {"path": f"{d}/notes.txt", "content": "notes"}),
+             ("write", {"path": f"{d}/link/escape.txt", "content": "x"}),
+             ("write", {"path": "inside.txt", "content": "x"})]
+    k = since_user(req)
+    if k < len(steps):
+        yield from tool(model, n, *steps[k])
+    else:
+        yield from answer(model, "Planned.")
 
 
 def sc_always(model, n, req):
@@ -4514,6 +5069,24 @@ def sc_side_task_b(model, n, req):
         yield from tool(model, n, "shell", {"command": "sleep 3"})
     else:
         yield from answer(model, "Slept.")
+
+
+def sc_fork_folder(model, n, req):
+    # In the original: a write in its folder (a snapshot), then one in
+    # ../ext, asked about. In a fork: a relative read, and big reads for
+    # a compaction
+    u = last_user_text(req) or ""
+    k = since_user(req)
+    plan = {
+        "one": [("write", {"path": "f.txt", "content": "v1"}),
+                ("write", {"path": "../ext/a.txt", "content": "a"})],
+        "two": [("read", {"path": "note.txt"})],
+        "read them": [("read", {"path": f"f{i}.txt"}) for i in range(6)],
+    }.get(u, [])
+    if k < len(plan):
+        yield from real_tool(model, req, n, *plan[k])
+    else:
+        yield from real_answer(model, req, f"Done with {u[:20]}.")
 
 
 def sc_fork_job_quiet(model, n, req):
@@ -4740,7 +5313,21 @@ def sc_attach_text(model, n, req):
 
 
 sc_attach_text_replay = sc_attach_text
+
+
+def sc_mention_sessions(model, n, req):
+    # How many mentioned sessions the request names
+    k = user_text_all(req).count("[The user mentioned session ")
+    yield from answer(model, f"{k} sessions mentioned.")
 sc_attach_text_b = sc_attach_text  # its model without vision
+
+
+def sc_attach_pdf(model, n, req):
+    # How many PDFs are attached, and how many images the request has
+    k = user_text_all(req).count("[Attached PDF ")
+    yield from answer(model, f"{k} PDFs, {len(user_images(req))} images.")
+sc_attach_pdf_b = sc_attach_pdf  # its model without vision
+sc_attach_pdf_more = sc_attach_pdf
 
 
 def sc_attach_text_long(model, n, req):
@@ -4918,6 +5505,36 @@ def sc_web_flow(model, n, req):
         "Done reading."])
 
 
+def web_read_kept(nonce, results):
+    """read the PDF the last web_fetch kept, if it kept one."""
+    m = re.search(r"The PDF is kept at (\S+): read", results[-1] if results else "")
+    return ("read", {"path": m.group(1)}) if m else "Nothing kept."
+
+
+def sc_web_fetch_pdf(model, n, req):
+    d = "https://docs.example.com/{nonce}"
+    yield from web_steps(model, n, req, [
+        web_fetch(d + "/report.pdf"),
+        web_read_kept,
+        web_fetch(d + "/report.pdf", offset=10),
+        web_fetch(d + "/dump"),
+        web_fetch(d + "/locked.pdf"),
+        "Done reading."])
+
+
+sc_web_fetch_pdf_blind = sc_web_fetch_pdf
+
+
+def sc_web_fetch_pdf_more(model, n, req):
+    d = "https://docs.example.com/{nonce}"
+    yield from web_steps(model, n, req, [web_fetch(d + "/" + x) for x in
+                                         ("htmlpdf", "mention", "mid.pdf", "blank.pdf",
+                                          "scan.pdf")] + ["Done reading."])
+
+
+sc_web_fetch_pdf_more_blind = sc_web_fetch_pdf_more
+
+
 def sc_web_ask(model, n, req):
     # Two turns, the second in a later process
     d = "https://docs.example.com/{nonce}"
@@ -4947,6 +5564,18 @@ def sc_web_exa(model, n, req):
         web_search("sse"),
         web_fetch("https://forum.example.org/{nonce}/next"),
         "Done."])
+
+
+def sc_web_keenable(model, n, req):
+    yield from web_steps(model, n, req, [
+        web_search("widgets"),
+        web_search("busy"),
+        web_search("refused"),
+        web_fetch("https://forum.example.org/{nonce}/next"),
+        "Done."])
+
+
+sc_web_keenable_key = sc_web_keenable
 
 
 def sc_web_anthropic(model, n, req):
@@ -5009,6 +5638,620 @@ def sc_web_task_b(model, n, req):
         f"imagine https://docs.example.com/{nonce}/hidden too."])
 
 
+# OpenAI's Responses API: requests checked as the API would with nothing
+# stored, run as Chat Completions requests through the same scenarios,
+# and answered with Responses events. Reasoning gets encrypted content
+# that must come back verbatim, with its summary unchanged.
+
+def rs_enc(model, text):
+    enc = "enc_" + hashlib.sha256((model + "\0" + text).encode()).hexdigest()[:24]
+    with STATE.lock:
+        STATE.encs[enc] = text
+    return enc
+
+
+def rs_check(req):
+    """Why the API would refuse the request, or None."""
+    if req.get("store") is not False:
+        return "store must be false: nothing is kept here"
+    if req.get("stream") is not True:
+        return "stream must be true"
+    if "reasoning.encrypted_content" not in req.get("include", []):
+        return "include must ask for reasoning.encrypted_content"
+    if not isinstance(req.get("instructions"), str):
+        return "instructions must be a string"
+    for x in req.get("tools", []):
+        if x.get("type") != "function" or x.get("strict") is not False or "function" in x:
+            return f"a tool not flat with strict false: {x}"
+    calls = set()
+    for i, item in enumerate(req.get("input", [])):
+        kind = item.get("type")
+        where = f"input[{i}]"
+        if "id" in item:
+            return f"{where}: an item id, but nothing is stored"
+        if kind == "message":
+            role = item.get("role")
+            want = {"user": ("input_text", "input_image"),
+                    "assistant": ("output_text",)}.get(role)
+            if not want or not item.get("content"):
+                return f"{where}: a message of role {role!r} or no content"
+            for c in item["content"]:
+                if c.get("type") not in want:
+                    return f"{where}: content {c.get('type')} in a {role} message"
+                if c["type"] == "input_image" and \
+                        not str(c.get("image_url", "")).startswith("data:image/"):
+                    return f"{where}: an image not a data URL"
+                if c["type"] == "output_text" and not c.get("text", "").strip():
+                    return f"{where}: blank output_text"
+        elif kind == "function_call":
+            if not all(isinstance(item.get(k), str) for k in ("call_id", "name", "arguments")):
+                return f"{where}: a call without call_id, name or arguments"
+            try:
+                json.loads(item["arguments"])
+            except ValueError:
+                return f"{where}: arguments not JSON"
+            calls.add(item["call_id"])
+        elif kind == "function_call_output":
+            if item.get("call_id") not in calls:
+                return f"{where}: output of no call before it: {item.get('call_id')}"
+            if not isinstance(item.get("output"), str):
+                return f"{where}: output not a string"
+        elif kind == "reasoning":
+            enc = item.get("encrypted_content")
+            summary = "".join(s.get("text", "") for s in item.get("summary", []))
+            if enc is not None:
+                with STATE.lock:
+                    known = STATE.encs.get(enc)
+                if known is None:
+                    return f"{where}: encrypted_content not given by this server"
+                if summary and summary != known:
+                    return f"{where}: the summary changed"
+            elif not item.get("content") or item.get("summary") != []:
+                return f"{where}: reasoning without encrypted_content or text"
+        else:
+            return f"{where}: unknown item type {kind}"
+    return None
+
+
+def rs_tochat(req):
+    """The request as Chat Completions, as llama.cpp converts it."""
+    msgs = [{"role": "system", "content": req.get("instructions", "")}]
+    def asst():
+        if msgs[-1].get("role") != "assistant":
+            msgs.append({"role": "assistant", "content": ""})
+        return msgs[-1]
+    for item in req.get("input", []):
+        kind = item.get("type")
+        if kind == "message" and item.get("role") == "user":
+            parts = item["content"]
+            if all(c["type"] == "input_text" for c in parts):
+                msgs.append({"role": "user", "content": "".join(c["text"] for c in parts)})
+            else:
+                msgs.append({"role": "user", "content": [
+                    {"type": "text", "text": c["text"]} if c["type"] == "input_text" else
+                    {"type": "image_url", "image_url": {"url": c["image_url"]}}
+                    for c in parts]})
+        elif kind == "message":
+            a = asst()
+            a["content"] += "".join(c.get("text", "") for c in item["content"])
+        elif kind == "function_call":
+            asst().setdefault("tool_calls", []).append({
+                "id": item["call_id"], "type": "function",
+                "function": {"name": item["name"], "arguments": item["arguments"]}})
+        elif kind == "function_call_output":
+            msgs.append({"role": "tool", "tool_call_id": item["call_id"],
+                         "content": item["output"]})
+        elif kind == "reasoning":
+            text = "".join(s.get("text", "") for s in item.get("summary", [])) or \
+                   "".join(c.get("text", "") for c in item.get("content", []))
+            a = asst()
+            a["reasoning_content"] = a.get("reasoning_content", "") + text
+    chat = {k: v for k, v in req.items()
+            if k not in ("input", "instructions", "tools", "include", "store")}
+    chat["messages"] = msgs
+    if req.get("tools"):
+        chat["tools"] = [{"type": "function", "function": {
+            "name": x["name"], "description": x.get("description", ""),
+            "parameters": x.get("parameters", {})}} for x in req["tools"]]
+    return chat
+
+
+class RsStream:
+    """Chat Completions chunks as Responses events. With rotate, as
+    Copilot sends them: each event with its item's output_index, and the
+    item under a new id each time."""
+
+    def __init__(self, model, rotate=False):
+        self.model = model
+        self.items = {}   # key -> item, by first sight
+        self.order = []
+        self.finish = None
+        self.usage = None
+        self.ended = False
+        self.rotate = rotate
+        self.rotated = 0
+
+    def fresh(self):
+        self.rotated += 1
+        return f"rot_{self.rotated}"
+
+    def ev(self, obj):
+        if self.rotate:
+            ids = [it["id"] for it in (self.items[k] for k in self.order)]
+            if "item_id" in obj:
+                obj["output_index"] = ids.index(obj["item_id"])
+                obj["item_id"] = self.fresh()
+            if "item" in obj:
+                obj["item"] = dict(obj["item"], id=self.fresh())
+            if isinstance(obj.get("response", {}).get("output"), list):
+                obj["response"]["output"] = [dict(it, id=self.fresh())
+                                             for it in obj["response"]["output"]]
+        return S.raw(f"event: {obj['type']}\ndata: {json.dumps(obj)}\n\n")
+
+    def item(self, key, made):
+        out = []
+        if key not in self.items:
+            it = made()
+            it["id"] = f"{it['type'][:2]}_{len(self.order)}"
+            self.items[key] = it
+            self.order.append(key)
+            out.append(self.ev({"type": "response.output_item.added",
+                                "output_index": self.order.index(key), "item": dict(it)}))
+        return self.items[key], out
+
+    def whole(self, key):
+        it = dict(self.items[key])
+        if it["type"] == "reasoning":
+            text = it.pop("_text", "")
+            it["summary"] = [{"type": "summary_text", "text": text}] if text else []
+            it["encrypted_content"] = rs_enc(self.model, text)
+        elif it["type"] == "message":
+            it["content"] = [{"type": "output_text", "text": it.pop("_text", "")}]
+        return it
+
+    def end(self):
+        if self.ended:
+            return []
+        self.ended = True
+        out = [self.ev({"type": "response.output_item.done",
+                        "output_index": i, "item": self.whole(k)})
+               for i, k in enumerate(self.order)]
+        u = self.usage or {}
+        usage = {"input_tokens": u.get("prompt_tokens", 0),
+                 "output_tokens": u.get("completion_tokens", 0),
+                 "input_tokens_details": {
+                     "cached_tokens": (u.get("prompt_tokens_details") or {}).get(
+                         "cached_tokens", self.cache_n)}}
+        resp = {"id": "resp_fake", "object": "response", "usage": usage,
+                "output": [self.whole(k) for k in self.order]}
+        if self.finish == "length":
+            resp["status"] = "incomplete"
+            resp["incomplete_details"] = {"reason": "max_output_tokens"}
+            out.append(self.ev({"type": "response.incomplete", "response": resp}))
+        else:
+            resp["status"] = "completed"
+            out.append(self.ev({"type": "response.completed", "response": resp}))
+        return out
+
+    cache_n = 0
+
+    def chunk(self, obj):
+        out = []
+        if "error" in obj:
+            e = obj["error"]
+            code = e.get("code")
+            out.append(self.ev({"type": "response.failed", "response": {
+                "status": "failed", "error": {
+                    "code": code if isinstance(code, str) else "server_error",
+                    "message": e.get("message", "")}}}))
+            return out
+        if obj.get("prompt_progress"):
+            out.append(self.ev({"type": "response.in_progress",
+                                "response": {"id": "resp_fake"},
+                                "prompt_progress": obj["prompt_progress"]}))
+        for ch in obj.get("choices", []):
+            d = ch.get("delta") or {}
+            r = d.get("reasoning_content")
+            if r:
+                it, o = self.item("r", lambda: {"type": "reasoning", "summary": []})
+                out += o
+                it["_text"] = it.get("_text", "") + r
+                out.append(self.ev({"type": "response.reasoning_summary_text.delta",
+                                    "item_id": it["id"], "delta": r}))
+            c = d.get("content")
+            if c:
+                it, o = self.item("m", lambda: {"type": "message", "role": "assistant",
+                                                "content": []})
+                out += o
+                it["_text"] = it.get("_text", "") + c
+                out.append(self.ev({"type": "response.output_text.delta",
+                                    "item_id": it["id"], "delta": c}))
+            for tc in d.get("tool_calls", []):
+                fn = tc.get("function", {})
+                it, o = self.item(("c", tc.get("index", 0)), lambda: {
+                    "type": "function_call", "call_id": tc.get("id", ""),
+                    "name": fn.get("name", ""), "arguments": ""})
+                out += o
+                args = fn.get("arguments", "")
+                if args:
+                    it["arguments"] += args
+                    out.append(self.ev({"type": "response.function_call_arguments.delta",
+                                        "item_id": it["id"], "delta": args}))
+            if ch.get("finish_reason"):
+                self.finish = ch["finish_reason"]
+        if obj.get("usage"):
+            self.usage = obj["usage"]
+            self.cache_n = (obj.get("timings") or {}).get("cache_n", 0)
+            if self.finish:
+                out += self.end()
+        return out
+
+    def actions(self, actions):
+        created = False
+        for a in actions:
+            if a[0] == "data":
+                if not created:
+                    created = True
+                    yield self.ev({"type": "response.created",
+                                   "response": {"id": "resp_fake", "status": "in_progress"}})
+                yield from self.chunk(a[1])
+            elif a[0] == "raw" and a[1].strip() == "data: [DONE]":
+                if self.finish:
+                    yield from self.end()
+            else:
+                yield a
+
+
+def rs_handle(handler, prefix, raw, rotate=False):
+    """POST /v1/responses: checked, run, and answered, its items' ids
+    rotated as Copilot's are if asked."""
+    def fail(status, message, code="invalid_request_error"):
+        handler.send_json(status, {"error": {"message": message, "type": code,
+                                             "code": None}})
+    try:
+        req = json.loads(raw)
+    except ValueError:
+        fail(400, "invalid JSON body")
+        return
+    model = req.get("model", "")
+    parts = model.split(":")
+    name = parts[1] if len(parts) > 1 and parts[0] == "fake" else ""
+    fn = SCENARIOS.get(name)
+    if not fn:
+        fail(404, f"The model `{model}` does not exist", "model_not_found")
+        return
+    chat = rs_tochat(req)
+    key = model
+    if is_compaction(chat):
+        key = model + "#compact"
+        fn = SCENARIOS.get(name + "_compact", compact_default)
+    headers = {k.lower(): v for k, v in handler.headers.items()}
+    n = STATE.take(key, req, headers)
+    STATE.begin(prefix, model)
+    try:
+        err = rs_check(req)
+        if err:
+            fail(400, err)
+        else:
+            handler.perform(RsStream(model, rotate).actions(fn(model, n, chat)))
+    finally:
+        STATE.end(prefix, model)
+        STATE.finished(key, n)
+
+
+# Scenarios run over the Responses API, by the name its scenario has
+sc_rs_plain = sc_plain
+sc_rs_read_edit_shell = sc_read_edit_shell
+sc_rs_length_think = sc_length_think
+sc_rs_midstream_error = sc_midstream_error
+sc_rs_drop_args = sc_drop_args
+
+
+# ChatGPT: its sign-in (an issuer at /chatgpt, as auth.openai.com, which
+# PROSPERO_TEST_CHATGPT_AUTH names) and the Codex backend at
+# /chatgpt/backend-api/codex, which takes only the tokens it gave, the
+# account's id, and the Codex headers, then answers as Responses. Access
+# tokens are JWTs whose claims name the account; refresh tokens rotate.
+
+CG_CLIENT = "app_EMoamEEZ73f0CkXaXp7hrann"
+CG_ACCOUNT = "acct-fake"
+
+
+def cg_jwt(claims):
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{b64({'alg': 'none'})}.{b64(claims)}.sig"
+
+
+def cg_tokens(expires=3600):
+    """New tokens, known to the backend: access, refresh, id."""
+    with STATE.lock:
+        STATE.cg["n"] += 1
+        n = STATE.cg["n"]
+    auth = {"chatgpt_account_id": CG_ACCOUNT, "chatgpt_plan_type": "plus"}
+    access = cg_jwt({"n": n, "exp": int(time.time()) + expires,
+                     "https://api.openai.com/auth": auth})
+    idt = cg_jwt({"email": "me@example.com", "https://api.openai.com/auth": auth})
+    with STATE.lock:
+        STATE.cg["access"].add(access)
+        STATE.cg["refresh"].add(f"rt-{n}")
+    return {"access_token": access, "refresh_token": f"rt-{n}", "id_token": idt,
+            "token_type": "Bearer", "expires_in": expires}
+
+
+def cg_log(entry):
+    with STATE.lock:
+        STATE.cg["log"].append(entry)
+
+
+def cg_get(handler, url, path):
+    """GET /chatgpt/...: the authorize page, or the model listing."""
+    q = dict(urllib.parse.parse_qsl(url.query))
+    if path == "/chatgpt/oauth/authorize":
+        cg_log({"_oauth": path, **q})
+        redirect = q.get("redirect_uri", "")
+        if (q.get("client_id") != CG_CLIENT or q.get("response_type") != "code" or
+                q.get("code_challenge_method") != "S256" or not q.get("state") or
+                "resource" in q or "offline_access" not in q.get("scope", "") or
+                q.get("codex_cli_simplified_flow") != "true" or
+                not redirect.endswith("/auth/callback")):
+            handler.send_json(400, {"error": "invalid_request"})
+            return
+        with STATE.lock:
+            STATE.cg["n"] += 1
+            code = f"code-{STATE.cg['n']}"
+            STATE.cg["codes"][code] = {"redirect": redirect,
+                                       "challenge": q.get("code_challenge")}
+        to = redirect + "?" + urllib.parse.urlencode({"code": code, "state": q["state"]})
+        handler.send_response(302)
+        handler.send_header("Location", to)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+    elif path == "/chatgpt/backend-api/codex/models":
+        cg_log({"_models": url.query, "auth": cg_authorized(handler)})
+        if cg_authorized(handler):
+            handler.send_json(401, {"error": {"message": cg_authorized(handler)}})
+            return
+        handler.send_json(200, {"models": [
+            {"slug": m["id"], "context_window": 65536} for m in models()["data"]]})
+    else:
+        handler.send_json(404, {"error": {"message": "not found"}})
+
+
+def cg_authorized(handler):
+    """Why the backend refuses the request's credentials, or None."""
+    auth = handler.headers.get("Authorization", "")
+    with STATE.lock:
+        known = auth[7:] in STATE.cg["access"] if auth.startswith("Bearer ") else False
+    if not known:
+        return "invalid or revoked access token"
+    if handler.headers.get("chatgpt-account-id") != CG_ACCOUNT:
+        return "the account's id is missing"
+    return None
+
+
+def cg_post(handler, path, raw, prefix):
+    """POST /chatgpt/...: the token endpoint, or a model call."""
+    if path == "/chatgpt/oauth/token":
+        form = dict(urllib.parse.parse_qsl(raw.decode()))
+        cg_log({"_oauth": path, **form})
+        if form.get("client_id") != CG_CLIENT or "resource" in form:
+            handler.send_json(400, {"error": "invalid_client"})
+        elif form.get("grant_type") == "authorization_code":
+            with STATE.lock:
+                c = STATE.cg["codes"].pop(form.get("code"), None)
+            v = form.get("code_verifier", "").encode()
+            want = base64.urlsafe_b64encode(hashlib.sha256(v).digest()).rstrip(b"=").decode()
+            if not c or c["redirect"] != form.get("redirect_uri") or want != c["challenge"]:
+                handler.send_json(400, {"error": "invalid_grant"})
+                return
+            handler.send_json(200, cg_tokens())
+        elif form.get("grant_type") == "refresh_token":
+            with STATE.lock:
+                known = form.get("refresh_token") in STATE.cg["refresh"]
+                STATE.cg["refresh"].discard(form.get("refresh_token"))  # rotated
+            if not known:
+                handler.send_json(401, {"error": {"code": "refresh_token_expired",
+                                                  "message": "sign in again"}})
+                return
+            t = cg_tokens()
+            del t["id_token"]  # as a refresh may leave it out
+            handler.send_json(200, t)
+        else:
+            handler.send_json(400, {"error": "unsupported_grant_type"})
+    elif path == "/chatgpt/backend-api/codex/responses":
+        why = cg_authorized(handler)
+        try:
+            model = json.loads(raw).get("model", "")
+        except (ValueError, AttributeError):
+            model = ""
+        cg_log({"_call": path, "auth": why, "model": model})
+        if why:
+            handler.send_json(401, {"error": {"message": why, "type": "invalid_request_error"}})
+            return
+        rs_handle(handler, prefix, raw)
+    else:
+        handler.send_json(404, {"error": {"message": "not found"}})
+
+
+def cg_revoke(access=None, refresh=None):
+    """The backend forgets an access token, or the issuer a refresh
+    token, as after a sign-out elsewhere."""
+    with STATE.lock:
+        STATE.cg["access"].discard(access)
+        STATE.cg["refresh"].discard(refresh)
+
+
+def sc_cg_limit(model, n, req):
+    """ChatGPT's usage limit, which resets in 2 h 5 min."""
+    yield S.error(429, {"error": {
+        "type": "usage_limit_reached", "message": "The usage limit has been reached",
+        "plan_type": "plus", "resets_in_seconds": 7500}})
+
+
+sc_cg_signin = sc_plain
+sc_cg_refresh = sc_plain
+sc_cg_refused = sc_plain
+
+
+# GitHub Copilot: GitHub's device flow (its sign-in at /copilot-gh, as
+# github.com and api.github.com both, which PROSPERO_TEST_COPILOT_AUTH
+# names) and Copilot's API at /copilot, which takes only the tokens the
+# flow gave. Tokens issued to CP_UNLICENSED's client belong to an
+# account with no Copilot. The listing gives each registered model the
+# endpoints its id's suffix says: +msg Messages, +rs Responses, +guess
+# none (the name decides), +off turned off by policy, else Chat
+# Completions.
+
+CP_CLIENT = "Ov23lion1hTLsXGBOJAZ"
+CP_OTHER = "other-client"
+CP_UNLICENSED = "unlicensed-client"
+
+
+def cp_log(entry):
+    with STATE.lock:
+        STATE.cp["log"].append(entry)
+
+
+def cp_token(handler):
+    """The client a request's token was issued to, or None."""
+    auth = handler.headers.get("Authorization", "")
+    with STATE.lock:
+        return STATE.cp["tokens"].get(auth[7:]) if auth.startswith("Bearer ") else None
+
+
+def cp_get(handler, url, path):
+    q = dict(urllib.parse.parse_qsl(url.query))
+    if path == "/copilot-gh/login/device":
+        # The page where the code is entered: entering it approves it
+        with STATE.lock:
+            STATE.cp["approved"].add(q.get("user_code", ""))
+        cp_log({"_entered": q.get("user_code", "")})
+        handler.send_json(200, {"ok": True})
+    elif path == "/copilot-gh/copilot_internal/user":
+        client = cp_token(handler)
+        cp_log({"_user": client, "version": handler.headers.get("X-GitHub-Api-Version")})
+        if not client:
+            handler.send_json(401, {"message": "Bad credentials"})
+        elif client == CP_UNLICENSED:
+            handler.send_json(200, {"login": "me", "chat_enabled": False,
+                                    "can_signup_for_limited": True})
+        else:
+            handler.send_json(200, {"login": "me", "copilot_plan": "individual",
+                                    "chat_enabled": True,
+                                    "endpoints": {"api": "https://api.example.invalid"}})
+    elif path == "/copilot/models":
+        client = cp_token(handler)
+        cp_log({"_models": client, "headers": dict(handler.headers.items())})
+        if not client:
+            handler.send_json(401, {"error": {"message": "unauthorized"}})
+            return
+        data = []
+        for m in models()["data"]:
+            mid = m["id"]
+            entry = {"id": mid, "name": mid, "version": mid, "object": "model",
+                     "model_picker_enabled": True,
+                     "capabilities": {"family": "fake", "limits": {
+                         "max_context_window_tokens": 128000, "max_prompt_tokens": 60000,
+                         "max_output_tokens": 4000}, "supports": {"tool_calls": True}}}
+            if mid.endswith("+msg"):
+                entry["supported_endpoints"] = ["/v1/messages", "/chat/completions"]
+            elif mid.endswith("+rs"):
+                entry["supported_endpoints"] = ["/responses", "/chat/completions"]
+            elif mid.endswith("+off"):
+                entry["policy"] = {"state": "disabled"}
+            elif not mid.endswith("+guess"):
+                entry["supported_endpoints"] = ["/chat/completions"]
+            data.append(entry)
+        handler.send_json(200, {"data": data, "object": "list"})
+    else:
+        handler.send_json(404, {"error": {"message": "not found"}})
+
+
+def cp_post(handler, path, raw):
+    """POST /copilot-gh/...: the device flow; else None, a model call at
+    /copilot/ checked and logged, with the path it is served as."""
+    try:
+        body = json.loads(raw) if raw else {}
+    except ValueError:
+        body = {}
+    if path == "/copilot-gh/login/device/code":
+        if body.get("client_id") not in (CP_CLIENT, CP_OTHER, CP_UNLICENSED):
+            cp_log({"_device": path, **body})
+            handler.send_json(400, {"error": "unauthorized_client"})
+            return None
+        with STATE.lock:
+            STATE.cp["n"] += 1
+            n = STATE.cp["n"]
+            STATE.cp["devices"][f"dc-{n}"] = {"code": f"FAKE-{n:04d}",
+                                              "client": body["client_id"], "polls": 0}
+        cp_log({"_device": path, "device_code": f"dc-{n}", **body})
+        host = handler.headers.get("Host", "127.0.0.1")
+        handler.send_json(200, {"device_code": f"dc-{n}", "user_code": f"FAKE-{n:04d}",
+                                "verification_uri": f"http://{host}/copilot-gh/login/device",
+                                "interval": 0, "expires_in": 900})
+        return None
+    if path == "/copilot-gh/login/oauth/access_token":
+        cp_log({"_poll": path, **body})
+        with STATE.lock:
+            d = STATE.cp["devices"].get(body.get("device_code"))
+            if d:
+                d["polls"] += 1
+        if (not d or body.get("client_id") != d["client"] or
+                body.get("grant_type") != "urn:ietf:params:oauth:grant-type:device_code"):
+            handler.send_json(200, {"error": "bad_verification_code"})
+        elif d["polls"] == 1:
+            handler.send_json(200, {"error": "slow_down", "interval": 1})
+        elif d["code"] not in STATE.cp["approved"]:
+            handler.send_json(200, {"error": "authorization_pending"})
+        else:
+            tok = f"gho_{body['device_code']}"
+            with STATE.lock:
+                STATE.cp["tokens"][tok] = d["client"]
+            handler.send_json(200, {"access_token": tok, "token_type": "bearer",
+                                    "scope": "read:user"})
+        return None
+    client = cp_token(handler)
+    serve = path[len("/copilot"):]
+    model = body.get("model", "") if isinstance(body, dict) else ""
+    cp_log({"_call": serve, "client": client, "model": model,
+            "headers": {k.lower(): v for k, v in handler.headers.items()}})
+    if not client:
+        handler.send_json(401, {"error": {"message": "unauthorized"}})
+        return None
+    if serve not in ("/chat/completions", "/responses", "/v1/messages"):
+        handler.send_json(404, {"error": {"message": "not found"}})
+        return None
+    return serve
+
+
+def cp_revoke(token):
+    with STATE.lock:
+        STATE.cp["tokens"].pop(token, None)
+
+
+sc_cp_signin = sc_plain
+sc_cp_unlicensed = sc_plain
+sc_cp_clientid = sc_plain
+sc_cp_wire = sc_read_edit_shell
+sc_cp_wire_an = sc_an_tools
+sc_rs_compaction = sc_compaction
+
+
+def sc_rs_reasoning(model, n, req):
+    # Reasoning and a call, then reasoning and the answer: the first
+    # reasoning must come back with its encrypted content (rs_check)
+    yield S.head()
+    if n == 0:
+        yield from think(model, "Plan: read it.", 2)
+        yield from call(model, 0, "call_r0", "read", {"path": "hello.txt"}, 2)
+        yield from finish(model, "tool_calls")
+    else:
+        yield from think(model, "It says hello.")
+        yield from text(model, "It says hello.", 2)
+        yield from finish(model)
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 
@@ -5058,7 +6301,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url, path, prefix = self.route()
         q = urllib.parse.parse_qs(url.query)
-        if path in ("/v1/models", "/models") and self.headers.get("anthropic-version"):
+        if path.startswith("/copilot-gh/") or path.startswith("/copilot/"):
+            cp_get(self, url, path)
+            return
+        if path.startswith("/chatgpt/"):
+            cg_get(self, url, path)
+        elif path in ("/v1/models", "/models") and self.headers.get("anthropic-version"):
             with STATE.lock:
                 STATE.listings.append({"query": url.query,
                                        "version": self.headers.get("anthropic-version"),
@@ -5129,7 +6377,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # The web tools: pages at /web/HOST/NONCE/NAME, where
     # PROSPERO_TEST_WEB sends https://HOST/..., Exa's endpoint at
-    # /web/mcp.exa.ai/mcp, and SearXNG at /searxng/search
+    # /web/mcp.exa.ai/mcp, Keenable's at /web/api.keenable.ai/v1/search
+    # and .../search/public, and SearXNG at /searxng/search
 
     def send_bytes(self, status, ctype, data, headers=None):
         self.send_response(status)
@@ -5153,6 +6402,9 @@ class Handler(BaseHTTPRequestHandler):
             self.searxng(q.get("q", [""])[0], q)
         elif url.path == "/web/mcp.exa.ai/mcp":
             self.exa(raw)
+        elif url.path in ("/web/api.keenable.ai/v1/search",
+                          "/web/api.keenable.ai/v1/search/public"):
+            self.keenable(url.path, raw)
         else:
             self.webpage(url.path)
 
@@ -5197,6 +6449,46 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_json(200, reply)
 
+    def keenable(self, path, raw):
+        # Keyless needs X-Keenable-Title, keyed an X-API-Key; a "busy"
+        # query is refused the first time, a "refused" one always
+        try:
+            body = json.loads(raw)
+            query = body["query"]
+        except (ValueError, KeyError, TypeError):
+            self.send_json(400, {"error": "Bad request", "message": "query is required"})
+            return
+        if path.endswith("/public") and not self.headers.get("X-Keenable-Title"):
+            self.send_json(400, {"error": "Missing app identifier",
+                                 "message": "X-Keenable-Title header is required "
+                                            "for token-less requests"})
+            return
+        if not path.endswith("/public") and not self.headers.get("X-API-Key"):
+            self.send_json(401, {"error": "Authentication failed",
+                                 "message": "Missing API key"})
+            return
+        words = query.split()
+        nonce = words[-1] if words else ""
+        with STATE.lock:
+            tries = sum(1 for w in STATE.web if w["body"] == raw.decode("utf-8", "replace"))
+        if "refused" in words:
+            self.send_json(403, {"error": "Forbidden", "message": "Query blocked\nby policy"})
+            return
+        if "busy" in words and tries == 1:
+            self.send_json(429, {"error": "Too many requests",
+                                 "message": "Rate limit exceeded"})
+            return
+        n = int(body.get("max_results", 10))
+        results = [
+            {"title": "Widget docs", "url": f"https://docs.example.com/{nonce}/page",
+             "description": "", "snippet": "Widgets turn at **42 rpm**.\n\nMore.",
+             "published_at": "2026-10-20T00:00:00Z", "acquired_at": "2026-11-01T00:00:00Z"},
+            {"title": "Widget forum", "url": f"https://forum.example.org/{nonce}/next",
+             "description": "Someone asked about widgets.", "snippet": "",
+             "published_at": None, "acquired_at": "2026-11-01T00:00:00Z"},
+        ]
+        self.send_json(200, {"query": query, "mode": "pro", "results": results[:n]})
+
     WEB_HTML = (
         "<!doctype html><html><head><title>Widget &amp; docs</title>"
         "<script>var SCRIPTED = 'SCRIPT-TEXT';</script>"
@@ -5239,6 +6531,36 @@ class Handler(BaseHTTPRequestHandler):
                             {"Location": f"https://{host}/{nonce}/loop"})
         elif name == "pdf":
             self.send_bytes(200, "application/pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        elif name == "report.pdf":
+            self.send_bytes(200, "application/pdf", mkpdfpages(
+                [(["Widget report", "Widgets turn at 42 rpm."], ["Im1"]),
+                 (["Second page: the totals."], [])],
+                {"Im1": pdfrgb(100, 50, (200, 30, 30))}, title="Widget report"))
+        elif name == "dump":
+            # Known by its first bytes, and past any cap a PDF gets: read
+            # from its first page
+            self.send_bytes(200, "application/octet-stream", mkpdfpages(
+                [(["Before the cut."], []), (["After the cut."], [])],
+                title="Dump", pad=33 << 20))
+        elif name == "locked.pdf":
+            self.send_bytes(200, "application/pdf", mkpdf(1, encrypt=True).encode())
+        elif name == "htmlpdf":
+            # A login page sent as the PDF asked for
+            self.send_bytes(200, "application/pdf",
+                            b"<!doctype html><html><head><title>Sign in</title></head>"
+                            b"<body><p>Sign in to read the report.</p></body></html>")
+        elif name == "mention":
+            self.send_bytes(200, "application/octet-stream",
+                            b"Every PDF begins with %PDF-1.7 and a comment.\n")
+        elif name == "mid.pdf":
+            # Past a page's cap, within a PDF's
+            self.send_bytes(200, "application/pdf", mkpdfpages(
+                [(["Before the pad."], []), (["After the pad."], [])], pad=7 << 20))
+        elif name == "blank.pdf":
+            self.send_bytes(200, "application/pdf", mkpdfpages([([], []), ([], [])]))
+        elif name == "scan.pdf":
+            self.send_bytes(200, "application/pdf", mkpdfpages(
+                [([], ["S"]), ([], ["S"])], {"S": pdfrgb(60, 80, (240, 240, 240))}))
         elif name == "challenge":
             self.send_bytes(403, "text/html", b"<p>Just a moment...</p>",
                             {"cf-mitigated": "challenge"})
@@ -5320,6 +6642,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url, path, prefix = self.route()
         raw = self.body()
+        copilot = path.startswith("/copilot/")
+        if path.startswith("/copilot-gh/") or copilot:
+            path = cp_post(self, path, raw)
+            if not path:
+                return
+            if path == "/v1/messages":
+                self.messages(prefix, raw, copilot=True)
+                return
         if path.endswith("/chat/completions"):
             # By model: scenarios running meanwhile send theirs too
             try:
@@ -5339,6 +6669,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/messages":
             self.messages(prefix, raw)
+            return
+        if path.startswith("/chatgpt/"):
+            cg_post(self, path, raw, prefix)
+            return
+        if path in ("/v1/responses", "/responses"):
+            rs_handle(self, prefix, raw, rotate=copilot)
             return
         if path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_json(404, {"error": {"message": "not found"}})
@@ -5367,12 +6703,13 @@ class Handler(BaseHTTPRequestHandler):
             STATE.end(prefix, model)
             STATE.finished(key, n)
 
-    def messages(self, prefix, raw):
-        """Anthropic's Messages API, checked as the API would."""
+    def messages(self, prefix, raw, copilot=False):
+        """Anthropic's Messages API, checked as the API would (Copilot's
+        has checked its own token)."""
         def fail(status, kind, message):
             self.send_json(status, {"type": "error", "error": {
                 "type": kind, "message": message}})
-        if self.headers.get("x-api-key") != AN_KEY:
+        if not copilot and self.headers.get("x-api-key") != AN_KEY:
             fail(401, "authentication_error", "invalid x-api-key")
             return
         if self.headers.get("anthropic-version") != AN_VERSION:

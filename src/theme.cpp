@@ -50,6 +50,8 @@ struct Palette {
     u32 btn;        // buttons: at rest, under the mouse, pressed
     u32 btnhover;
     u32 btnpress;
+    u32 btnon;      // a toggle that is on, and it under the mouse: a toggle
+    u32 btnonhover; // that is off has no fill, so on stands out from it
     u32 bar;        // progress bars, under paneltext
     // ImGui's accents, the stock style's where 0: the focused window's
     // title bar and selected tab, under paneltext; and checks, sliders,
@@ -81,6 +83,11 @@ struct Palette {
     u32 amber;      // waiting, asking, stalled
     u32 active;     // running, streaming
     u32 stale;      // the metrics overlay's alarm
+    // The terminal's (term.cpp): its 16 colors, text, background, cursor
+    u32 ansi[16];
+    u32 termfg;
+    u32 termbg;
+    u32 termcursor;
 };
 
 static constexpr u32 rgb(i32 r, i32 g, i32 b)
@@ -101,6 +108,8 @@ static Palette themedark = {
     .btn       = rgb( 36,  69, 110),
     .btnhover  = rgb( 46,  88, 140),
     .btnpress  = rgb( 30,  62, 104),
+    .btnon     = rgb( 24,  98, 184),
+    .btnonhover= rgb( 36, 112, 204),
     .bar       = rgb( 52,  96, 170),
     .text      = rgb(222, 222, 222),
     .dim       = rgb(160, 170, 190),
@@ -138,6 +147,15 @@ static Palette themedark = {
     .amber     = rgb(235, 180,  80),
     .active    = rgb(110, 170, 240),
     .stale     = rgb(255, 102,  77),
+    .ansi = {
+        rgb( 40,  42,  46), rgb(205,  49,  49), rgb( 13, 188, 121), rgb(229, 229,  16),
+        rgb( 36, 114, 200), rgb(188,  63, 188), rgb( 17, 168, 205), rgb(204, 204, 204),
+        rgb(102, 102, 102), rgb(241,  76,  76), rgb( 35, 209, 139), rgb(245, 245,  67),
+        rgb( 59, 142, 234), rgb(214, 112, 214), rgb( 41, 184, 219), rgb(229, 229, 229),
+    },
+    .termfg     = rgb(222, 222, 222),
+    .termbg     = rgb( 15,  15,  16),
+    .termcursor = rgb(230, 230, 230),
 };
 
 static Palette themelight = {
@@ -153,6 +171,8 @@ static Palette themelight = {
     .btn       = rgb(176, 206, 244),
     .btnhover  = rgb(150, 190, 244),
     .btnpress  = rgb(124, 172, 236),
+    .btnon     = rgb(100, 160, 240),
+    .btnonhover= rgb( 84, 144, 228),
     .bar       = rgb(150, 190, 240),
     .text      = rgb( 32,  33,  36),
     .dim       = rgb( 80,  88, 100),
@@ -190,6 +210,15 @@ static Palette themelight = {
     .amber     = rgb(125,  78,   0),
     .active    = rgb(  0,  80, 176),
     .stale     = rgb(180,  40,  20),
+    .ansi = {
+        rgb(  0,   0,   0), rgb(205,  49,  49), rgb(  0, 138,   0), rgb(128, 118,   0),
+        rgb(  4,  81, 165), rgb(188,   5, 188), rgb(  5, 132, 168), rgb( 85,  85,  85),
+        rgb(102, 102, 102), rgb(205,  49,  49), rgb( 20, 160,  20), rgb(150, 140,   0),
+        rgb(  4,  81, 165), rgb(188,   5, 188), rgb(  5, 152, 188), rgb(165, 165, 165),
+    },
+    .termfg     = rgb( 32,  33,  36),
+    .termbg     = rgb(255, 255, 255),
+    .termcursor = rgb( 32,  33,  36),
 };
 
 // Gruvbox's dark palette at hard contrast (github.com/morhetz/gruvbox):
@@ -216,6 +245,8 @@ static Palette themegruvbox = {
     .btn       = rgb( 80,  73,  69),  // bg2
     .btnhover  = rgb(102,  92,  84),  // bg3
     .btnpress  = rgb( 60,  56,  54),  // bg1
+    .btnon     = rgb(  7, 102, 120),  // faded blue
+    .btnonhover= rgb(  5,  90, 106),  // faded blue, darker
     .bar       = rgb(  7, 102, 120),  // faded blue
     .title     = rgb( 80,  73,  69),  // bg2
     .accent    = rgb(250, 189,  47),  // yellow
@@ -255,6 +286,15 @@ static Palette themegruvbox = {
     .amber     = rgb(250, 189,  47),  // yellow
     .active    = rgb(136, 169, 156),  // blue, lightened
     .stale     = rgb(254, 128,  25),  // orange
+    .ansi = {
+        rgb( 40,  40,  40), rgb(204,  36,  29), rgb(152, 151,  26), rgb(215, 153,  33),
+        rgb( 69, 133, 136), rgb(177,  98, 134), rgb(104, 157, 106), rgb(168, 153, 132),
+        rgb(146, 131, 116), rgb(251,  73,  52), rgb(184, 187,  38), rgb(250, 189,  47),
+        rgb(131, 165, 152), rgb(211, 134, 155), rgb(142, 192, 124), rgb(235, 219, 178),
+    },
+    .termfg     = rgb(235, 219, 178),  // fg1
+    .termbg     = rgb( 29,  32,  33),  // bg0_h
+    .termcursor = rgb(235, 219, 178),  // fg1
 };
 
 // The setting's value from its name, or -1 if it names none.

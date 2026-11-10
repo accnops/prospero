@@ -17,7 +17,7 @@ there for the full list. Changes take effect while Prospero runs.
 The Settings pane ([View → Settings](view:settings), or Ctrl+, and
 Cmd+, on macOS) edits the file in place, a page for each section,
 changing only the lines it sets and keeping your comments. The model
-and shell lists above the transcript end with Endpoints and models...
+and shell lists on the Prompt's status line end with Endpoints and models...
 and Shells..., which show their pages. Its top line says which file it edits.
 [Diagnostics](settings:diagnostics), at the end of its list, shows each
 problem found in the files, with where it is; a bad value falls back to
@@ -97,6 +97,47 @@ directory's `approvals.json`. Bypass mode does not approve them.
 
 A url from a local include, or from your own file, needs no approval.
 
+## Signing in with ChatGPT
+
+A ChatGPT subscription can run Prospero's sessions, billed to the plan
+rather than by the token. In Settings, at Endpoints, choose Add
+endpoint..., name it, and pick **chatgpt: ChatGPT, signed in to your
+account**: its URL is filled in. On its page, **Sign in** opens the
+browser at ChatGPT's sign-in; once you sign in there, the browser comes
+back to Prospero, and the page says who is signed in and on which plan.
+Then pick its models, such as `gpt-5-codex`, as any others.
+
+The browser returns to this computer at `localhost:1455` (else 1457),
+as for OpenAI's Codex CLI, so sign in on the computer that runs the
+engine; `prospero endpoint auth NAME` does the same from a terminal.
+The tokens are kept in the state directory, readable only by you, and
+refreshed as they expire. **Sign out** forgets them. A remote host that
+relays its model calls through this computer uses this sign-in, and
+needs none of its own. When the plan's usage limit is reached, the turn
+ends saying when it resets.
+
+`kind = responses` is the same API with an OpenAI API key instead,
+billed by the token.
+
+## Signing in with GitHub Copilot
+
+A GitHub Copilot plan, Copilot Free included, can run sessions too.
+Add an endpoint and pick **copilot: GitHub Copilot, signed in to your
+account**. On its page, **Sign in** shows a code and opens GitHub's
+page, where you enter it and authorize Prospero; the page then says who
+is signed in and on which plan. The code can be entered in a browser on
+any computer, and `prospero endpoint auth NAME` prints it in a
+terminal, so this works for an engine over ssh as well.
+
+GitHub gives each app its own models, and Prospero's own app gets only
+the older ones, such as `gpt-4o`, `gpt-4o-mini` and `gpt-4.1`, not the
+newer models your plan offers on github.com. The endpoint's
+`client_id` setting signs in as another OAuth app instead, at your own
+risk, and `integration_id` names the product the requests are for (the
+`Copilot-Integration-Id` header), when Copilot says a model "is not
+available for integrator". If the account has no Copilot, the sign-in
+fails with a link to sign up for Copilot Free.
+
 ## Settings worth knowing
 
 - **API keys** never go in the file: `key = env:NAME` reads one from
@@ -141,7 +182,7 @@ A url from a local include, or from your own file, needs no approval.
   gets HOME as w64devkit's own window sets it, `%USERPROFILE%`, when
   Prospero has none, as when started from the Start menu (a home set
   in `w64devkit.ini` needs `env.HOME`). `env.NAME` sets a variable for
-  its commands, and Open in terminal's (a value, or `env:VAR` from
+  its commands, and Open in external terminal's (a value, or `env:VAR` from
   Prospero's own environment). `path_prepend` and
   `path_append` add directories around `[tools]`'s, and `description`
   tells the agent what the shell is for:
@@ -184,7 +225,7 @@ A url from a local include, or from your own file, needs no approval.
   else on macOS the default text editor, which you then quit. Started
   from the Finder or a desktop menu, Prospero has no `$VISUAL` or
   `$EDITOR`: set this, with a full path if need be.
-- **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in terminal opens: on
+- **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in external terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its
   folder and command Prospero knows; another gets `-e`.
@@ -198,6 +239,9 @@ A url from a local include, or from your own file, needs no approval.
   notifications are off or unavailable, the window asks for attention
   instead (a flashing taskbar button, a bouncing Dock icon). On macOS
   only Prospero.app can show them, after you allow it once.
+- **[`[ui] mentions`](settings:ui#mentions)**: `false` turns off the
+  `@` picker of files, folders and sessions in the compose box, leaving
+  `@` as plain text. On by default.
 - **[`[ui] font_size`](settings:ui#font_size)**: the text's size in
   pixels, 8 to 40 (17 by default). The View menu's zoom scales it until Prospero exits.
 - **[`[ui] theme`](settings:ui#theme)**: `system`, `dark`, `light` or

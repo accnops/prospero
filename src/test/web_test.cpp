@@ -207,6 +207,28 @@ static void testwebredirect(Test *t)
     expect(t, "webredirect.addwww", istr(&a, r.kind), istr(&a, WEBR_FOLLOW));
 }
 
+static void testwebpdfnote(Test *t)
+{
+    Arena a = t->perm;
+    static struct { Str text; b32 cut; Str why; Str want; } cases[] = {
+        {"--- page 1 ---\nHello\n", 0, {}, "--- page 1 ---\nHello\n"},
+        {"--- page 1 ---\nHello\n", 1, {},
+         "--- page 1 ---\nHello\n\n"
+         "[The PDF was cut at 32 MiB; only the text before that could be read.]\n"},
+        {"--- page 1 ---\nHello", 1, "out of memory",
+         "--- page 1 ---\nHello\n\n"
+         "[The PDF was cut at 32 MiB; only the text before that could be read.]\n"},
+        {"--- page 1 ---\nHello\n", 0, "too much work",
+         "--- page 1 ---\nHello\n\n"
+         "[Only part of the PDF could be read: too much work.]\n"},
+        {"", 1, {}, "[The PDF was cut at 32 MiB; only the text before that could be read.]\n"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Str got = webpdfnote(&a, cases[i].text, cases[i].cut, 32<<20, cases[i].why);
+        expect(t, concat(&a, "webpdfnote ", istr(&a, i)), got, cases[i].want);
+    }
+}
+
 static void testwebkind(Test *t)
 {
     Arena a = t->perm;
@@ -223,8 +245,16 @@ static void testwebkind(Test *t)
         {"application/atom+xml", "", WEBK_TEXT},
         {"application/javascript", "", WEBK_TEXT},
         {"application/x-ndjson", "", WEBK_TEXT},
-        {"application/pdf", "%PDF", WEBK_BINARY},
-        {"image/png", "", WEBK_BINARY},
+        {"application/pdf", "%PDF", WEBK_PDF},
+        {"Application/PDF; qs=1", "", WEBK_PDF},
+        {"application/x-pdf", "junk", WEBK_PDF},
+        {"application/octet-stream", "%PDF-1.7\n%\xe2\xe3", WEBK_PDF},
+        {"", "\r\n%PDF-1.4\n", WEBK_PDF},
+        {"", {(u8 *)"\0\0%PDF-1.4", 11}, WEBK_PDF},  // before the NUL check
+        {"", "<html>%PDF-1.4", WEBK_HTML},
+        {"", "%PDF", WEBK_TEXT},
+        {"text/plain", "%PDF-1.4", WEBK_TEXT},
+        {"image/png", "%PDF-1.4", WEBK_BINARY},
         {"application/octet-stream", "text", WEBK_BINARY},
         {"application/+json", "", WEBK_BINARY},
         {"", "\xef\xbb\xbf \n<!DOCTYPE HTML><p>", WEBK_HTML},
@@ -239,6 +269,19 @@ static void testwebkind(Test *t)
         name = concat(&a, name, istr(&a, i));
         expect(t, name, istr(&a, webkind(cases[i].ctype, cases[i].body)),
                istr(&a, cases[i].want));
+    }
+
+    // "%PDF-" past the first KiB is not looked for
+    {
+        Buf b(&a, 2048);
+        for (i32 i = 0; i < 1020; i++) {
+            putbyte(&b, ' ');
+        }
+        print(&b, "%PDF-1.4");
+        Str body = finish(&b);
+        expect(t, "webkind late", istr(&a, webkind("", body)), istr(&a, WEBK_TEXT));
+        body = cuthead(body, 1);
+        expect(t, "webkind early", istr(&a, webkind("", body)), istr(&a, WEBK_PDF));
     }
 
     static struct { Str ctype, body; b32 html; Str want; } utf8s[] = {
@@ -577,6 +620,52 @@ static void testwebexa(Test *t)
     expect(t, "webexa.garbage", webshow(h.err), "Exa sent no JSON-RPC reply");
 }
 
+static void testwebkeenable(Test *t)
+{
+    Arena a = t->perm;
+
+    expect(t, "webkeenablebody", webkeenablebody(&a, "rust \"async\"", 8),
+        "{\"query\":\"rust \\\"async\\\"\",\"max_results\":8}");
+
+    Str json =
+        "{\"query\":\"q\",\"mode\":\"pro\",\"results\":["
+        "{\"title\":\"Async  Rust\",\"url\":\"https://rust-lang.github.io/async-book/\","
+        "\"description\":\"\",\"snippet\":\"Async\\nprogramming in **Rust**.\","
+        "\"published_at\":\"2024-01-02T00:00:00Z\",\"acquired_at\":\"2026-10-20T00:00:00Z\"},"
+        "{\"title\":\"Tokio\",\"url\":\"https://tokio.rs/\","
+        "\"description\":\"An async runtime.\",\"snippet\":\" \"},"
+        "{\"title\":\"Again\",\"url\":\"https://tokio.rs/\",\"snippet\":\"dup\"},"
+        "{\"title\":\"No URL\",\"snippet\":\"none\"},"
+        "{\"title\":\"Local\",\"url\":\"javascript:alert(1)\",\"snippet\":\"bad\"}"
+        "]}";
+    WebHits h = webkeenable(&a, json, 10);
+    expect(t, "webkeenable.hits", webshowhits(&a, &h),
+        "Async Rust|https://rust-lang.github.io/async-book/|"
+        "2024-01-02T00:00:00Z|Async programming in **Rust**.\n"
+        "Tokio|https://tokio.rs/||An async runtime.");
+    expect(t, "webkeenable.err", webshow(h.err), "(null)");
+
+    h = webkeenable(&a, json, 1);
+    expect(t, "webkeenable.max", istr(&a, h.hits.len), "1");
+
+    h = webkeenable(&a, "{\"query\":\"q\",\"results\":[]}", 10);
+    expect(t, "webkeenable.none", istr(&a, h.hits.len), "0");
+    expect(t, "webkeenable.none.err", webshow(h.err), "(null)");
+
+    h = webkeenable(&a, "<html>502</html>", 10);
+    expect(t, "webkeenable.garbage", webshow(h.err), "Keenable sent no JSON results");
+    h = webkeenable(&a, "{\"error\":\"Rate limited\"}", 10);
+    expect(t, "webkeenable.noresults", webshow(h.err), "Keenable sent no JSON results");
+
+    expect(t, "webkeenableerr.message", webshow(webkeenableerr(&a,
+        "{\"error\":\"Authentication failed\",\"message\":\"Malformed\\n API key\"}")),
+        "Malformed API key");
+    expect(t, "webkeenableerr.error", webshow(webkeenableerr(&a,
+        "{\"error\":\"Too many requests\"}")), "Too many requests");
+    expect(t, "webkeenableerr.garbage", webshow(webkeenableerr(&a, "<h1>502</h1>")),
+        "(null)");
+}
+
 static void testwebanthropic(Test *t)
 {
     Arena a = t->perm;
@@ -865,10 +954,12 @@ static void test_web(Test *t)
     testweburls(t);
     testwebredirect(t);
     testwebkind(t);
+    testwebpdfnote(t);
     testwebclean(t);
     testwebhtml(t);
     testwebsearxng(t);
     testwebexa(t);
+    testwebkeenable(t);
     testwebanthropic(t);
     testwebtext(t);
 }

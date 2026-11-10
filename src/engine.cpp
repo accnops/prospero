@@ -69,11 +69,11 @@
 // frontend that can answer has it open, which the frontend declares with
 // attended:1 on new or open (and close ends). Unattended, an ask is
 // denied at once by policy. Attended, the session logs an ask with a
-// deadline ([guard] ask_timeout, 30 s by default) and waits in its own state,
-// blocking nothing else: an answer resolves it, the deadline denies it,
-// and so does a steer, whose text the agent reads next (as does any ask
-// while a steer waits for the next step), though not the agent's
-// questions (ask_user), which a steer waits behind. Every denial is the
+// deadline ([guard] ask_timeout, 60 s by default, 0 for none) and waits in its own state,
+// blocking nothing else: an answer resolves it, the deadline denies it.
+// A steer never answers one: it waits behind the ask, to be read at the
+// next step with the ask's outcome (the user may not have seen the ask
+// when writing it). Stop cancels the turn and its ask. Every denial is the
 // call's tool result, explaining what to do instead. A path's ask offers to
 // allow its directory for good ("always"), and a desktop ask its class
 // of actions, which the answer may take (see "Grants"). The log holds
@@ -137,6 +137,7 @@ enum : i64 {
     FARREPORT_MAX = 512 << 10,    // bytes of a task.report's text
     MSG_TURN     = 20,            // send_message calls a turn
     SESS_SHOWN   = 50,            // unrelated sessions the sessions tool lists
+    MENTION_SESSIONS = 16,        // sessions a message may mention
     // Images attached to a message (upload, prompt)
     ATTACH_MAX    = 10,           // a message's
     ATTACH_BYTES  = 5 << 20,      // its base64, as the APIs take it
@@ -160,11 +161,12 @@ enum : i32 {
     S_MCP,       // waiting for MCP servers to start, before a request
     S_WORKTREE,  // waiting for git to make its worktree, before a turn
     S_RELAY,     // waiting for a computer to relay its model calls
+    S_AUTH,      // waiting for its endpoint's sign-in to be refreshed
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "mcp", "worktree", "relay",
+    "ask", "queued", "task", "mcp", "worktree", "relay", "auth",
 };
 
 enum : i32 {
@@ -336,6 +338,9 @@ struct Job {
     b32   quiet;     // the agent stopped it: no notice
     b32   cut;       // processes it left held its output
     i64   ran;       // ticks it ran, once done
+    i64   turn;      // the session's turn it began in
+    i64   seen;      // its output's size at the agent's last job_output,
+                     // or -1: polling, if no larger at the next
 };
 
 // The original of a file the harness changed, kept as snap/<n> in the
@@ -366,6 +371,12 @@ struct InstrStamp {
     Str path;
     i64 size;
     i64 mtime;
+    // As the system prompt has it (psize, pmtime), or loaded after it,
+    // for the files under a directory (under): what a summary may lose
+    b32 prompt;
+    i64 psize;
+    i64 pmtime;
+    Str under;
 };
 
 // A task call and its subagent, while the calls of its response run.
@@ -408,6 +419,10 @@ struct Endpoint {
     i64 progress;
     i32 connectms;
     i32 kind;       // EP_*
+    i32 wire;       // the format of its requests, EP_*: its kind's, but
+                    // a copilot endpoint's model's own (discovered)
+    Str api;        // a copilot endpoint's account's own API root, its
+                    // url being the kind's, else null
 };
 
 struct Engine;
@@ -506,6 +521,25 @@ struct WebSpill {
     Str ctype;
 };
 
+// A PDF read whose text was kept (readpdf), by its absolute path, while
+// its size and time are the same: a paged read takes the text from its
+// file and the images' places from here, and parses the PDF again only
+// to decode the images it shows.
+struct PdfMemo {
+    i64             size;
+    i64             mtime;
+    Str             txt;       // the text's file, absolute...
+    i64             txtlen;    // ...and its length
+    i32             pages;
+    i32             read;      // pages whose text was read
+    i32             status;    // PDFR_OK or PDFR_PARTIAL
+    b32             recovered;
+    i32             imgonly;   // pages with no text, only images
+    i32             blank;     // pages with neither
+    Slice<iz>       pageline;
+    Slice<PdfPlace> places;
+};
+
 // The user's answer about a task call's container, before it starts.
 struct TaskAsk {
     Str call;   // its id
@@ -540,7 +574,9 @@ struct Ask {
                         // trusts for good, or null
     Str       mcpurl;   // an MCP ask's server's url, by its SHA-256, or null
     b32       approve;  // credentials for urls of web includes (approving)
-    i64       deadline; // a question's, epoch ms, as the frontends have it
+    i64       deadline; // epoch ms, as the frontends have it, or 0
+    i64       delay;    // ticks: the deadline's, which a touch starts over
+    b32       held;     // the user chose to wait for it: no deadline (ask.hold)
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -559,12 +595,6 @@ struct Grant {
     Str image;  // a container image subagents may run in (the task tool's)
 };
 
-// An image converted for a request (topng).
-struct Converted {
-    Str png;  // null on failure
-    Str err;
-};
-
 // A summary compaction under way (REQ_COMPACT).
 struct Compact {
     Endpoint  ep;        // the compactor
@@ -579,6 +609,7 @@ struct Compact {
     i32       shrink;    // the summarizer rejected its input so often
     iz        inbytes;   // of the conversation in the last request
     iz        rejected;  // of the first one rejected, 0 if none
+    i64       toolong;   // tokens of a summary over COMPACT_SUMMAX, 0 if none
     i64       began;     // ticks
 };
 
@@ -589,6 +620,7 @@ struct Queued {
     i64             id;
     Slice<MsgImage> images;
     Slice<MsgFile>  files;
+    Slice<MsgSess>  sessions;
 };
 
 // A worktree session's worktree, as its session record has it, and its
@@ -609,6 +641,7 @@ struct WtSess {
 struct Prefill {
     i64 n;          // the last event's tokens processed, cached ones too
     i64 ms;         // and when, on the server's clock if it said, else ours
+    i64 n0, ms0;    // the first event's, from which the rate is taken
     b32 started;
     b32 server;     // ms is the server's time_ms
     i32 samples;
@@ -634,6 +667,8 @@ struct Session {
     Str          cwd;
     Slice<Str>   roots;     // extra workspace roots
     WtSess       wt;        // its worktree, if a worktree session's
+    Str          movedfrom; // the folder of the session it forked from into
+                            // this one's (fork {cwd}), else null
     b32          wtfresh;   // its worktree made since its guard was built
     b32          wtdefer;   // its worktree was missing as it opened: its
                             // instructions, memory and prefix wait for it
@@ -713,6 +748,9 @@ struct Session {
     i32          callimgw;   // to dir, and its size, and a screenshot's
     i32          callimgh;   // geometry (deskshotstr), for tool.end
     Str          callshot;
+    i32          callpages;  // callimage is a PDF read, of so many pages
+    Slice<MsgImage> callimages;  // in perm: its several images, if any
+                                 // (a PDF's), each a file under out/
     DeskRun      desk;       // the desktop helper
     WebRun      *web;        // the web call running, if one is
     Proc        *proc;
@@ -763,6 +801,10 @@ struct Session {
     u8           relayby[64];  // its name, for live
     i32          relaybylen;
     i32          relaylost;  // calls lost in a row before visible output
+    // A chatgpt endpoint's sign-in (epauth)
+    u64          authsent;   // the access token sent last, hashed
+    u64          authstale;  // the one refused (401), to be refreshed
+    b32          authretried;  // refreshed for a 401 this turn
     b32          relayq;     // waiting at the computer's endpoint, and
     i32          relayqpos;  // its place in line there
     i32          relayqlen;
@@ -800,10 +842,12 @@ struct Session {
     // Project memory (memory.cpp)
     Str          memdir;     // its directory, null if the session has none
     Str          memseen;    // MEMORY.md as the agent knows it
+    Str          memsys;     // and as its system prompt has it
     b32          memlog;     // the start record is still to log
     // Skills (skills.cpp)
     b32          skillson;   // its prefix lists skills: tell it of changes
     Slice<Skill> skillseen;  // what the agent knows of: name, description
+    Slice<Skill> skillsys;   // and what its system prompt lists
     Slice<Str>   skillwarned;  // skills left out, warned of already
     // Roles and subagents
     Str          role;       // the role's name, empty if none
@@ -854,6 +898,8 @@ struct Session {
     // The web (see "Web")
     Map<b32>    *webseen;    // URLs the agent was shown: web_fetch's
     Map<WebSpill> *webspill; // pages read, by URL, to read on
+    Map<PdfMemo> *pdfmemo;   // PDFs read, by absolute path (readpdf)
+    iz           pdfmemobytes;  // perm pdfmemo took, within PDF_MEMOBYTES
     i32          websearches;  // a tree's root's: the tree's searches
     Slice<Str>   callurls;   // a task call's report's URLs its subagent saw
 };
@@ -894,6 +940,8 @@ struct WtJob {
 
 // Engine functions take scratch by value, so that whatever a caller has
 // allocated in its own scratch stays intact below them.
+struct Terms;  // ptyhost.cpp
+
 struct Engine {
     Os         *os;
     Arena       perm;
@@ -904,6 +952,10 @@ struct Engine {
     Config     *cfg;
     Ini        *ini;      // cfg->ini, until the next reload
     Str         statedir;
+    Str         chatgptauth;  // ChatGPT's issuer (a test hook,
+                              // PROSPERO_TEST_CHATGPT_AUTH, replaces it)
+    Str         ghauth;   // GitHub's sign-in, and its API, for Copilot
+    Str         ghapi;    // (PROSPERO_TEST_COPILOT_AUTH replaces both)
     Str         exedir;
     Str         home;     // for "~" in paths
     Str         global;   // the user's own instruction file
@@ -936,6 +988,8 @@ struct Engine {
     u64         farserial;
     EHttp      *freehttp; // handles to reuse (ehttp)
     Relay      *relay;    // offers, relayed calls, and those served (relay.cpp)
+    Terms      *terms;    // terminals' shells (ptyhost.cpp)
+    b32         gui;      // the GUI's own engine, in its process
     Slice<Str>  distros;  // the WSL distros installed, as last listed
     Str         ctrname;  // the container runtime, docker or podman, for
     Str         ctrpath;  // subagents (hostlink.cpp): its program, and
@@ -1238,7 +1292,8 @@ static i64 estimate(Session *s)  // walks the history for images
            deskimagetokens(s) + attachtokens(s);
 }
 
-// Put images as the user record has them: [{name, mime, w, h}].
+// Put images as the user record has them: [{name, mime, w, h}], and a
+// tool result's with its label, if it has one.
 static void putimages(JsonOut *w, Slice<MsgImage> images)
 {
     putkey(w, "images");
@@ -1249,6 +1304,9 @@ static void putimages(JsonOut *w, Slice<MsgImage> images)
         putstrkey(w, "mime", images[i].mime);
         putintkey(w, "w", images[i].w);
         putintkey(w, "h", images[i].h);
+        if (images[i].label.len) {
+            putstrkey(w, "label", images[i].label);
+        }
         putend(w);
     }
     putend(w);
@@ -1285,21 +1343,110 @@ static Slice<MsgFile> getfiles(Arena *perm, Json *list)
     return r;
 }
 
-// The images of a user record, in perm, those well formed.
+// Put the sessions a message mentioned as the user record has them:
+// [{sid, title}].
+static void putsessrefs(JsonOut *w, Slice<MsgSess> refs)
+{
+    putkey(w, "sessions");
+    putarray(w);
+    for (iz i = 0; i < refs.len; i++) {
+        putobject(w);
+        putstrkey(w, "sid", refs[i].sid);
+        putstrkey(w, "title", refs[i].title);
+        putend(w);
+    }
+    putend(w);
+}
+
+// The sessions a user record mentioned, in perm, those well formed.
+static Slice<MsgSess> getsessrefs(Arena *perm, Json *list)
+{
+    Slice<MsgSess> r = {};
+    for (Json *x = list->child; x; x = x->next) {
+        MsgSess m = {};
+        m.sid   = clone(perm, jsonstr(jsonget(x, "sid")));
+        m.title = clone(perm, jsonstr(jsonget(x, "title")));
+        if (m.sid.len) {
+            r = push(perm, r, m);
+        }
+    }
+    return r;
+}
+
+// The images of a user record, or of a tool result, in perm, those
+// well formed.
 static Slice<MsgImage> getimages(Arena *perm, Json *list)
 {
     Slice<MsgImage> r = {};
     for (Json *x = list->child; x; x = x->next) {
         MsgImage g = {};
-        g.name = clone(perm, jsonstr(jsonget(x, "name")));
-        g.mime = clone(perm, jsonstr(jsonget(x, "mime")));
-        g.w    = (i32)jsonint(jsonget(x, "w"), 0);
-        g.h    = (i32)jsonint(jsonget(x, "h"), 0);
+        g.name  = clone(perm, jsonstr(jsonget(x, "name")));
+        g.mime  = clone(perm, jsonstr(jsonget(x, "mime")));
+        g.w     = (i32)jsonint(jsonget(x, "w"), 0);
+        g.h     = (i32)jsonint(jsonget(x, "h"), 0);
+        g.label = clone(perm, jsonstr(jsonget(x, "label")));
         if (g.name.len && g.mime.len) {
             r = push(perm, r, g);
         }
     }
     return r;
+}
+
+// A tool result's image keys in its record (tool.end), from its message:
+// a PDF sent as a document (pdf, pages); several images (images), with
+// the first PNG among them under the keys of one too (image, width,
+// height), which older engines replay and older views draw, and which
+// is sent as a PNG, so never a JPEG; or one image (image, width,
+// height), and a screenshot's geometry (shot). Never both a PDF and
+// images.
+static void putcallimages(JsonOut *w, Msg *m, Str shot)
+{
+    if (m->image.len && m->pages) {
+        putstrkey(w, "pdf", m->image);  // not an image to draw
+        putintkey(w, "pages", m->pages);
+    } else if (m->images.len) {
+        putimages(w, m->images);
+        for (iz k = 0; k < m->images.len; k++) {
+            MsgImage *g = &m->images[k];
+            if (g->mime == "image/png") {
+                putstrkey(w, "image", g->name);
+                putintkey(w, "width", g->w);
+                putintkey(w, "height", g->h);
+                break;
+            }
+        }
+    } else if (m->image.len) {
+        putstrkey(w, "image", m->image);
+        putintkey(w, "width", m->imgw);
+        putintkey(w, "height", m->imgh);
+        if (shot.len) {
+            putstrkey(w, "shot", shot);  // a screenshot's
+        }
+    }
+}
+
+// A tool result's image fields from its record (putcallimages), in perm:
+// its images, when it has several, and the image key, naming a PNG of
+// them, left aside; that alone if none of the images is well formed.
+static void getcallimages(Arena *perm, Json *j, Msg *m)
+{
+    Json *list = jsonget(j, "images");
+    if (list->type==JSON_ARRAY && list->child) {
+        m->images = getimages(perm, list);
+        if (m->images.len) {
+            return;
+        }
+    }
+    m->image   = clone(perm, jsonstr(jsonget(j, "image")));
+    m->imgw    = (i32)jsonint(jsonget(j, "width"), 0);
+    m->imgh    = (i32)jsonint(jsonget(j, "height"), 0);
+    m->imgread = m->image.len && !jsonstr(jsonget(j, "shot")).len;
+    if (!m->image.len) {
+        m->image   = clone(perm, jsonstr(jsonget(j, "pdf")));
+        m->pages   = m->image.len ? (i32)jsonint(jsonget(j, "pages"), 1) : 0;
+        m->pages   = m->image.len && m->pages<1 ? 1 : m->pages;
+        m->imgread = m->image.len > 0;
+    }
 }
 
 static void webanswered(Session *, Arena, b32 allow, i32 by, Str note, i64 wait);
@@ -1335,13 +1482,20 @@ static Slice<Str> geturls(Arena *a, Json *list)
     return r;
 }
 
+static void lastactput(Session *, Arena, i64);
+
 // Log a user record and append its message: the images in perm. A
 // task's names the URLs in its prompt that the parent saw (webvouch).
 static void adduser(Session *s, Arena scratch, Str text, Str via,
-                    Slice<MsgImage> images = {}, Slice<MsgFile> files = {})
+                    Slice<MsgImage> images = {}, Slice<MsgFile> files = {},
+                    Slice<MsgSess> refs = {})
 {
     Slice<Str> urls = via=="task" ? webvouch(s->parent, &scratch, text) : Slice<Str>{};
-    Buf   b(&scratch, 256 + text.len + 128*images.len + 128*files.len);
+    iz    reflen = 0;
+    for (iz i = 0; i < refs.len; i++) {
+        reflen += 64 + refs[i].sid.len + 2*refs[i].title.len;
+    }
+    Buf   b(&scratch, 256 + text.len + 128*images.len + 128*files.len + reflen);
     EvOut w = sbegin(s, &b, EV_USER);
     putstrkey(&w.json, "text", text);
     putstrkey(&w.json, "via", via);
@@ -1356,13 +1510,18 @@ static void adduser(Session *s, Arena scratch, Str text, Str via,
     if (files.len) {
         putfiles(&w.json, files);
     }
+    if (refs.len) {
+        putsessrefs(&w.json, refs);
+    }
     puturls(&w.json, urls);
     ssend(s, &w);
+    lastactput(s, scratch, w.ts);
     Msg m = {};
     m.role   = ROLE_USER;
     m.text   = clone(&s->perm, text);
-    m.images = images;
-    m.files  = files;
+    m.images   = images;
+    m.files    = files;
+    m.sessions = refs;
     addmsg(s, m);
     webnoteuser(s, scratch, via, text, urls);
 }
@@ -1414,6 +1573,10 @@ static void logassistant(Session *s, Arena scratch, Slice<Block> blocks,
         putend(&w.json);
     }
     putintkey(&w.json, "ms", (os_ticks(s->e->os) - s->sent)/MS);
+    if (s->firstout > s->sent) {
+        // Its first token: before it, the prompt was read
+        putintkey(&w.json, "first_ms", (s->firstout - s->sent)/MS);
+    }
     ssend(s, &w);
     if (u && u->in && s->sentbytes) {
         // The server's count calibrates the estimates
@@ -1696,10 +1859,12 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
     print(&b, "Accept: ");
     print(&b, accept);
     print(&b, "\r\nUser-Agent: prospero/" PROSPERO_VERSION "\r\n");
-    if (ep->kind == EP_ANTHROPIC) {
+    if (ep->wire == EP_ANTHROPIC) {
         print(&b, "anthropic-version: ");
         print(&b, anversion);
         print(&b, "\r\n");
+    }
+    if (ep->kind == EP_ANTHROPIC) {
         if (ep->key.len) {
             print(&b, "x-api-key: ");
             print(&b, ep->key);
@@ -1711,6 +1876,25 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
         print(&b, "\r\n");
     }
     return finish(&b);
+}
+
+// The URL of name at an endpoint: under its /v1/ (apiurl), but under a
+// copilot endpoint's root, its account's own if it has one. A relayed
+// endpoint's are apiurl's, which the computer relaying it maps to its
+// own (relaysend).
+static Str epurl(Arena *a, Endpoint *ep, Str name)
+{
+    if (ep->kind==EP_COPILOT && !ep->relay.len) {
+        return copiloturl(a, ep->api.len ? ep->api : ep->url, name);
+    }
+    return apiurl(a, ep->url, name);
+}
+
+// The URL of a model call at an endpoint, in its format.
+static Str callurl(Arena *a, Endpoint *ep)
+{
+    b32 cp = ep->kind==EP_COPILOT && !ep->relay.len;
+    return epurl(a, ep, cp ? copilotpath(ep->wire) : eppath(ep->wire));
 }
 
 // What to check when a server refuses the key, to follow its error: the
@@ -1914,6 +2098,15 @@ static b32  relaylisting(Engine *, Buf *, Endpoint *);
 static b32  relaytoken(Str);
 static void relaytick(Engine *, Arena);
 static i64  relaynext(Engine *, i64 now);
+static void termopen(Engine *, Arena, i64 id, Json *);
+static void termcmd(Engine *, Arena, i32 cmd, Json *);
+static b32  termrecord(Engine *, Arena, Record);
+static void termtick(Engine *, Arena);
+static i64  termnext(Engine *, i64 now);
+static i32  termcount(Engine *, i64 peer);
+static void termhangupall(Engine *, i64 peer, Str sid);
+static void termaway(Engine *, i64 peer, b32 away);
+static Terms *newterms(Arena *);
 
 // Start a request to an endpoint, its records to req->mbox with its id,
 // for a session (s) or not; with no endpoint, a plain request, or at
@@ -1991,7 +2184,8 @@ static b32 endreasoning(Session *s, Arena scratch, i32 why)
     Endpoint *ep  = reqep(s);
     Str       msg = why==CTL_BUDGET ? Str("the reasoning ran past its budget")
                                     : Str("the model's reasoning repeated itself");
-    b32       can = reqmc(s)->llamacpp && !s->noctl && s->part->id.len;
+    b32       can = reqmc(s)->llamacpp && !s->noctl && s->part->id.len &&
+                    ep->kind==EP_OPENAI;  // the control call is Chat Completions'
     if (s->ctlwhy || !can) {
         s->ctlwhy = why;
         fail(s, scratch, CLASS_LOOP, 0, msg, -1);
@@ -2093,6 +2287,38 @@ static void stopreq(Session *s)
     disarm(s, T_GRACE);
 }
 
+static Str chatgptheaders(Engine *, Arena *, Endpoint *, Str sid, u64 *sent);
+static Str epsigninmsg(Arena *, Str name);
+static b32 authgate(Session *, Arena, Endpoint *);
+
+// What Copilot is told of a request, beyond its body: who began it (the
+// user, only for the step that answers the user's own message, else the
+// agent), what for, and whether it shows images. Its premium requests
+// are counted by the first.
+struct CpHint {
+    Str initiator;    // "user" or "agent"
+    Str interaction;  // "conversation-agent", -subagent or -compaction
+    b32 vision;
+};
+
+static CpHint cphint(Session *s)
+{
+    CpHint h  = {};
+    b32    cp = s->purpose == REQ_COMPACT;
+    iz     n  = s->history.len;
+    b32    us = !cp && n && s->history[n-1].role==ROLE_USER;
+    h.initiator   = us ? Str("user") : Str("agent");
+    h.interaction = cp         ? Str("conversation-compaction") :
+                    s->depth>0 ? Str("conversation-subagent")
+                               : Str("conversation-agent");
+    for (iz i = 0; !cp && i < n; i++) {
+        h.vision |= s->history[i].images.len>0 || s->history[i].image.len>0;
+    }
+    return h;
+}
+
+static Str copilotheaders(Engine *, Arena *, Endpoint *, Str sid, CpHint);
+
 // Start a request whose records go to this session, with keep for a
 // turn's body, which a relayed request's next may be a delta against.
 // 0 on failure.
@@ -2107,6 +2333,13 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
     r.method    = method;
     r.url       = url;
     r.headers   = authheaders(&scratch, ep, accept);
+    if (ep->kind==EP_CHATGPT && !ep->relay.len) {
+        Str more  = chatgptheaders(e, &scratch, ep, s->sid, &s->authsent);
+        r.headers = concat(&scratch, r.headers, more);
+    } else if (ep->kind==EP_COPILOT && !ep->relay.len) {
+        Str more  = copilotheaders(e, &scratch, ep, s->sid, cphint(s));
+        r.headers = concat(&scratch, r.headers, more);
+    }
     r.body      = body;
     r.connectms = ep->connectms;
     r.readms    = readms;
@@ -2192,6 +2425,7 @@ static Str  wtforked(Engine *, Arena, Str sid, WtSess *);
 static void wtsay(Engine *, Arena, Str sid, Str path, Str did, Str why, Str err,
                   Str branch);
 static void wtheed(Session *, Arena);
+static void moveheed(Session *, Arena);
 static void wtsweep(Engine *, Arena);
 static void wtrestore(Engine *, Arena, Str sid);
 static WtJob *wtjobfor(Engine *, Str path);
@@ -2209,6 +2443,7 @@ static Slice<Msg> deskimages(Session *, Arena *);
 static void toolsessions(Session *, Arena);
 static void toolmessage(Session *, Arena, Args *);
 static b32  validimage(Str name);
+static b32  validout(Str name);
 static b32  validfile(Str name);
 
 // The ids of the session's calls so far, which a new call's must not
@@ -2266,11 +2501,13 @@ static void sendchat(Session *s, Arena scratch)
     req.tools     = s->tools;
     req.history   = deskimages(s, &scratch);
     req.thinkfrom = s->thinkfrom;
-    b32 an        = s->ep.kind == EP_ANTHROPIC;
-    Str body      = an ? anencode(&s->attempt, scratch, &req)
-                       : encodechat(&s->attempt, scratch, &req);
-    Str url       = apiurl(&scratch, s->ep.url, an ? Str("messages")
-                                                   : Str("chat/completions"));
+    req.cachekey  = s->sid;
+    i32 wire      = s->ep.wire;
+    Str body      = wire==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
+                    epresponses(wire)  ? rsencode(&s->attempt, scratch, &req,
+                                                  s->ep.kind==EP_CHATGPT)
+                                       : encodechat(&s->attempt, scratch, &req);
+    Str url       = callurl(&scratch, &s->ep);
 
     if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0, 1)) {
         Str err = os_lasterr(e->os, &scratch);
@@ -2325,7 +2562,7 @@ static b32 relaygate(Session *s, Arena scratch, Endpoint *ep)
 // Send the current request once it is admitted at its endpoint.
 static void request(Session *s, Arena scratch)
 {
-    if (!relaygate(s, scratch, reqep(s))) {
+    if (!relaygate(s, scratch, reqep(s)) || !authgate(s, scratch, reqep(s))) {
         return;
     } else if (!admit(s, scratch)) {
         setstate(s, S_QUEUED);
@@ -2341,7 +2578,7 @@ static void discover(Session *, Arena);
 static void proceed(Session *s, Arena scratch)
 {
     if (!s->discovered) {
-        if (relaygate(s, scratch, &s->ep)) {
+        if (relaygate(s, scratch, &s->ep) && authgate(s, scratch, &s->ep)) {
             discover(s, scratch);
         }
         return;
@@ -2357,7 +2594,7 @@ static void proceed(Session *s, Arena scratch)
     if (s->purpose==REQ_CHAT && s->mc.ctx) {
         i64 at = compactat(s->mc.ctx);
         if (estimate(s) >= at) {
-            compact(s, scratch, at, at*4/5, CW_THRESHOLD);
+            compact(s, scratch, at*COMPACT_PRUNETO/100, at*4/5, CW_THRESHOLD);
             return;
         }
     }
@@ -2366,15 +2603,14 @@ static void proceed(Session *s, Arena scratch)
 
 static void discover(Session *s, Arena scratch)
 {
-    // Anthropic's listing comes in pages, of at most 1000 models
-    Str url = apiurl(&scratch, s->ep.url, s->ep.kind==EP_ANTHROPIC ?
-                     Str("models?limit=1000") : Str("models"));
+    Str url = epurl(&scratch, &s->ep, eplistpath(s->ep.kind));
     resetattempt(s);
     s->discovered = 1;
-    if (s->ep.kind==EP_ANTHROPIC && s->mc.kwargs.len) {
+    if ((s->ep.kind==EP_ANTHROPIC || epsigned(s->ep.kind)) && s->mc.kwargs.len) {
         Str msg = concat(&scratch, "the template settings of [model ", s->model);
-        msg = concat(&scratch, msg, "] are not sent: kind anthropic takes "
-                     "no chat_template_kwargs");
+        msg = concat(&scratch, msg, "] are not sent: kind ");
+        msg = concat(&scratch, msg, epkindname(s->ep.kind));
+        msg = concat(&scratch, msg, " takes no chat_template_kwargs");
         note(s, scratch, "warn", msg);
     }
     if (!startreq(s, scratch, &s->ep, "GET", url, {}, "application/json", 10000)) {
@@ -2454,11 +2690,17 @@ static void discovered(Session *s, Arena scratch, b32 ok)
 {
     Engine *e = s->e;
     if (ok && s->status==200) {
-        notekinds(e, scratch, s->ep.url, finish(&s->body));
+        Str body = finish(&s->body);
+        if (s->ep.kind == EP_CHATGPT) {
+            body = rslisting(&scratch, s->attempt, body);
+        } else if (s->ep.kind == EP_COPILOT) {
+            body = cplisting(&scratch, s->attempt, body);
+        }
+        notekinds(e, scratch, s->ep.url, body);
         Str  key     = kindkey(&scratch, s->ep.url, s->mc.name);
         i64 *cached  = upsert(&e->trained, key, (Arena *)0);
         i64  trained = cached ? *cached : 0;
-        ModelInfo mi = parsemodels(scratch, finish(&s->body), s->mc.name, trained);
+        ModelInfo mi = parsemodels(scratch, body, s->mc.name, trained);
         if (mi.found) {
             s->info        = mi;
             s->mc.llamacpp = mi.llamacpp;
@@ -2476,6 +2718,9 @@ static void discovered(Session *s, Arena scratch, b32 ok)
                 s->mc.ctx = s->mc.ctx && !mi.learned ? s->mc.ctx : mi.ctx;
             }
             s->mc.maxout = mi.maxout;
+            if (s->ep.kind == EP_COPILOT) {
+                s->ep.wire = mi.wire;  // each model its own format
+            }
         }
     }
     stopreq(s);
@@ -2779,6 +3024,8 @@ static b32 unbind(Session *s)
     return any;
 }
 
+static b32 refusepdf(Session *, Str);
+
 // Fail the current attempt. Transient failures back off and retry while
 // nothing visible has streamed, and otherwise commit what streamed and
 // ask the agent to continue. Once quick retries are spent, fallbacks and
@@ -2828,7 +3075,16 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
     b32      visible = p && committed(p);
     s->part = 0;
 
-    if (cls==CLASS_DETERMINISTIC && reqep(s)->kind==EP_ANTHROPIC &&
+    if (cls==CLASS_DETERMINISTIC && reqep(s)->wire==EP_ANTHROPIC &&
+            contains(msg, "PDF") && refusepdf(s, msg)) {
+        // A PDF read that the API takes for one but refuses (damaged),
+        // which every request after would carry: the newest left out,
+        // which is the one this request added, and the step goes again
+        retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
+        request(s, scratch);
+        return;
+    }
+    if (cls==CLASS_DETERMINISTIC && reqep(s)->wire==EP_ANTHROPIC &&
             contains(msg, "signature") && contains(msg, "thinking") &&
             unbind(s)) {
         // Anthropic's reasoning is bound to the conversation before it,
@@ -3002,6 +3258,10 @@ static i64 prefilleta(Prefill *p, PrefillLine *last, u64 key, i64 n, i64 total, 
         p->sxy = k*p->sxy + w*x*y;
         p->samples++;
     }
+    if (!p->started) {
+        p->n0  = n;
+        p->ms0 = ms;
+    }
     if (!p->started || batch) {
         p->n  = n;
         p->ms = ms;
@@ -3056,12 +3316,19 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
     if (!p->started) {
         p->server = c->pms >= 0;
     }
-    i64 eta = -1;
+    i64 eta = -1, tps10 = 0;
     if (!p->server || c->pms>=0) {
         i64 ms    = p->server ? c->pms : os_ticks(s->e->os)/MS;
         Str model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
         u64 key   = (hash(reqep(s)->url)*3 ^ hash(model)) | 1;
         eta = prefilleta(p, prefillline(s->e, key), key, c->pdone, c->ptotal, ms);
+        // Tokens per second, tenths, as the output's (tps10): the tokens
+        // computed since the first event over the time since. llama.cpp's
+        // first comes as its slot starts, before any batch, with the
+        // cached tokens already counted, so neither the queue's wait nor
+        // the cache's hits count.
+        i64 dn = c->pdone - p->n0, dt = ms - p->ms0;
+        tps10 = dn>0 && dt>0 ? dn*10*1000/dt : 0;
     }
 
     Buf   b(&scratch, 256);
@@ -3073,14 +3340,20 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
     if (eta >= 0) {
         putintkey(&w.json, "eta_ms", eta);  // left, as of this record
     }
+    if (tps10) {
+        putkey(&w.json, "tps");
+        putfloat(&w.json, (f64)tps10 / 10);
+    }
     ssend(s, &w);
 }
 
 // Apply one parsed data event. Returns 0 if the attempt failed.
 static b32 onchunk(Session *s, Arena scratch, Json *j)
 {
-    Chunk c = reqep(s)->kind==EP_ANTHROPIC ? anchunk(s->part, j, &scratch)
-                                           : applychunk(s->part, j, &scratch);
+    i32   wire = reqep(s)->wire;
+    Chunk c    = wire==EP_ANTHROPIC ? anchunk(s->part, j, &scratch) :
+                 epresponses(wire)  ? rschunk(s->part, j, &scratch)
+                                    : applychunk(s->part, j, &scratch);
     if (c.bad) {
         fail(s, scratch, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
         return 0;
@@ -3211,12 +3484,12 @@ static void onbody(Session *s, Arena scratch, Str data)
             fail(s, t, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
             return;
         }
-        if (ev->type=="error" && reqep(s)->kind!=EP_ANTHROPIC) {
+        if (ev->type=="error" && reqep(s)->wire==EP_OPENAI) {
             Str msg = errortext(jsonget(d.root, "error"));
             fail(s, t, classify(0, msg), 0, msg, -1);
             return;
         }
-        if (!onchunk(s, t, d.root)) {  // Anthropic's error events too
+        if (!onchunk(s, t, d.root)) {  // Anthropic's and Responses' errors too
             return;
         }
     }
@@ -3263,8 +3536,46 @@ static void ondone(Session *s, Arena scratch, i32 err, Str text)
         if (cls == CLASS_OVERFLOW) {
             s->ovinfo = overflowsizes(scratch, body);
         }
+        Endpoint *rep = reqep(s);
+        b32       cgp = rep->kind==EP_CHATGPT;
+        if (cgp && !rep->relay.len && s->status==401 && !s->authretried) {
+            // Refused: refreshed, once a turn, and sent again at no cost
+            s->authretried = 1;
+            s->authstale   = s->authsent;
+            stopreq(s);
+            s->part = 0;
+            retryevent(s, scratch, RETRY_QUICK, CLASS_TRANSIENT, s->status, 0,
+                       "HTTP 401: ChatGPT refused the access token, so it is refreshed");
+            request(s, scratch);
+            return;
+        }
+        i64 limit = cgp && s->status==429 ?
+                    rsusagelimit(scratch, body, os_time(e->os)/1000) : -1;
+        if (limit >= 0) {
+            Buf b(&scratch, 256 + msg.len);
+            print(&b, "ChatGPT's usage limit was reached");
+            if (limit) {
+                print(&b, ": it resets in ");
+                printelapsed(&b, limit*1000);
+            }
+            if (msg.len) {
+                print(&b, " (");
+                print(&b, utf8head(msg, 500));
+                print(&b, ")");
+            }
+            fail(s, scratch, CLASS_LIMIT, s->status, finish(&b), -1);
+            return;
+        }
         Str hint = {};
-        if (cls==CLASS_FATAL && (s->status==401 || s->status==403)) {
+        if (cls==CLASS_FATAL && (s->status==401 || s->status==403) && epsigned(rep->kind)) {
+            Str svc = epservice(rep->kind);
+            hint = rep->relay.len
+                 ? concat(&scratch, concat(&scratch, " (sign in to ", svc),
+                          concat(&scratch, " on the computer that relays endpoint ",
+                                 concat(&scratch, rep->relay, ")")))
+                 : concat(&scratch, " (sign in again ",
+                          concat(&scratch, epsigninmsg(&scratch, rep->name), ")"));
+        } else if (cls==CLASS_FATAL && (s->status==401 || s->status==403)) {
             hint = keyhint(e, &scratch, reqep(s));
         }
         Buf b(&scratch, 64 + msg.len + hint.len);
@@ -3416,16 +3727,6 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
         putintkey(&w.json, "hop", s->msghop);
     }
     puturls(&w.json, s->callurls);  // a task's report's (webvouch)
-    if (s->callimage.len) {
-        putstrkey(&w.json, "image", s->callimage);
-        putintkey(&w.json, "width", s->callimgw);
-        putintkey(&w.json, "height", s->callimgh);
-        if (s->callshot.len) {
-            putstrkey(&w.json, "shot", s->callshot);  // a screenshot's
-        }
-    }
-    putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
-    ssend(s, &w);
 
     Msg m = {};
     m.role   = ROLE_TOOL;
@@ -3433,14 +3734,27 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.text   = clone(&s->perm, text);
     m.spill  = spill.len ? clone(&s->perm, spill) : Str{};
     m.error  = toolfailed(status);
-    m.image  = s->callimage;
-    m.imgw   = s->callimgw;
-    m.imgh   = s->callimgh;
-    m.imgread = s->callimage.len && !s->callshot.len;
+    if (s->callimages.len && !(s->callimage.len && s->callpages)) {
+        m.images = s->callimages;  // several: no image of its own
+    } else {
+        m.image   = s->callimage;
+        m.imgw    = s->callimgw;
+        m.imgh    = s->callimgh;
+        m.imgread = s->callimage.len && !s->callshot.len;
+        m.pages   = s->callpages;
+    }
+    putcallimages(&w.json, &m, s->callshot);
+    putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
+    ssend(s, &w);
+
     addmsg(s, m);
     webnotetool(s, scratch, c->name, status, text, s->callurls);
-    s->callimage = {};
-    s->callshot  = {};
+    s->callimage  = {};
+    s->callimgw   = 0;
+    s->callimgh   = 0;
+    s->callimages = {};
+    s->callshot   = {};
+    s->callpages  = 0;
     s->msgto     = {};
     s->msgtitle  = {};
     s->msghow    = {};
@@ -3587,13 +3901,19 @@ static Slice<Str> instrlist(Session *s, Arena *a)
     return instrnames(a, cfgget(s->e->cfg, "instructions", "", "files", 0));
 }
 
-static void instrstamp(Session *s, Slice<InstrFile> files)
+// Stamp files just loaded: into the system prompt, or later for the
+// files under a directory (under).
+static void instrstamp(Session *s, Slice<InstrFile> files, Str under)
 {
     for (iz i = 0; i < files.len; i++) {
         InstrStamp k = {};
-        k.path  = clone(&s->perm, files[i].path);
-        k.size  = files[i].size;
-        k.mtime = files[i].mtime;
+        k.path   = clone(&s->perm, files[i].path);
+        k.size   = files[i].size;
+        k.mtime  = files[i].mtime;
+        k.prompt = !under.data;
+        k.psize  = k.size;
+        k.pmtime = k.mtime;
+        k.under  = under.data ? clone(&s->perm, under) : Str{};
         s->instrfiles = push(&s->perm, s->instrfiles, k);
     }
 }
@@ -3658,7 +3978,7 @@ static void instrlazy(Session *s, Arena scratch, Str path)
     print(&b, in.text);
     Str text = finish(&b);
     loginstr(s, scratch, in.files, in.skipped, "nested", {});
-    instrstamp(s, in.files);
+    instrstamp(s, in.files, dir);
     notify(s, "instructions", text, 0);
 }
 
@@ -4046,12 +4366,18 @@ enum : iz {
 // What plan mode allows, for the agent.
 static Str planrules(Session *s, Arena *a)
 {
-    Buf b(a, 1024 + s->planfile.len);
+    Str dir = s->scratch.len ? normpath(a, s->cwd, s->scratch, s->te.windows) : Str{};
+    Buf b(a, 1024 + s->planfile.len + dir.len);
     if (s->depth) {
         print(&b, "Plan mode is on: the agent you work for is planning, so "
                   "you must not change anything. Do not write or edit "
-                  "files, and run only commands that change nothing. "
-                  "Report what you found.");
+                  "files");
+        if (dir.len) {
+            print(&b, " but scratch files in ");
+            print(&b, dir);
+        }
+        print(&b, ", and run only commands that change nothing. Report what "
+                  "you found.");
         return finish(&b);
     }
     print(&b, "Plan mode is on: explore and plan, but change nothing yet. "
@@ -4060,7 +4386,11 @@ static Str planrules(Session *s, Arena *a)
               "write into the working directory). Write and edit work only "
               "on the plan file, ");
     print(&b, s->planfile);
-    print(&b, ", which stays after plan mode ends. Write your plan there in "
+    if (dir.len) {
+        print(&b, ", and on scratch files (notes, test inputs) in ");
+        print(&b, dir);
+    }
+    print(&b, ". The plan file stays after plan mode ends. Write your plan there in "
               "Markdown: the goal, the changes file by file, and how to "
               "verify them. Once it is complete, call exit_plan_mode to ask "
               "the user to approve it. ");
@@ -4164,26 +4494,58 @@ static void planheed(Session *s, Arena scratch)
 // How long the agent's questions wait, in ticks, outside plan mode.
 static i64 questiondelay(Engine *e)
 {
-    return cfgms(e->cfg, "guard", "", "question_timeout", 0)*MS;
+    return cfgwaitms(e->cfg, "guard", "question_timeout")*MS;
 }
 
-// The clock of the agent's questions while they wait: none in plan mode,
-// where the user means to review a plan soon, else question_timeout,
-// from now with restart, as the user works on the answers, else as it
-// was. A changed deadline goes to the frontends as an ask.deadline
-// record, unless it moved by under a tenth of the delay (5 s at most),
-// so a stream of touches logs little: the deadline they show is then at
-// most that early.
-static void questionclock(Session *s, Arena scratch, b32 restart)
+// Arm a waiting ask's deadline, from now, and keep its delay for the
+// user's touches to start over (askclock). A delay of 0 waits with no
+// deadline ([guard] ask_timeout = 0).
+static void askarm(Session *s, i64 delay)
+{
+    if (delay) {
+        arm(s, T_ASK, delay);
+    } else {
+        disarm(s, T_ASK);
+    }
+    s->ask.delay    = delay;
+    s->ask.deadline = delay ? os_time(s->e->os) + delay/MS : 0;
+}
+
+// An ask record's deadline, epoch ms: now if nobody attends it, as it is
+// denied at once, else after delay, or 0 for none.
+static i64 askdue(Session *s, b32 wait, i64 delay)
+{
+    i64 now = os_time(s->e->os);
+    return !wait ? now : delay ? now + delay/MS : 0;
+}
+
+// The clock of a waiting ask, from now with restart, as the user works
+// on the answer (a question's form, a denial's note), else as it was.
+// The agent's questions have none in plan mode, where the user means to
+// review a plan soon, else question_timeout; other asks keep the delay
+// they were armed with, and one that waits with none keeps none, as
+// does one the user chose to keep waiting (ask.hold). A
+// changed deadline goes to the frontends as an ask.deadline record,
+// unless it moved by under a tenth of the delay (5 s at most), so a
+// stream of touches logs little: the deadline they show is then at most
+// that early.
+static void askclock(Session *s, Arena scratch, b32 restart)
 {
     Ask *k = &s->ask;
-    if (s->state!=S_ASK || k->tool!=TOOL_ASKUSER) {
+    if (s->state != S_ASK) {
         return;
     }
     Engine *e     = s->e;
-    i64     delay = planning(s) ? 0 : questiondelay(e);
+    i64     delay = k->delay;
     b32     armed = s->timers[T_ASK] != 0;
-    i64     at    = k->deadline;
+    if (k->held) {
+        delay = 0;
+    } else if (k->tool == TOOL_ASKUSER) {
+        delay = planning(s) ? 0 : questiondelay(e);
+    } else if (!armed || !delay) {
+        return;
+    }
+    i64 at = k->deadline;
     if (!delay && armed) {
         disarm(s, T_ASK);
         at = 0;
@@ -4220,7 +4582,7 @@ static void setmode(Session *s, Arena scratch, i32 mode, Str by)
         s->modeheard = mode;
     }
     planheed(s, scratch);
-    questionclock(s, scratch, 0);  // into plan mode, or out of it
+    askclock(s, scratch, 0);  // into plan mode, or out of it
 }
 
 // Queue the notice of the shell, unless the agent knows it as it is: a
@@ -4270,17 +4632,42 @@ static b32 bypassrefuses(Session *s, Arena scratch, Str path)
            (real.data && want.data && within(real, want, win));
 }
 
+// Whether plan mode lets the file tools change the file at a normalized
+// absolute path: the plan file, or one in the session's scratch
+// directory, which is its own (its subagents share it), not the user's,
+// for notes and test inputs while it explores. The real path must be
+// in the directory's too, so a link there cannot lead out of it. The
+// system's temporary directories stay closed, shared as they are.
+static b32 planallows(Session *s, Arena scratch, Str path)
+{
+    if (isplanfile(s, path)) {
+        return 1;
+    } else if (!s->scratch.len) {
+        return 0;
+    }
+    Os *os  = s->e->os;
+    b32 win = s->guard.win;
+    Str dir = normpath(&scratch, s->guard.cwd, s->scratch, win);
+    if (!within(dir, path, win) || path.len==dir.len) {
+        return 0;
+    }
+    Str rdir  = realpathof(os, &scratch, dir, win);
+    Str rpath = realpathof(os, &scratch, path, win);
+    return rdir.data && rpath.data && within(rdir, rpath, win);
+}
+
 // Why plan mode refuses a change to the file at path.
 static Str planrefusal(Session *s, Arena *a, Str path)
 {
     Buf b(a, 512 + path.len + s->planfile.len);
     if (s->depth) {
         print(&b, "Not done: plan mode is on, and you must not change "
-                  "anything. Report what you found instead.");
+                  "anything but your scratch files. Report what you found "
+                  "instead.");
         return finish(&b);
     }
     print(&b, "Not done: plan mode is on, so nothing may change but the "
-              "plan file, and this would change ");
+              "plan file and your scratch files, and this would change ");
     print(&b, showpath(s->guard.cwd, path));
     print(&b, ". Write your plan to ");
     print(&b, s->planfile);
@@ -4288,15 +4675,15 @@ static Str planrefusal(Session *s, Arena *a, Str path)
     return finish(&b);
 }
 
-// In plan mode, the first file a patch changes that is not the plan
-// file, or null. The patch's paths are absolute (patchguard).
-static Str planpatchout(Session *s, Patch *p)
+// In plan mode, the first file a patch changes that plan mode does not
+// allow (planallows), or null. The patch's paths are absolute (patchguard).
+static Str planpatchout(Session *s, Arena scratch, Patch *p)
 {
     for (iz i = 0; planning(s) && i<p->files.len; i++) {
         PatchFile *f = &p->files[i];
-        if (f->file.data && !isplanfile(s, f->file)) {
+        if (f->file.data && !planallows(s, scratch, f->file)) {
             return f->file;
-        } else if (f->fileto.data && !isplanfile(s, f->fileto)) {
+        } else if (f->fileto.data && !planallows(s, scratch, f->fileto)) {
             return f->fileto;
         }
     }
@@ -4365,7 +4752,8 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
                   "it out now. ");
         if (tooloffered(&s->te, TOOL_TODO)) {
             print(&b, "If it has several steps, begin with a todo list of "
-                      "them (todo_write), and keep it up to date. ");
+                      "them (todo_write), sent with your first tool call, and "
+                      "keep it up to date. ");
         }
         if (plan.err.len) {
             // The user emptied it, or made it too long, since the ask
@@ -4720,7 +5108,7 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
     Engine    *e  = s->e;
     Patch     *p  = &args->patch;
     PatchGuard pg = patchguard(s, &scratch, p, allowed);
-    Str        no = planpatchout(s, p);
+    Str        no = planpatchout(s, scratch, p);
     if (no.data) {
         Str text = planrefusal(s, &scratch, no);
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
@@ -4791,6 +5179,7 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
 }
 
 static b32 readimage(Session *, Arena, Str);
+static b32 readpdf(Session *, Arena, Str, Args *);
 
 // A path tool on a path the guard allowed, or the user did. Returns 1
 // if the call finished, 0 if it goes on (a search).
@@ -4810,7 +5199,7 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     if (tool==TOOL_EDIT && s->te.edit==EDIT_PATCH) {
         runpatch(s, scratch, args, path);
         return 1;
-    } else if (planning(s) && !toolreads(tool) && !isplanfile(s, path)) {
+    } else if (planning(s) && !toolreads(tool) && !planallows(s, scratch, path)) {
         Str text = planrefusal(s, &scratch, path);
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return 1;
@@ -4822,7 +5211,7 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
         pre = snapbefore(s, scratch, path);
-    } else if (tool==TOOL_READ && readimage(s, scratch, path)) {
+    } else if (tool==TOOL_READ && (readimage(s, scratch, path) || readpdf(s, scratch, path, args))) {
         return 1;
     }
     switch (tool) {
@@ -5230,15 +5619,14 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     k->hint.exists = h.exists;
     k->opened      = os_ticks(e->os);
 
-    // A steer waiting for the next step answers this ask too: the user
-    // has already said what to do instead
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    // A steer waiting for the next step waits behind this ask, as behind
+    // every ask: the user may not have seen it when writing the steer
+    b32 wait  = attending(s);
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
         // The deadline runs from now: the record's fsync, which a slow
         // disk may draw out, must not extend it
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
@@ -5262,12 +5650,12 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
             putstrkey(&w.json, "always", k->grant);
             putstrkey(&w.json, "access", read ? Str("read") : Str("write"));
         }
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -5567,6 +5955,8 @@ static Job *newjob(Session *s, Arena scratch, Str call, Str command, Proc *proc,
     j->start    = start;
     j->deadline = start + timeout*SEC;
     j->hidden   = hidden;
+    j->turn     = s->turn;
+    j->seen     = -1;
     j->next     = s->jobs;
     s->jobs     = j;
     if (!hidden) {
@@ -5621,6 +6011,21 @@ static i32 msgwake(Session *s)
         }
     }
     return s->readonly || s->e->quitting ? 0 : hop;
+}
+
+// A job begun in this turn still runs, and its end may start the next:
+// the agent may end its turn to wait for it, and is not nudged on.
+static b32 jobwaiting(Session *s)
+{
+    if (!canresume(s)) {
+        return 0;
+    }
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (!j->hidden && j->state!=JOB_DONE && j->turn==s->turn) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // Start a turn to give the agent its notices, a session left idle.
@@ -5902,11 +6307,10 @@ static void startjob(Session *s, Arena scratch, Args *args)
     print(&b, j->n);
     print(&b, ". It may run for ");
     printduration(&b, timeout);
-    print(&b, ". You will be told when it ends, with the end of its "
-              "output: do not poll it or wait for it, but go on with other "
-              "work, or end your turn if there is nothing else to do. Use "
-              "job_output to read its output so far, and job_kill to stop "
-              "it.");
+    print(&b, ". ");
+    printjobwait(&b, canresume(s));
+    print(&b, " Its notice has the end of its output. Use job_output to "
+              "read its output so far, and job_kill to stop it.");
     Str text = finish(&b);
     toolend(s, scratch, "ok", text, 0, 0, rel, 0, j->n);
 }
@@ -5957,6 +6361,7 @@ static void movetojob(Session *s, Arena scratch, b32 user)
     end.job     = j->n;
     end.timeout = s->sh.timeout;
     end.moved   = user;
+    end.resume  = canresume(s);
     end.ms      = shellran(s);
     ToolOut o  = shellresult(e->os, &scratch, s->sh.spill, &end);
     Stat    st = os_stat(e->os, scratch, s->sh.spill);
@@ -6014,7 +6419,11 @@ static void tooljobs(Session *s, Arena scratch)
         print(&b, j->command.len>200 ? utf8head(j->command, 200) : j->command);
         putbyte(&b, '\n');
     }
-    print(&b, "You are told when each job ends: there is no need to check.");
+    print(&b, canresume(s) ? Str("You are told when each job ends, in a new "
+                                 "turn if yours has ended: there is no need "
+                                 "to check.")
+                           : Str("You are told when each job ends: there is "
+                                 "no need to check."));
     Str text = finish(&b);
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
@@ -6070,7 +6479,27 @@ static void tooljobout(Session *s, Arena scratch, Args *args)
         print(&b, "]\n");
     }
     if (j->state != JOB_DONE) {
-        print(&b, "[you are told when the job ends: do not poll it]");
+        // Read again with nothing new: it is being polled, so be plain
+        b32 resume = canresume(s);
+        if (j->seen>=0 && st.size<=j->seen) {
+            print(&b, "[job ");
+            print(&b, j->n);
+            print(&b, resume ? Str(" is still running, with no new output "
+                                   "since you last read it. Stop polling it: "
+                                   "if there is nothing else to do, end your "
+                                   "turn now, and a new turn starts when the "
+                                   "job ends]")
+                             : Str(" is still running, with no new output "
+                                   "since you last read it. Stop polling it: "
+                                   "you are told when it ends, at your next "
+                                   "request after that]"));
+        } else {
+            print(&b, resume ? Str("[you are told when the job ends, in a new "
+                                   "turn if yours has ended: do not poll it]")
+                             : Str("[you are told when the job ends: do not "
+                                   "poll it]"));
+        }
+        j->seen = st.size;
     }
     Str text = finish(&b);
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
@@ -6182,6 +6611,44 @@ static b32 startsearch(Session *s, Arena scratch, i32 tool, Str path, Args *args
     return 0;
 }
 
+// A command that only sleeps, as "sleep 30" or "Start-Sleep -s 30":
+// with a job running, likely a wait for it.
+static b32 onlysleeps(Str cmd)
+{
+    cmd = trim(cmd);
+    while (cmd.len && cmd[cmd.len-1]==';') {
+        cmd = trimright(takehead(cmd, cmd.len-1));
+    }
+    i32 words = 0;
+    b32 num   = 0;
+    while (cmd.len) {
+        iz i = 0;
+        for (; i<cmd.len && cmd[i]!=' ' && cmd[i]!='\t'; i++) {}
+        Str w = takehead(cmd, i);
+        cmd   = trimleft(cuthead(cmd, i));
+        if (!words++) {
+            if (w!="sleep" && !equalfold(w, "Start-Sleep")) {
+                return 0;
+            }
+            continue;
+        } else if (w.len>1 && w[0]=='-') {
+            if (!equalfold(w, "-s") && !equalfold(w, "-Seconds") &&
+                !equalfold(w, "-m") && !equalfold(w, "-Milliseconds")) {
+                return 0;
+            }
+            continue;
+        }
+        iz d = 0;
+        for (; d<w.len && ((w[d]>='0' && w[d]<='9') || w[d]=='.'); d++) {}
+        Str unit = cuthead(w, d);
+        if (!d || (unit.len && unit!="s" && unit!="m" && unit!="h" && unit!="d")) {
+            return 0;
+        }
+        num = 1;
+    }
+    return num;
+}
+
 // A command or search ends: cancelled with the turn, or stopped alone
 // by the user, or done.
 static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 0)
@@ -6240,6 +6707,14 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 
     end.nojob     = s->sh.nojob;
     end.ms        = shellran(s);
     ToolOut o = shellresult(e->os, &scratch, s->sh.spill, &end);
+    if (!cancelled && !stopped && jobsrunning(s) && canresume(s) &&
+        onlysleeps(s->sh.command)) {
+        // Sleeping to wait for a job: say plainly that it need not
+        o.text = concat(&scratch, o.text,
+                        Str("\n[a background job is running: to wait for "
+                            "its end, end your turn instead of sleeping, "
+                            "and a new turn starts when it ends]"));
+    }
     Str status = cancelled    ? Str("cancelled") :
                  stopped      ? Str("stopped")   :
                  end.timedout ? Str("timeout")   :
@@ -6253,14 +6728,19 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 
 
 static void tooltodo(Session *s, Arena scratch, Args *args)
 {
-    Block          *c     = &s->calls[s->callidx];
+    Block          *c      = &s->calls[s->callidx];
+    Str             err    = {};
+    b32             resent = todoresent(s->todos, args);
+    Slice<TodoItem> now    = todoapply(&scratch, s->todos, args, &err);
+    if (err.data) {
+        toolend(s, scratch, "error", err, 0, 0, {}, 0);
+        return;
+    }
     Slice<TodoItem> items = {};
-    i32             active = 0;
-    for (iz i = 0; i < args->todos.len; i++) {
-        TodoItem t = args->todos[i];
+    for (iz i = 0; i < now.len; i++) {
+        TodoItem t = now[i];
         t.content = clone(&s->perm, t.content);
-        items  = push(&s->perm, items, t);
-        active += t.status == TODO_ACTIVE;
+        items = push(&s->perm, items, t);
     }
     if (todoprogress(s->todos, items)) {
         s->nudges[N_TODO] = 0;
@@ -6283,11 +6763,25 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
         putend(&w.json);
         ssend(s, &w);
     }
-    Str text = todoshow(&scratch, items);
-    if (active > 1) {
-        text = concat(&scratch, text, "Note: more than one item is in "
-                      "progress. Finish one at a time, marking each done as "
-                      "soon as it is.");
+    // The slow habits, said here, where the agent reads them, since the
+    // description alone didn't stop some models: the whole list sent
+    // again, and a response with nothing but the list, a round trip of
+    // its own. Neither for a list now finished, as there's nothing left
+    // to send with it.
+    Str  text  = todoshow(&scratch, items);
+    b32  alone = s->calls.len == 1;
+    if ((resent || alone) && todoleft(&scratch, items).data) {
+        text = concat(&scratch, text,
+            resent && alone ? Str("Next time, mark items with done and start "
+                                  "instead of sending the whole list, and send "
+                                  "todo_write in the same response as your "
+                                  "other tool calls, not in one of its own.") :
+            resent          ? Str("Next time, mark items with done and start "
+                                  "instead of sending the whole list again.") :
+                              Str("Next time, send todo_write in the same "
+                                  "response as your other tool calls, such as "
+                                  "the first call of the next step, not in a "
+                                  "response of its own."));
     }
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
@@ -6305,8 +6799,8 @@ static b32 todonudge(Session *s, Arena scratch)
     print(&b, "Your todo list still has items that are not done:\n");
     print(&b, left);
     print(&b, "Continue with them now. If some are finished already, or "
-              "will not be done, update the list with todo_write first, "
-              "then end your turn.");
+              "will not be done, mark them with todo_write (done, or remove) "
+              "first, then end your turn.");
     Str text = finish(&b);
     if (!nudge(s, scratch, N_TODO, text)) {
         return 0;
@@ -6324,8 +6818,9 @@ static void todoremind(Session *s, Arena scratch)
     }
     s->mutations = 0;
     nudge(s, scratch, N_REMIND, "You have made 12 changes since your todo "
-          "list last changed. Update it with todo_write, so that it shows "
-          "what is done and what comes next.");
+          "list last changed. Update it with todo_write (done, start, add or "
+          "remove), in the same response as your next tool call, so that it "
+          "shows what is done and what comes next.");
 }
 
 
@@ -6449,11 +6944,42 @@ struct DeskLimits {
 // The largest screenshot to send the session's model.
 static DeskLimits desklimits(Session *s)
 {
-    b32        an = s->ep.kind == EP_ANTHROPIC;
+    b32        an = s->ep.wire == EP_ANTHROPIC;
     DeskLimits r  = {};
     r.edge   = s->mc.imgedge   ? s->mc.imgedge   : an ? DESK_EDGE   : DESK_EDGE_OAI;
     r.pixels = s->mc.imgpixels ? s->mc.imgpixels : an ? DESK_PIXELS : DESK_PIXELS_OAI;
     return r;
+}
+
+// Whether read sends a PDF, and a request carries one, as a document:
+// to a model on an endpoint of kind anthropic, unless [model] pdf is off.
+static b32 pdfon(Session *s)
+{
+    return s->ep.kind==EP_ANTHROPIC && !s->mc.nopdf;
+}
+
+// After a request the API refused over a PDF: the newest PDF read that
+// requests still send is not sent again, why kept to say in its place
+// (deskimages). 0 if there is none.
+static b32 refusepdf(Session *s, Str why)
+{
+    for (iz i = s->history.len-1; i >= 0; i--) {
+        Msg *m = &s->history[i];
+        if (m->pages && !m->pdfbad.len) {
+            m->pdfbad = clone(&s->perm, why);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The most pages of PDFs a request carries: Anthropic's limit, and no
+// more than half the model's window holds, as estimated (PDF_TOKENS).
+static i64 pdfpagesmax(Session *s)
+{
+    i64 ctx = s->mc.ctx ? s->mc.ctx : s->ctxhint;
+    i64 fit = ctx>0 ? ctx/2/PDF_TOKENS : (i64)PDF_PAGES;
+    return fit<1 ? 1 : fit>PDF_PAGES ? (i64)PDF_PAGES : fit;
 }
 
 // Screenshots kept in requests, and how many more before the oldest
@@ -6470,12 +6996,56 @@ static i64 deskslack(Engine *e)
     return v.ok ? (v.val<0 ? 0 : v.val>20 ? 20 : v.val) : DESK_SLACK;
 }
 
+// Of the images of PDFs, tool results' and attached PDFs', a request
+// carries at most so many, and so many bytes of their files, the newest
+// first: Anthropic takes 100 images in a request to a 200k model, and
+// [desktop] images may keep 20 sets. With the PDFs sent as documents,
+// at most PDF_REQBYTES of files in all, within Anthropic's 32 MB of a
+// request as base64, with room for the rest of it.
+enum : i32 {
+    PDF_REQIMAGES   = 40,
+    PDF_REQIMGBYTES = 8 << 20,
+    PDF_REQBYTES    = 20 << 20,
+};
+// A window's images (pdfpick) always fit a request, alone
+static_assert((i64)PDF_SHOWBYTES/4*3 <= PDF_REQIMGBYTES);
+static_assert((i32)PDF_IMAGES <= (i32)PDF_REQIMAGES);
+static_assert((i32)PDF_BYTES<=(i32)PDF_REQBYTES && PDF_REQIMGBYTES<=PDF_REQBYTES);
+
+// Whether an image attached to a user message is one of an attached
+// PDF's (pdfattachimages), which come and go together as a set does.
+static b32 pdfattached(MsgImage *g)
+{
+    return g->label.len > 0;
+}
+
+static b32 pdfattachset(Msg *m)
+{
+    for (iz k = 0; m->role==ROLE_USER && k<m->images.len; k++) {
+        if (pdfattached(&m->images[k])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a message is one of the items [desktop] images counts: a
+// screenshot, an image or PDF read, or a tool result's several images,
+// which come and go together. deskdrop, deskimagetokens, deskkeepset
+// and deskimages count by it alike, or their indices fall apart.
+static b32 deskitem(Msg *m)
+{
+    return m->image.len || (m->role==ROLE_TOOL && m->images.len);
+}
+
 // Which screenshots a request leaves out, the oldest first, and where
 // its prefix stops matching the request before (FLOOR_*).
 struct DeskDrop {
     i64 drop;   // screenshots left out
     i64 read;   // FLOOR_READ, or -1
     i64 write;  // FLOOR_WRITE, or -1
+    i64 was;    // screenshots the request before left out
+    iz  last;   // the latest response, where the request before ended, or -1
 };
 
 static DeskDrop deskdrop(Session *s)
@@ -6490,7 +7060,7 @@ static DeskDrop deskdrop(Session *s)
     i64 total  = 0;
     i64 before = 0;
     for (iz i = 0; i < s->history.len; i++) {
-        b32 shot = s->history[i].image.len > 0;
+        b32 shot = deskitem(&s->history[i]);
         total  += shot;
         before += shot && i<last;
     }
@@ -6501,18 +7071,143 @@ static DeskDrop deskdrop(Session *s)
     i64 old = keep>0 && before>was ? was : -1;  // the oldest shown, or -1
     i64 now = keep>0 && total>r.drop ? r.drop : -1;
     r.write = now!=old ? now : -1;
+    r.was   = was;
+    r.last  = last;
     return r;
 }
 
-// Tokens of the screenshots the next request carries.
+// The size of a file of the session's directory, 0 if it is lost,
+// with an arena of its own on the stack, so that estimate, which has
+// none, weighs files as deskimages does (a path past 1 KiB, which no
+// session has, weighs nothing).
+static i64 deskfilesize(Session *s, Str name)
+{
+    byte  mem[1<<14];
+    Arena t = {mem, mem+countof(mem)};
+    if (s->dir.len+name.len > 1<<10) {
+        return 0;
+    }
+    Str path = join(&t, s->dir, name);  // before t is copied
+    i64 z    = os_stat(s->e->os, t, path).size;
+    return z>0 ? z : 0;
+}
+
+// Which of the PDFs read, and of tool results' sets of images, a
+// request shown carries (its [desktop] images count them with
+// screenshots), of history[0..len) with drop screenshots left out: the
+// newest first while they fit in a request, PDFs by pdfpagesmax and
+// PDF_BYTES, sets of images, each whole or not at all, by PDF_REQIMAGES
+// and PDF_REQIMGBYTES (the files of out/ alone, as no others are sent),
+// a user message's attached PDFs' images among them as one set (which
+// [desktop] images does not count), and both by PDF_REQBYTES together.
+// The first of a kind with no room ends that kind, older ones left out
+// too, so that one only ever leaves as newer ones arrive, and requests
+// keep their prefix (deskfloor); one with no room even alone is passed
+// over, as it never has any. Each kept sets keep[i], if keep is given;
+// returns the tokens of those kept that the model is sent: PDFs only if
+// pdfon, sets only if it takes images (deskimages).
+static i64 deskkept(Session *s, b32 *keep, i64 drop, iz len)
+{
+    i64 max    = pdfpagesmax(s);
+    b32 pdf    = pdfon(s);
+    b32 blind  = s->mc.novision;
+    i64 n      = 0;
+    i64 pages  = 0;
+    i64 bytes  = 0;
+    i64 imgs   = 0;
+    i64 ibytes = 0;
+    b32 nosets = 0;
+    b32 nopdfs = 0;
+    i64 r      = 0;
+    for (iz i = 0; i < len; i++) {
+        n += deskitem(&s->history[i]);
+    }
+    for (iz i = len-1; i >= 0; i--) {
+        Msg *m = &s->history[i];
+        if (pdfattachset(m)) {
+            i64 cnt  = 0;
+            i64 size = 0;
+            for (iz k = 0; k < m->images.len; k++) {
+                MsgImage *g = &m->images[k];
+                if (pdfattached(g)) {
+                    cnt++;
+                    size += validimage(g->name) ? deskfilesize(s, g->name) : 0;
+                }
+            }
+            if (nosets || cnt>PDF_REQIMAGES || size>PDF_REQIMGBYTES) {
+                continue;
+            } else if (imgs+cnt>PDF_REQIMAGES || ibytes+size>PDF_REQIMGBYTES ||
+                       bytes+ibytes+size>PDF_REQBYTES) {
+                nosets = 1;
+                continue;
+            }
+            imgs   += cnt;
+            ibytes += size;
+            for (iz k = 0; !blind && k<m->images.len; k++) {
+                MsgImage *g = &m->images[k];
+                r += pdfattached(g) ? imagetokens(g->w, g->h) : 0;
+            }
+            if (keep) {
+                keep[i] = 1;
+            }
+            continue;
+        }
+        if (!deskitem(m) || --n<drop) {
+            continue;
+        } else if (!m->image.len) {
+            if (nosets || m->images.len>PDF_REQIMAGES) {
+                continue;
+            }
+            i64 size = 0;
+            for (iz k = 0; k < m->images.len; k++) {
+                Str name = m->images[k].name;
+                size += validout(name) ? deskfilesize(s, name) : 0;
+            }
+            if (size > PDF_REQIMGBYTES) {
+                continue;
+            } else if (imgs+m->images.len>PDF_REQIMAGES || ibytes+size>PDF_REQIMGBYTES ||
+                       bytes+ibytes+size>PDF_REQBYTES) {
+                nosets = 1;
+                continue;
+            }
+            imgs   += m->images.len;
+            ibytes += size;
+            for (iz k = 0; !blind && k<m->images.len; k++) {
+                r += imagetokens(m->images[k].w, m->images[k].h);
+            }
+        } else if (!m->pages || m->pdfbad.len || nopdfs || m->pages>max) {
+            continue;
+        } else {
+            i64 size = deskfilesize(s, m->image);
+            if (size > PDF_BYTES) {
+                continue;
+            } else if (pages+m->pages>max || bytes+size>PDF_BYTES ||
+                       bytes+ibytes+size>PDF_REQBYTES) {
+                nopdfs = 1;
+                continue;
+            }
+            pages += m->pages;
+            bytes += size;
+            r     += pdf ? (i64)m->pages*PDF_TOKENS : 0;
+        }
+        if (keep) {
+            keep[i] = 1;
+        }
+    }
+    return r;
+}
+
+// Tokens of the screenshots, images and PDFs read that the next request
+// carries: the PDFs and tool results' sets of images as deskkept keeps
+// them, files and all, and for a model that takes no images, only the
+// PDFs (deskimages).
 static i64 deskimagetokens(Session *s)
 {
     i64 drop = deskdrop(s).drop;
-    i64 n    = 0;
-    i64 r    = 0;
-    for (iz i = 0; i < s->history.len; i++) {
+    i64 r    = deskkept(s, 0, drop, s->history.len);
+    for (iz i = 0, n = 0; !s->mc.novision && i<s->history.len; i++) {
         Msg *m = &s->history[i];
-        if (m->image.len && n++>=drop) {
+        if (deskitem(m) && n++>=drop && m->image.len && !m->pages) {
             r += imagetokens(m->imgw, m->imgh);
         }
     }
@@ -6520,14 +7215,19 @@ static i64 deskimagetokens(Session *s)
 }
 
 // Tokens of the images attached to user messages, which requests always
-// carry, each as the model's limits would scale it down (desklimits).
+// carry, each as the model's limits would scale it down (desklimits),
+// but for a model that takes no images, which gets notes (deskimages),
+// and but for attached PDFs' images, which deskkept counts.
 static i64 attachtokens(Session *s)
 {
     DeskLimits l = desklimits(s);
     i64        r = 0;
-    for (iz i = 0; i < s->history.len; i++) {
+    for (iz i = 0; !s->mc.novision && i<s->history.len; i++) {
         Msg *m = &s->history[i];
-        for (iz k = 0; k < m->images.len; k++) {
+        for (iz k = 0; m->role==ROLE_USER && k<m->images.len; k++) {
+            if (pdfattached(&m->images[k])) {
+                continue;
+            }
             i64 w    = m->images[k].w;
             i64 h    = m->images[k].h;
             i64 edge = w>h ? w : h;
@@ -6542,9 +7242,42 @@ static i64 attachtokens(Session *s)
     return r;
 }
 
+// Whether an attached file is a PDF's text (attachfile), files/N-NAME.pdf
+// with its PDF beside it.
+static b32 filepdf(Str name)
+{
+    return endswith(name, ".pdf.txt");
+}
+
+// The head before an attached file's lines in a request (filestext),
+// in a: where it is kept, which the agent may read on from; for a PDF's
+// text, where the PDF is too, which read shows with its images.
+static Str filehead(Session *s, Arena *a, Str name)
+{
+    Str  path = join(a, s->dir, name);
+    Str  own  = cut(cuthead(name, 6), '-').tail;
+    Buf  b(a, 256 + 2*path.len);
+    if (filepdf(name)) {
+        print(&b, "[Attached PDF ");
+        print(&b, cuttail(own, 4));
+        print(&b, ", its text extracted, kept at ");
+        print(&b, path);
+        print(&b, ", where read continues it; the PDF itself is at ");
+        print(&b, cuttail(path, 4));
+        print(&b, s->mc.novision ? Str(":]\n") : Str(", which read shows with its images:]\n"));
+    } else {
+        print(&b, "[Attached file ");
+        print(&b, own);
+        print(&b, ", kept at ");
+        print(&b, path);
+        print(&b, ", where read continues it:]\n");
+    }
+    return finish(&b);
+}
+
 // The text a request has for the files attached to a user message, in
-// a, before its own: each as read shows it, where it is kept, which the
-// agent may read on from, or a note if its file is lost.
+// a, before its own: each as read shows it, after its head (filehead),
+// or a note if its file is lost.
 static Str filestext(Session *s, Arena *a, Slice<MsgFile> files)
 {
     Str r = {};
@@ -6554,71 +7287,209 @@ static Str filestext(Session *s, Arena *a, Slice<MsgFile> files)
         b32  ok   = validfile(files[i].name);
         Read rd   = ok ? os_read(s->e->os, a, path, ATTACH_FILE) : Read{};
         if (!ok || rd.err!=READ_OK) {
-            r = concat(a, r, concat(a, concat(a, "[Attached file ", name),
+            Str what = filepdf(name) ? Str("[Attached PDF ") : Str("[Attached file ");
+            name = filepdf(name) ? cuttail(name, 4) : name;
+            r = concat(a, r, concat(a, concat(a, what, name),
                                     " lost: its file could not be read]\n\n"));
             continue;
         }
-        Str head = concat(a, concat(a, concat(a, "[Attached file ", name), ", kept at "),
-                          concat(a, path, ", where read continues it:]\n"));
+        Str head = filehead(s, a, files[i].name);
         Str body = readbody(a, rd.data, head, 1, READ_LINES);
         r = concat(a, r, concat(a, body, endswith(body, "\n") ? Str("\n") : Str("\n\n")));
     }
     return r;
 }
 
+// The text a request has for the sessions a user message mentioned, in
+// a, before its own and its files': a line for each, giving the id that
+// send_message takes, since the token the user typed is only a title.
+static Str sessrefstext(Arena *a, Slice<MsgSess> refs)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < refs.len; i++) {
+        print(&b, "[The user mentioned session ");
+        print(&b, refs[i].sid);
+        if (refs[i].title.len) {
+            print(&b, " (\"");
+            print(&b, refs[i].title);
+            print(&b, "\")");
+        }
+        print(&b, ": send_message reaches it by that id, and the sessions "
+                  "tool lists it]\n");
+    }
+    putbyte(&b, '\n');
+    return finish(&b);
+}
+
+// Which of the PDFs read and sets of images deskkept keeps, in a: each
+// kept if keep[i] for history[i].
+static b32 *deskkeepset(Session *s, Arena *a, i64 drop, iz len)
+{
+    b32 *keep = alloc<b32>(a, s->history.len);
+    deskkept(s, keep, drop, len);
+    return keep;
+}
+
+// Where a request's prefix stops matching the one before for a PDF or
+// set of images that deskkeepset kept then and leaves out now, which
+// newer ones crowd out: the index in history of the oldest such, which
+// takes FLOOR_READ, or -1. keep is this request's deskkeepset.
+static iz deskfloor(Session *s, Arena scratch, DeskDrop d, b32 *keep)
+{
+    if (d.last < 0) {
+        return -1;
+    }
+    b32 *was = deskkeepset(s, &scratch, d.was, d.last);
+    i64  n   = 0;
+    for (iz i = 0; i < d.last; i++) {
+        Msg *m = &s->history[i];
+        if (pdfattachset(m) && was[i]!=keep[i]) {
+            return i;
+        } else if (deskitem(m) && n++>=d.drop && was[i]!=keep[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// A tool result's several images, kept, in a: each read in as base64,
+// or a note in its place if its file is lost.
+static Slice<MsgImage> toolimagesin(Session *s, Arena *a, Slice<MsgImage> images)
+{
+    Slice<MsgImage> r = {};
+    r.data = alloc<MsgImage>(a, images.len);
+    r.len  = r.cap = images.len;
+    for (iz k = 0; k < images.len; k++) {
+        MsgImage g  = images[k];
+        b32      ok = validout(g.name);
+        Read     rd = {};
+        if (ok) {
+            rd = os_read(s->e->os, a, join(a, s->dir, g.name), DESK_REPLYMAX);
+            ok = rd.err==READ_OK && imagetypes[imagesniff(rd.data)].mime==g.mime;
+        }
+        if (ok) {
+            g.b64 = base64(a, rd.data);
+        } else {
+            g.alt = concat(a, concat(a, "[image lost: ", g.name),
+                           ", its file could not be read]");
+        }
+        r.data[k] = g;
+    }
+    return r;
+}
+
 // The history for a request: the screenshots shown read in as base64,
 // with a short text in place of each left out, and the floors marked;
+// the PDFs read likewise, each with no room for it, or for a model that
+// takes none, left out too (deskkeepset, pdfon); a tool result's
+// several images likewise, together, and each read in (toolimagesin);
 // the images attached, each read in, or a note if its file is lost; and
-// the text files attached, as text before their message's own.
-// The history itself if it has none of them.
+// the text files attached, as text before their message's own. For a
+// model that takes no images (one switched to), a note in place of each
+// image. The history itself if it has none of them.
 static Slice<Msg> deskimages(Session *s, Arena *a)
 {
     Engine *e   = s->e;
     b32     any = 0;
     for (iz i = 0; i<s->history.len && !any; i++) {
         any = s->history[i].image.len>0 || s->history[i].images.len>0 ||
-              s->history[i].files.len>0;
+              s->history[i].files.len>0 || s->history[i].sessions.len>0;
     }
     if (!any) {
         return s->history;
     }
-    DeskDrop   d = deskdrop(s);
-    Slice<Msg> h = {};
+    DeskDrop   d     = deskdrop(s);
+    b32       *keep  = deskkeepset(s, a, d.drop, s->history.len);
+    b32        pdf   = pdfon(s);
+    b32        blind = s->mc.novision;
+    Slice<Msg> h     = {};
     h.data = alloc<Msg>(a, s->history.len);
     h.len  = h.cap = s->history.len;
+
+    // One FLOOR_READ, the earlier of a screenshot dropped at this step
+    // and a PDF or set crowded out since the request before
+    iz read = deskfloor(s, *a, d, keep);
+    for (iz i = 0, n = 0; d.read>=0 && i<s->history.len; i++) {
+        if (deskitem(&s->history[i]) && n++==d.read) {
+            read = read<0 || i<read ? i : read;
+            break;
+        }
+    }
+
     i64 n  = 0;
     for (iz i = 0; i < s->history.len; i++) {
         Msg m = s->history[i];
-        if (m.image.len) {
-            m.floor = n==d.read ? FLOOR_READ : n==d.write ? FLOOR_WRITE : FLOOR_NONE;
-            Str what = m.imgread ? Str("image") : Str("screenshot");
+        if (deskitem(&m)) {
+            m.floor = i==read ? FLOOR_READ : n==d.write ? FLOOR_WRITE : FLOOR_NONE;
+        } else if (i == read) {
+            m.floor = FLOOR_READ;  // an attached PDF's images crowded out
+        }
+        if (!m.image.len && deskitem(&m)) {
+            if (n++<d.drop || !keep[i]) {
+                m.imgalt = concat(a, concat(a, "[PDF images omitted: ", m.callid),
+                                  "; read the file again to see them]");
+                m.images = {};
+            } else if (blind) {
+                m.imgalt = concat(a, concat(a, "[PDF images omitted: ", m.callid),
+                                  ", since this model takes no images]");
+                m.images = {};
+            } else {
+                m.images = toolimagesin(s, a, m.images);
+            }
+        } else if (m.image.len) {
+            Str what = m.pages   ? Str("PDF")   :
+                       m.imgread ? Str("image") : Str("screenshot");
             if (n++ < d.drop) {
                 Str why  = m.imgread ? Str("; read the file again to see it]") : Str("]");
                 m.imgalt = concat(a, concat(a, concat(a, "[", what), " omitted: "),
                                   concat(a, m.callid, why));
+            } else if (m.pages && m.pdfbad.len) {
+                m.imgalt = concat(a, concat(a, concat(a, "[PDF omitted: ", m.callid),
+                                            ", which the API refused: "),
+                                  concat(a, m.pdfbad, " The shell may extract its text "
+                                                      "instead.]"));
+            } else if (m.pages && !pdf) {
+                m.imgalt = concat(a, concat(a, "[PDF omitted: ", m.callid),
+                                  ", since this model is not sent PDFs]");
+            } else if (m.pages && !keep[i]) {
+                m.imgalt = concat(a, concat(a, "[PDF omitted: ", m.callid),
+                                  ", for room in the request for newer ones; read "
+                                  "the file again to see it]");
+            } else if (!m.pages && blind) {
+                m.imgalt = concat(a, concat(a, concat(a, "[", what), " omitted: "),
+                                  concat(a, m.callid, ", since this model takes no images]"));
             } else {
                 Read rd = os_read(e->os, a, join(a, s->dir, m.image), DESK_REPLYMAX);
                 if (rd.err == READ_OK) {
-                    m.imgb64 = base64(a, rd.data);
+                    m.imgb64  = base64(a, rd.data);
+                    m.imgmime = m.pages ? Str{} : imagetypes[imagesniff(rd.data)].mime;
                 } else {
                     m.imgalt = concat(a, concat(a, concat(a, "[", what), " lost: "),
                                       concat(a, m.callid, ", its file could not be read]"));
                 }
             }
         }
-        if (m.images.len) {
+        if (m.role==ROLE_USER && m.images.len) {
             Slice<MsgImage> imgs = {};
             imgs.data = alloc<MsgImage>(a, m.images.len);
             imgs.len  = imgs.cap = m.images.len;
             for (iz k = 0; k < m.images.len; k++) {
-                MsgImage g  = m.images[k];
-                b32      ok = validimage(g.name);
-                Read     rd = {};
+                MsgImage g    = m.images[k];
+                b32      room = !pdfattached(&g) || keep[i];
+                b32      ok   = !blind && room && validimage(g.name);
+                Read     rd   = {};
                 if (ok) {
                     rd = os_read(e->os, a, join(a, s->dir, g.name), ATTACH_UPLOAD);
                     ok = rd.err==READ_OK && imagetypes[imagesniff(rd.data)].mime==g.mime;
                 }
-                if (ok) {
+                if (!blind && !room) {
+                    g.alt = concat(a, concat(a, "[image omitted: ", g.label),
+                                   ", for room in the request for newer images; read "
+                                   "the PDF again to see it]");
+                } else if (blind) {
+                    g.alt = concat(a, concat(a, "[image omitted: ", g.name),
+                                   ", since this model takes no images]");
+                } else if (ok) {
                     g.b64 = base64(a, rd.data);
                 } else {
                     g.alt = concat(a, concat(a, "[image lost: ", g.name),
@@ -6630,6 +7501,9 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
         }
         if (m.files.len) {
             m.text = concat(a, filestext(s, a, m.files), m.text);
+        }
+        if (m.sessions.len) {
+            m.text = concat(a, sessrefstext(a, m.sessions), m.text);
         }
         h.data[i] = m;
     }
@@ -7274,11 +8148,10 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
         k->grant  = deskclassnames[cls];  // static
         k->gclass = cls;
     }
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
-    i64 delay = cfgms(e->cfg, "desktop", "", "ask_timeout", 0)*MS;
+    b32 wait  = attending(s);
+    i64 delay = cfgwaitms(e->cfg, "desktop", "ask_timeout")*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   what = concat(&scratch, "desktop: ", deskwhat(s, &scratch, d, 0));
@@ -7293,12 +8166,12 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
             putstrkey(&w.json, "always", k->grant);
             putstrkey(&w.json, "scope", "desktop");
         }
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -7356,9 +8229,11 @@ static Str deskdenial(Arena *a, i32 by, Str note, i64 wait)
 // whole call has a deadline. What comes back is framed as web content
 // between lines marked by a nonce that the pages cannot know.
 
-enum : i32 { WEBS_NONE, WEBS_SEARXNG, WEBS_EXA, WEBS_ANTHROPIC, WEBS_RELAY };
+enum : i32 {
+    WEBS_NONE, WEBS_SEARXNG, WEBS_EXA, WEBS_KEENABLE, WEBS_ANTHROPIC, WEBS_RELAY
+};
 static Str const webservices[] = {
-    "none", "SearXNG", "Exa", "Anthropic", "a connected computer"
+    "none", "SearXNG", "Exa", "Keenable", "Anthropic", "a connected computer"
 };
 
 enum : i64 {
@@ -7378,6 +8253,7 @@ static i32 websearchservice(Engine *e)
     b32       unset = !x || !trim(x->value).len;
     return v=="searxng"   ? WEBS_SEARXNG   :
            v=="exa"       ? WEBS_EXA       :
+           v=="keenable"  ? WEBS_KEENABLE  :
            v=="anthropic" ? WEBS_ANTHROPIC :
            unset && e->cfg->thin && relaysearches(e) ? WEBS_RELAY : WEBS_NONE;
 }
@@ -7709,7 +8585,7 @@ static Str websend(Engine *e, WebRun *w, Arena scratch)
                   "*/*;q=0.1\r\n"
                   "Accept-Encoding: identity\r\n"
                   "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
-        max = WEB_PAGEMAX;
+        max = WEB_PDFMAX;  // a page's body is cut sooner (webbodymax)
     } else if (w->service == WEBS_SEARXNG) {
         Str base = trim(cfgget(e->cfg, "web", "", "url", 0));
         r.method = "GET";
@@ -7731,6 +8607,24 @@ static Str websend(Engine *e, WebRun *w, Arena scratch)
         print(&h, "Content-Type: application/json\r\n"
                   "Accept: application/json, text/event-stream\r\n"
                   "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+    } else if (w->service == WEBS_KEENABLE) {
+        // Keyless at /public, which asks for the app's name; keyed with
+        // the key in a header, so never in the URL
+        Str key = cfgsecret(e->cfg, &scratch, "web", "", "key");
+        r.method = "POST";
+        r.url    = webtesturl(e, &scratch, key.len
+                       ? Str("https://api.keenable.ai/v1/search")
+                       : Str("https://api.keenable.ai/v1/search/public"));
+        r.body   = webkeenablebody(&scratch, w->query, (i32)webint(e, "results", 8, 1, 20));
+        print(&h, "Content-Type: application/json\r\n"
+                  "Accept: application/json\r\n"
+                  "X-Keenable-Title: prospero\r\n"
+                  "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+        if (key.len) {
+            print(&h, "X-API-Key: ");
+            print(&h, key);
+            print(&h, "\r\n");
+        }
     } else if (w->service == WEBS_RELAY) {
         Buf     q(&scratch, 64 + 2*w->query.len);
         JsonOut j = {&q};
@@ -7919,11 +8813,10 @@ static b32 webcall(Session *s, Arena scratch, i32 tool, Args *args)
     k->tool   = tool;
     k->grant  = tool==TOOL_WEBSEARCH ? Str("search") : clone(&s->perm, host);
     k->opened = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    b32 wait  = attending(s);
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str service = webservices[websearchservice(e)];
@@ -7947,12 +8840,12 @@ static b32 webcall(Session *s, Arena scratch, i32 tool, Args *args)
         }
         putstrkey(&w.json, "always", k->grant);
         putstrkey(&w.json, "scope", "web");
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -8005,12 +8898,14 @@ static Str webfailure(Arena *a, WebRun *w, i32 err, Str why)
     return finish(&b);
 }
 
+static void webshow(Session *, Arena, Str title, Str ctype, Str text, Str more);
+static b32  webpdfpage(Session *, Arena, Str body);
+
 // A fetched page's response, complete: a redirect, refusal, or its text.
 static void webpage(Session *s, Arena scratch)
 {
     Engine *e  = s->e;
     WebRun *w  = s->web;
-    Block  *c  = &s->calls[s->callidx];
     i32     st = w->status;
     Buf     b(&scratch, 1024 + w->url.len);
     if (st/100==3 && w->location.len) {
@@ -8069,13 +8964,21 @@ static void webpage(Session *s, Arena scratch)
 
     Str body = {w->body.data, w->body.len};
     i32 kind = webkind(w->ctype, body);
+    if (kind==WEBK_PDF && webpdfpage(s, scratch, body)) {
+        return;
+    } else if (kind == WEBK_PDF) {
+        // Not one after all, but text that mentions "%PDF-", or a page
+        // (a login or error page) sent as one
+        kind = webkind({}, body);
+        kind = kind==WEBK_PDF ? WEBK_TEXT : kind;
+    }
     if (kind == WEBK_BINARY) {
         Str type = trim(cut(w->ctype, ';').head);
         print(&b, "Not read: ");
         print(&b, w->url);
         print(&b, " is ");
         print(&b, type.len ? type : Str("binary data"));
-        print(&b, ", not text. web_fetch reads only web pages and text.");
+        print(&b, ", not text. web_fetch reads only web pages, text and PDFs.");
         webcallend(s, scratch, "error", finish(&b));
         return;
     }
@@ -8097,9 +9000,17 @@ static void webpage(Session *s, Arena scratch)
         print(&t, " MiB.]\n");
         text = finish(&t);
     }
+    webshow(s, scratch, title, w->ctype, text, {});
+}
 
-    // The whole text kept, to read on (webspillread), after a line
-    // saying where it came from
+// A fetched page's text, or a PDF's, title and Content-Type with it:
+// kept whole, to read on (webspillread), after a line saying where it
+// came from, and its window shown, after which more (if any) follows.
+static void webshow(Session *s, Arena scratch, Str title, Str ctype, Str text, Str more)
+{
+    Engine *e = s->e;
+    WebRun *w = s->web;
+    Block  *c = &s->calls[s->callidx];
     Str rel  = {};
     Str path = spillfile(s, scratch, c->id, &rel, ".txt");
     Buf f(&scratch, text.len + w->url.len + 256);
@@ -8114,7 +9025,7 @@ static void webpage(Session *s, Arena scratch)
         WebSpill sp = {};
         sp.path  = path;
         sp.title = clone(&s->perm, title);
-        sp.ctype = clone(&s->perm, w->ctype);
+        sp.ctype = clone(&s->perm, ctype);
         Str keys[] = {w->asked, w->url};
         for (iz i = 0; i < countof(keys); i++) {
             WebSpill *old = upsert(&s->webspill, keys[i], (Arena *)0);
@@ -8129,8 +9040,129 @@ static void webpage(Session *s, Arena scratch)
     }
     Str nonce = webnonce(&scratch, os_random(e->os));
     iz  off   = w->offset<0 ? 0 : w->offset<text.len ? (iz)w->offset : text.len;
-    Str shown = webfetchtext(&scratch, w->url, title, w->ctype, text, off, WEB_SHOW, nonce);
+    Str shown = webfetchtext(&scratch, w->url, title, ctype, text, off, WEB_SHOW, nonce);
+    if (more.len) {
+        shown = concat(&scratch, shown, Str("\n\n"));
+        shown = concat(&scratch, shown, more);
+    }
     webcallend(s, scratch, "ok", shown, rel, whole.len);
+}
+
+// A fetched PDF read: its text and title, clean, or err, why not, for
+// the agent; images, whether it draws any.
+struct WebPdf {
+    Str text;
+    Str title;
+    Str err;
+    b32 images;
+    b32 notpdf;  // no PDF after all, by its bytes (pdflikely)
+    i32 read;    // pages whose text was read
+    i32 imgonly; // of them, with no text but images (pdfnotext)
+    i32 blank;   // with neither
+};
+
+static void pdfnotext(Str, i32 *, i32 *);
+
+// The PDF body fetched from url read in mem, the reader's own region,
+// its results in perm; cut says its body was cut at WEB_PDFMAX.
+static WebPdf webpdf(Arena *perm, Arena mem, Str url, Str body, b32 cut)
+{
+    WebPdf r = {};
+    if (pdflocked(mem, body)) {
+        r.err = concat(perm, concat(perm, "Not read: ", url),
+                       Str(" is a PDF, encrypted, which web_fetch cannot read."));
+        return r;
+    }
+    PdfOut d = pdfread(perm, mem, body, 0);
+    if ((d.status==PDFR_NOTPDF || d.status==PDFR_NOPAGES) && !pdflikely(body)) {
+        r.notpdf = 1;
+        return r;
+    } else if ((d.status!=PDFR_OK && d.status!=PDFR_PARTIAL) || !d.text.len) {
+        b32 now = d.status==PDFR_PARTIAL;  // out of memory, say
+        Buf b(perm, 256 + url.len);
+        print(&b, "Not read: ");
+        print(&b, url);
+        print(&b, now ? Str(" is a PDF whose text cannot be read now (")
+                      : Str(" is a PDF whose text cannot be read ("));
+        print(&b, d.why.data ? d.why : Str("none was found"));
+        print(&b, now ? Str(").") : cut ? Str("): it was cut at ") : Str("): it may be damaged."));
+        if (!now && cut) {
+            print(&b, (i64)(WEB_PDFMAX >> 20));
+            print(&b, " MiB.");
+        }
+        r.err = finish(&b);
+        return r;
+    }
+    Str text = webclean(perm, d.text);
+    r.text   = webpdfnote(perm, text, cut, WEB_PDFMAX, d.why);
+    r.title  = webclean(perm, d.title);
+    r.images = d.places.len > 0;
+    r.read   = (i32)d.pageline.len;
+    pdfnotext(d.text, &r.imgonly, &r.blank);
+    return r;
+}
+
+// A fetched PDF's response: its text, shown as a page's, and when the
+// model takes images and it has some, the PDF kept for read to show
+// them; or why not. Returns 0 if it is no PDF after all (pdflikely),
+// for webpage to show it as the page or text it is.
+static b32 webpdfpage(Session *s, Arena scratch, Str body)
+{
+    Engine *e   = s->e;
+    WebRun *w   = s->web;
+    Block  *c   = &s->calls[s->callidx];
+    Region *reg = os_reserve(e->os, PDF_REGION);
+    if (!reg) {
+        Str text = concat(&scratch, concat(&scratch, "Not read: ", w->url),
+                          Str(" is a PDF, which cannot be read now: out of memory."));
+        webcallend(s, scratch, "error", text);
+        return 1;
+    }
+    WebPdf p = webpdf(&scratch, newarena(reg), w->url, body, w->cut);
+    os_release(e->os, reg);
+    if (p.notpdf) {
+        return 0;
+    } else if (p.err.len) {
+        webcallend(s, scratch, "error", p.err);
+        return 1;
+    }
+
+    // Kept for read to show its images, or for the shell when its pages
+    // hold no text, with read's notes (readpdf) after the window
+    b32 vision = !s->mc.novision;
+    b32 notext = p.read>0 && p.imgonly+p.blank==p.read;
+    Str kept   = {};
+    if ((p.images && vision) || notext) {
+        Str rel = {};
+        Str out = spillfile(s, scratch, c->id, &rel, ".pdf");
+        kept = os_write(e->os, scratch, out, body) ? out : Str{};
+    }
+    Buf m(&scratch, 512 + 2*kept.len);
+    if (kept.len) {
+        print(&m, "The PDF is kept at ");
+        print(&m, kept);
+        print(&m, p.images && vision ? Str(": read shows it with its images.")
+                                     : Str("."));
+    }
+    if (!vision && notext && p.imgonly) {
+        print(&m, m.len ? Str("\n") : Str(""));
+        print(&m, "[Its pages hold no text, only images (a scan), which this "
+                  "model cannot see. The shell may OCR them: pdfimages or "
+                  "pdftoppm, then tesseract.]");
+    } else if (!vision && (startswith(p.text, "[image ") || find(p.text, "\n[image ")>=0)) {
+        print(&m, m.len ? Str("\n") : Str(""));
+        print(&m, "[This model takes no images: each [image ...] line stands "
+                  "for a picture that is not shown.]");
+    }
+    if (notext && !p.imgonly) {
+        print(&m, m.len ? Str("\n") : Str(""));
+        print(&m, "[No text could be extracted: its words may be drawn as shapes. "
+                  "The shell may render its pages as images (pdftoppm -png -r 100)");
+        print(&m, vision ? Str(", which read then shows you.]")
+                         : Str(" and OCR them (tesseract).]"));
+    }
+    webshow(s, scratch, p.title, "application/pdf", p.text, finish(&m));
+    return 1;
 }
 
 // Hits copied into a, to keep past the scratch arena they were parsed in.
@@ -8178,7 +9210,9 @@ static void websearched(Engine *e, WebRun *w, Arena scratch)
         print(&b, " answered HTTP ");
         print(&b, (i64)st);
         Str body = {w->body.data, w->body.len};
-        Str why  = w->service==WEBS_ANTHROPIC ? webanthropic(&scratch, body, 1).err : Str{};
+        Str why  = w->service==WEBS_ANTHROPIC ? webanthropic(&scratch, body, 1).err :
+                   w->service==WEBS_KEENABLE  ? webkeenableerr(&scratch, body)     :
+                   Str{};
         if (why.len) {
             print(&b, ": ");
             print(&b, why);
@@ -8204,9 +9238,10 @@ static void websearched(Engine *e, WebRun *w, Arena scratch)
     }
     WebHits h = {};
     switch (w->service) {
-    case WEBS_SEARXNG: h = websearxng(&scratch, body, max);   break;
-    case WEBS_EXA:     h = webexa(&scratch, body, max);       break;
-    default:           h = webanthropic(&scratch, body, max); break;
+    case WEBS_SEARXNG:  h = websearxng(&scratch, body, max);   break;
+    case WEBS_EXA:      h = webexa(&scratch, body, max);       break;
+    case WEBS_KEENABLE: h = webkeenable(&scratch, body, max);  break;
+    default:            h = webanthropic(&scratch, body, max); break;
     }
     if (!h.err.len && w->service==WEBS_ANTHROPIC) {
         webmerge(&w->arena, &w->acc, webhitsclone(&w->arena, h), max);
@@ -8267,6 +9302,19 @@ static void webdone(Engine *e, WebRun *w, Arena scratch, i32 err, Str why)
     }
 }
 
+// How much of a response's body is kept, next given more: a fetched
+// PDF's more than a page's, known by its type or its first bytes.
+static i64 webbodymax(WebRun *w, Str more)
+{
+    if (w->status/100 != 2) {
+        return WEB_ERRBODY;
+    } else if (w->tool != TOOL_WEBFETCH) {
+        return WEB_REPLYMAX;
+    }
+    Str head = w->body.len ? Str{w->body.data, w->body.len} : more;
+    return webkind(w->ctype, head)==WEBK_PDF ? (i64)WEB_PDFMAX : (i64)WEB_PAGEMAX;
+}
+
 static void webrecord(Engine *e, WebRun *w, Arena scratch, Record r)
 {
     switch (r.type) {
@@ -8278,8 +9326,7 @@ static void webrecord(Engine *e, WebRun *w, Arena scratch, Record r)
         w->challenge = equalfold(trim(headervalue(head, "cf-mitigated")), "challenge");
     } return;
     case HTTP_BODY: {
-        i64 max  = w->status/100!=2 ? (i64)WEB_ERRBODY :
-                   w->tool==TOOL_WEBFETCH ? (i64)WEB_PAGEMAX : (i64)WEB_REPLYMAX;
+        i64 max  = webbodymax(w, r.data);
         i64 room = max - w->body.len;
         if (w->cut) {
             return;
@@ -8372,9 +9419,24 @@ static Slice<SkillDir> skilldirs(Session *s, Arena *a)
     return r;
 }
 
+// Whether a list of names, separated by blanks or commas, has one.
+static b32 skillnamed(Arena scratch, Str list, Str name)
+{
+    Slice<Str> names = instrnames(&scratch, list);
+    for (iz i = 0; i < names.len; i++) {
+        if (names[i] == name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // A session's skills as they are now: none while [skills] is off. The
 // built-in one too, unless one of the user's own has its name, or the
-// session follows only its project's instructions.
+// session follows only its project's instructions. Those [skills]
+// disabled names are left out, every one of the name, so that none
+// further away takes its place; those [skills] hidden names are the
+// user's alone, as with disable-model-invocation.
 static Skills sessskills(Session *s, Arena *a)
 {
     if (skilldeny(s->e)) {
@@ -8384,6 +9446,19 @@ static Skills sessskills(Session *s, Arena *a)
     if (!s->projinstr && !skillbyname(r.list, skillbuiltin)) {
         r.list = push(a, r.list, helpskill(a));
         sort(r.list.data, r.list.len, skillless, *a);
+    }
+    Str off  = cfgget(s->e->cfg, "skills", "", "disabled", 0);
+    Str hide = cfgget(s->e->cfg, "skills", "", "hidden", 0);
+    if (trim(off).len || trim(hide).len) {
+        iz n = 0;
+        for (iz i = 0; i < r.list.len; i++) {
+            Skill k = r.list[i];
+            if (!skillnamed(*a, off, k.name)) {
+                k.hidden |= skillnamed(*a, hide, k.name);
+                r.list[n++] = k;
+            }
+        }
+        r.list.len = n;
     }
     return r;
 }
@@ -8492,6 +9567,92 @@ static void skillcheck(Session *s, Arena scratch)
     skillsee(s, sk.list);
     notify(s, "skills", finish(&t), 0);
     s->notices[s->notices.len-1].skills = 1;
+}
+
+// After a summary, which may leave out the notices that told the agent
+// of instruction files, memories and skills since its system prompt:
+// all that now differs from the prompt, told again whole, for its next
+// request. Always against the prompt, so that a later summary, which
+// may leave out these too, tells it again.
+static void compactheed(Session *s, Arena scratch)
+{
+    Os *os = s->e->os;
+
+    Buf b(&scratch, 1024);
+    for (iz i = 0; i < s->instrfiles.len; i++) {
+        InstrStamp *k = &s->instrfiles[i];
+        b32 same = k->prompt && k->size==k->psize && k->mtime==k->pmtime;
+        if (same || (!k->prompt && k->mtime<0)) {
+            continue;  // in the prompt, or never there and now gone
+        }
+        print(&b, "\n\n## ");
+        print(&b, k->path);
+        Read rd = k->mtime<0 ? Read{} : os_readat(os, &scratch, k->path, 0, (iz)INSTR_MAX);
+        if (k->mtime<0 || rd.err) {
+            print(&b, "\n\nThis file is gone: its instructions no longer apply.");
+            continue;
+        }
+        if (k->prompt) {
+            print(&b, " (new version)");
+        } else {
+            print(&b, " (for the files under ");
+            print(&b, showpath(s->guard.cwd, k->under));
+            print(&b, ")");
+        }
+        print(&b, "\n\n");
+        print(&b, trimright(rd.data));
+    }
+    if (b.len) {
+        Str body = finish(&b);
+        Buf t(&scratch, 256 + body.len);
+        print(&t, "Your conversation was summarized, which may have left out "
+                  "instructions you were given since your system prompt. "
+                  "Follow them as they are now:");
+        print(&t, body);
+        notify(s, "instructions", finish(&t), 0);
+    }
+
+    if (s->memdir.len && !(s->memseen == s->memsys)) {
+        MemCut c = memcut(s->memseen);
+        Buf    t(&scratch, 512 + c.text.len);
+        print(&t, "Your conversation was summarized, which may have left out "
+                  "memories saved or forgotten since your system prompt. "
+                  "MEMORY.md now reads:\n\n");
+        print(&t, c.text.len ? c.text : Str("(empty: no memories)"));
+        if (c.cut) {
+            print(&t, "\n\n[Only its first 200 lines and 25 KB are shown "
+                      "here. Read it for the rest.]");
+        }
+        notify(s, "memory", finish(&t), 0);
+    }
+
+    b32 changed = s->skillsys.len != s->skillseen.len;
+    for (iz i = 0; !changed && i < s->skillseen.len; i++) {
+        Skill *was = skillbyname(s->skillsys, s->skillseen[i].name);
+        changed = !was || !(was->desc == s->skillseen[i].desc);
+    }
+    if (s->skillson && changed) {
+        Buf t(&scratch, 1024);
+        print(&t, "Your conversation was summarized, which may have left out "
+                  "changes to the skills since your system prompt listed "
+                  "them. Use the skill tool with the name of a skill when a "
+                  "task matches it. The skills now:");
+        for (iz i = 0; i < s->skillseen.len; i++) {
+            print(&t, "\n- ");
+            print(&t, s->skillseen[i].name);
+            print(&t, ": ");
+            print(&t, s->skillseen[i].desc);
+        }
+        for (iz i = 0; i < s->skillsys.len; i++) {
+            if (!skillbyname(s->skillseen, s->skillsys[i].name)) {
+                print(&t, "\n- ");
+                print(&t, s->skillsys[i].name);
+                print(&t, " (removed)");
+            }
+        }
+        notify(s, "skills", finish(&t), 0);
+        s->notices[s->notices.len-1].skills = 1;
+    }
 }
 
 // The agent may read a skill's other files without asking: its
@@ -8614,11 +9775,10 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
     k->tool    = tool;
     k->opened  = os_ticks(e->os);
     k->plansum = hash(plan.text);  // to know a plan revised by hand
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
-    i64 delay = leave ? 0 : cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    b32 wait  = attending(s);
+    i64 delay = leave ? 0 : cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait && delay) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   what = leave ? plan.text :
@@ -8640,7 +9800,7 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -8649,7 +9809,7 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
 
 // ask_user: its questions wait for the user's answers, unless nobody
 // can answer now, for [guard] question_timeout, or in plan mode with no
-// deadline (questionclock). Returns 1 if the call finished, 0 if the
+// deadline (askclock). Returns 1 if the call finished, 0 if the
 // session now waits for an answer.
 static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
 {
@@ -8666,8 +9826,7 @@ static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
     b32 wait  = attending(s);
     i64 delay = planning(s) ? 0 : questiondelay(e);
     if (wait && delay) {
-        arm(s, T_ASK, delay);
-        k->deadline = os_time(e->os) + delay/MS;
+        askarm(s, delay);
     }
     {
         Str   what = questiondetail(&scratch, qs);
@@ -8713,6 +9872,15 @@ enum : i64 {
     MCP_REGION = (i64)1 << (sizeof(void *)==8 ? 28 : 26),
 };
 
+// Whether the configuration defines a server by that name, with a
+// command or a url: a section that defines none only adjusts projects'
+// servers of that name (tools, enabled, timeout, startup_timeout).
+static b32 mcpdefines(Engine *e, Str name)
+{
+    return trim(cfgget(e->cfg, "mcp", name, "command", 0)).len ||
+           trim(cfgget(e->cfg, "mcp", name, "url", 0)).len;
+}
+
 // Where a server runs for a session: its section's cwd, from the
 // session's folder or the home directory, else the session's folder.
 static Str mcpcwd(Session *s, Arena *a, Str name)
@@ -8729,7 +9897,6 @@ static Str mcpcwd(Session *s, Arena *a, Str name)
 static Str       findpath(Os *, Arena *, Arena, Str path, Str name, b32 win);
 static Session  *findsession(Engine *, Str sid);
 static Converted topng(Os *, Arena *, Str data, b32 big, i64 edge, i64 pixels);
-static iz        base64len(iz n);
 
 static McpServer *mcpfind(Engine *e, Str name, Str cwd)
 {
@@ -8826,24 +9993,36 @@ struct McpTokens {
     Str access;
     Str refresh;
     i64 expires;  // Unix seconds, 0 if not known
+    Str account;  // a chatgpt endpoint's: its account's id, from the
+    Str email;    // id_token, and who signed in, on which plan
+    Str plan;
+    Str login;    // a copilot endpoint's: the GitHub user signed in,
+    Str api;      // and the account's own API root, if it has one
 };
 
-static Str mcpauthpath(Engine *e, Arena *a, Str name, Str url)
+// Where tokens are kept: <state>/mcp/auth for a server's, and
+// <state>/endpoints/auth for an endpoint's.
+static Str mcpauthdir(Engine *e, Arena *a, b32 ep)
+{
+    return join(a, join(a, e->statedir, ep ? Str("endpoints") : Str("mcp")), "auth");
+}
+
+static Str mcpauthpath(Engine *e, Arena *a, Str name, Str url, b32 ep = 0)
 {
     Buf b(a, 128);
     print(&b, mcpident(a, name));
     putbyte(&b, '-');
     printhex(&b, hash(url), 8);
     print(&b, ".json");
-    Str dir = join(a, join(a, e->statedir, "mcp"), "auth");
-    return join(a, dir, finish(&b));
+    return join(a, mcpauthdir(e, a, ep), finish(&b));
 }
 
-// A server's stored tokens, null url if none for that URL.
-static McpTokens mcptokens(Engine *e, Arena *a, Str name, Str url)
+// A server's stored tokens, or an endpoint's, null url if none for that
+// URL.
+static McpTokens mcptokens(Engine *e, Arena *a, Str name, Str url, b32 ep = 0)
 {
     McpTokens t    = {};
-    Str       path = mcpauthpath(e, a, name, url);
+    Str       path = mcpauthpath(e, a, name, url, ep);
     Read      r    = os_read(e->os, a, path, 1<<16);
     if (r.err != READ_OK) {
         return t;
@@ -8860,7 +10039,21 @@ static McpTokens mcptokens(Engine *e, Arena *a, Str name, Str url)
     t.access   = jsonstr(jsonget(j, "access_token"));
     t.refresh  = jsonstr(jsonget(j, "refresh_token"));
     t.expires  = jsonint(jsonget(j, "expires_at"), 0);
+    t.account  = jsonstr(jsonget(j, "account_id"));
+    t.email    = jsonstr(jsonget(j, "email"));
+    t.plan     = jsonstr(jsonget(j, "plan"));
+    t.login    = jsonstr(jsonget(j, "login"));
+    t.api      = jsonstr(jsonget(j, "api"));
     return t;
+}
+
+// The URL an endpoint's tokens are kept under: its url, and the client
+// it signs in as if [endpoint] client_id names one, so that a sign-in as
+// another client is kept apart, and changing it asks for a new one.
+static Str epauthurl(Engine *e, Arena *a, Endpoint *ep)
+{
+    Str client = trim(cfgget(e->cfg, "endpoint", ep->name, "client_id", 0));
+    return client.len ? concat(a, concat(a, ep->url, " "), client) : ep->url;
 }
 
 // Whether a server's own headers authorize it (a token, or a header
@@ -9238,7 +10431,7 @@ static void mcpconf(Engine *e, McpServer *m)
     Config *c  = e->cfg;
     m->startms = cfgms(c, "mcp", m->name, "startup_timeout", 0);
     m->callms  = cfgms(c, "mcp", m->name, "timeout", 0);
-    m->config  = inisection(e->ini, "mcp", m->name) != 0;
+    m->config  = mcpdefines(e, m->name);
 }
 
 // Start a server: its command, its environment, then initialize. A
@@ -9267,8 +10460,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     m->approve  = 0;
     m->trust    = 0;
     mcpconf(e, m);
-    Str only    = m->project.len ? Str{} : trim(cfgget(e->cfg, "mcp", m->name, "tools", 0));
-    m->only     = only.len ? clone(&m->arena, only) : Str{};
+    m->truncated = 0;
     i64 now     = os_ticks(e->os);
     m->startedat = now;
     m->readyby  = now + m->startms*MS;
@@ -9321,7 +10513,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     }
 
     Config  *c    = e->cfg;
-    b32      win  = s->te.windows;
+    b32      win  = s ? s->te.windows : e->te.windows;  // none: listing it
     McpWords w    = {};
     if (m->project.len) {
         w.words = m->argv;
@@ -9388,7 +10580,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     os_mkdirs(e->os, scratch, logdir);
     Buf lb(&scratch, 128);
     print(&lb, mcpident(&scratch, m->name));
-    putbyte(&lb, '-');
+    print(&lb, m->forlist ? Str("-list-") : Str("-"));  // another process's, maybe
     printhex(&lb, hash(m->cwd), 8);
     print(&lb, ".log");
     m->log = clone(&e->perm, join(&scratch, logdir, finish(&lb)));
@@ -9421,18 +10613,33 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
 // be. Null if the configuration has no such server.
 static McpDef *mcpdefof(Session *s, Arena scratch, Str name);
 
+static Str mcpprojkey(Arena *, McpDef *);
+
+// Whose a server of that name is for a session, as a call must find it
+// still: "config", a project's key (mcpprojkey), or null for none.
+static Str mcporigin(Session *s, Arena *a, Str name)
+{
+    Engine *e   = s->e;
+    b32     cfg = trim(cfgget(e->cfg, "mcp", name, "url", 0)).len ||
+                  trim(cfgget(e->cfg, "mcp", name, "command", 0)).len;
+    McpDef *d   = cfg ? 0 : mcpdefof(s, *a, name);
+    return cfg ? Str("config") : d ? mcpprojkey(a, d) : Str{};
+}
+
 static McpServer *mcpserver(Session *s, Arena scratch, Str name)
 {
     Engine    *e   = s->e;
     Str        url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
-    b32        cfg = url.len || trim(cfgget(e->cfg, "mcp", name, "command", 0)).len;
+    Str        cmd = trim(cfgget(e->cfg, "mcp", name, "command", 0));
+    b32        cfg = url.len || cmd.len;
     McpDef    *d   = cfg ? 0 : mcpdefof(s, scratch, name);
     if (!cfg && !d) {
         return 0;
     }
-    // An HTTP server is one for every folder
-    Str        cwd = d ? (d->url.len ? Str("") : d->dir) :
-                     url.len ? Str("") : mcpcwd(s, &scratch, name);
+    // An HTTP server is one for every folder, by its url, so that no two
+    // urls (two projects', or a project's and the configuration's) share
+    Str        cwd = d ? (d->url.len ? d->url : d->dir) :
+                     url.len ? url : mcpcwd(s, &scratch, name);
     McpServer *m   = mcpfind(e, name, cwd);
     if (!m) {
         m = alloc<McpServer>(&e->perm);
@@ -9440,6 +10647,28 @@ static McpServer *mcpserver(Session *s, Arena scratch, Str name)
         m->cwd  = clone(&e->perm, cwd);
         m->next = e->mcp;
         e->mcp  = m;
+    }
+
+    // What it is defined as: changed, it starts afresh, and never runs
+    // on as another's (a project's process with the configuration's
+    // trust, say)
+    Str origin = d ? mcpprojkey(&scratch, d) : Str("config");
+    Str def    = d ? concat(&scratch, concat(&scratch, origin, "\n"), d->raw)
+                   : concat(&scratch, concat(&scratch, url, "\n"), cmd);
+    if (m->def.data && m->def!=def) {
+        if (m->state != MCP_STOPPED) {
+            Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
+                             Str(" started again, as its definition changed."));
+            mcpstop(e, scratch, m, why);
+            m->state = MCP_STOPPED;
+        }
+        m->approve  = 0;
+        m->needauth = 0;
+        m->tools    = {};
+    }
+    if (m->def != def) {
+        m->def    = clone(&e->perm, def);
+        m->origin = clone(&e->perm, origin);
     }
     if (d && (m->project!=d->file || m->raw!=d->raw)) {
         // Its definition, kept apart from any session's (and from those
@@ -9498,6 +10727,9 @@ static void mcpoffer(Session *s, Arena scratch)
         McpServer *m = mcpserver(s, scratch, names[i]);
         b32        have = !m;
         for (iz k = 0; m && k < s->mcpsrvs.len; k++) {
+            if (s->mcpsrvs[k]!=m && s->mcpsrvs[k]->name==m->name) {
+                s->mcpsrvs[k] = m;  // another instance now: its url changed
+            }
             have |= s->mcpsrvs[k] == m;
         }
         if (!have) {
@@ -9644,11 +10876,13 @@ static i32 mcpprojdecided(Session *s, Arena scratch, Str key)
 }
 
 // The project's server of a name that the session may start: the
-// nearest file's, approved, when no section of the configuration has
-// that name. Null if none.
+// nearest file's, approved, when the configuration defines no server of
+// that name (mcpdefines), nor turns it off. Null if none.
 static McpDef *mcpdefof(Session *s, Arena scratch, Str name)
 {
-    if (inisection(s->e->ini, "mcp", name)) {
+    Engine *e = s->e;
+    if (mcpdefines(e, name) ||
+            cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0)))==0) {
         return 0;
     }
     for (iz i = 0; i < s->mcpdefs.len; i++) {
@@ -9727,8 +10961,10 @@ static b32 mcpprojgate(Session *s, Arena scratch)
     Slice<Str>      keys = {};
     for (iz i = 0; i < s->mcpdefs.len; i++) {
         McpDef *d = &s->mcpdefs[i];
-        if (inisection(e->ini, "mcp", d->name)) {
+        if (mcpdefines(e, d->name)) {
             continue;  // the configuration's own
+        } else if (cfgbool(trim(cfgget(e->cfg, "mcp", d->name, "enabled", 0))) == 0) {
+            continue;  // turned off, never asked about
         } else if (d->err.len) {
             Str  what = concat(&scratch, "project:", d->name);
             b32  told = 0;
@@ -9778,11 +11014,10 @@ static b32 mcpprojgate(Session *s, Arena scratch)
     k->project = 1;
     k->grant   = "project";
     k->opened  = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    b32 wait  = attending(s);
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Buf files(&scratch, 256);
@@ -9809,12 +11044,12 @@ static b32 mcpprojgate(Session *s, Arena scratch)
         putstrkey(&w.json, "detail", detail);
         putstrkey(&w.json, "always", "project");
         putstrkey(&w.json, "scope", "mcp.project");
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -9905,7 +11140,8 @@ static b32 approvegate(Session *s, Arena scratch)
         }
     }
     if (!want.len && epno) {
-        endturn(s, scratch, "error", epheldmsg(&scratch, &s->ep));
+        Str why = epheldmsg(&scratch, &s->ep);
+        endturn(s, scratch, "error", why);
         return 0;
     } else if (!want.len) {
         return 1;
@@ -9928,11 +11164,10 @@ static b32 approvegate(Session *s, Arena scratch)
     k->tool    = TOOL_NONE;
     k->approve = 1;
     k->opened  = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    b32 wait  = attending(s);
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         // A line a url: what would go there, and which section sends it
@@ -9971,12 +11206,12 @@ static b32 approvegate(Session *s, Arena scratch)
         putstrkey(&w.json, "path", path);
         putstrkey(&w.json, "detail", detail);
         putstrkey(&w.json, "scope", "approve");
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return approvegate(s, scratch);  // ends the turn if its endpoint's
     }
     setstate(s, S_ASK);
@@ -10047,6 +11282,18 @@ static void logprefix(Session *, Arena);
 // are not fixed, waited for (S_MCP) until each is ready or failed. Then
 // the tools of those ready that it lacks join its prefix, logged anew.
 // Returns 0 while it waits: mcpwake goes on, through prepare.
+// Whether the configuration keeps a server's tool, by the server's name
+// for it, as it says now: the server's section enabled, and its tools
+// key (mcponly) offering it. A session's tool turned off since is not
+// taken away, as its tools stay as they began, but its calls are
+// refused (mcpcall).
+static b32 mcpkept(Engine *e, Str server, Str tool)
+{
+    Config *c = e->cfg;
+    return cfgbool(trim(cfgget(c, "mcp", server, "enabled", 0)))!=0 &&
+           mcponly(trim(cfgget(c, "mcp", server, "tools", 0)), tool);
+}
+
 static b32 mcpgate(Session *s, Arena scratch)
 {
     if (s->readonly) {
@@ -10091,7 +11338,8 @@ static b32 mcpgate(Session *s, Arena scratch)
         b32 any = 0;
         for (iz k = 0; k < m->tools.len; k++) {
             McpTool *t = &m->tools[k];
-            if (!mcpallowed(s->mcpfilter, m->name, t->name) || mcptoolof(s, t->name)) {
+            if (!mcpallowed(s->mcpfilter, m->name, t->name) ||
+                    !mcpkept(s->e, m->name, t->tool) || mcptoolof(s, t->name)) {
                 continue;
             }
             b32 clash = toolfind(t->name) != TOOL_NONE;
@@ -10110,6 +11358,7 @@ static b32 mcpgate(Session *s, Arena scratch)
             c.tool   = clone(&s->perm, t->tool);
             c.desc   = clone(&s->perm, t->desc);
             c.schema = clone(&s->perm, t->schema);
+            c.origin = clone(&s->perm, m->origin);
             add      = push(&scratch, add, c);
             any      = 1;
         }
@@ -10234,9 +11483,14 @@ static void mcpcallsend(Session *s, Arena scratch)
 
 // Run the current call, allowed: sent to its server, or once it is
 // ready. Returns 1 if it ended already, 0 if it waits.
+static b32 mcpmoved(Session *, Arena, McpTool *, b32 started);
+
 static b32 mcprun(Session *s, Arena scratch, McpTool *t)
 {
     Engine    *e = s->e;
+    if (mcpmoved(s, scratch, t, 1)) {
+        return 1;  // while it asked, say
+    }
     McpServer *m = mcpserver(s, scratch, t->server);
     if (!m) {
         Str why = concat(&scratch, concat(&scratch, "The MCP server ", t->server),
@@ -10246,6 +11500,9 @@ static b32 mcprun(Session *s, Arena scratch, McpTool *t)
     }
     b32 have = 0;
     for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        if (s->mcpsrvs[i]!=m && s->mcpsrvs[i]->name==m->name) {
+            s->mcpsrvs[i] = m;
+        }
         have |= s->mcpsrvs[i] == m;
     }
     if (!have) {
@@ -10470,6 +11727,11 @@ static Str mcpwhat(Arena *a, McpTool *t, Str args)
 // define the server. Null for a server that runs a command.
 static Str mcpurlkey(Arena *a, McpServer *m)
 {
+    if (m->project.len) {
+        // A project's, by its definition, so that a grant for it never
+        // holds for the configuration's server of the same name
+        return concat(a, "project:", m->origin);
+    }
     return m->url.len ? cfgsha256(a, m->url) : Str{};
 }
 
@@ -10496,6 +11758,29 @@ static void mcpprojtrust(Session *s, Arena scratch, Str server)
     mcpprojremember(s->e, scratch, defs, keys, 1);
 }
 
+// Whether a tool's server is no longer the one it came from (a
+// project's now, where the configuration's was, say), its call ended
+// unrun: its schema, its grants and its trust were another's. A tool
+// logged before origins were has none, and is not checked.
+static b32 mcpmoved(Session *s, Arena scratch, McpTool *t, b32 started)
+{
+    if (!t->origin.len) {
+        return 0;
+    }
+    Str now = mcporigin(s, &scratch, t->server);
+    if (!now.len || now==t->origin) {
+        return 0;  // gone: the call says so where it would run
+    }
+    Str why = concat(&scratch, concat(&scratch, "Not run: the MCP server ", t->server),
+                     Str(" is not the one this tool came from any more (its "
+                         "definition changed); a new session gets its tools."));
+    if (!started) {
+        toolstart(s, scratch);
+    }
+    toolend(s, scratch, "denied", why, 0, 0, {}, 0);
+    return 1;
+}
+
 // A call to an MCP tool: refused in plan mode unless it only reads,
 // asked about unless its server is trusted (by its section, or a
 // project's for good), a grant covers it or its server, or the session
@@ -10516,6 +11801,21 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         toolstart(s, scratch);
         toolend(s, scratch, "denied", "Not run: plan mode is on, and this MCP tool "
                 "does not say that it only reads.", 0, 0, {}, 0);
+        return 1;
+    } else if (mcpmoved(s, scratch, t, 0)) {
+        return 1;
+    } else if (!mcpkept(e, t->server, t->tool)) {
+        // Turned off since the session got it: refused, whoever trusts it
+        b32 off = cfgbool(trim(cfgget(e->cfg, "mcp", t->server, "enabled", 0))) == 0;
+        Buf b(&scratch, 256);
+        print(&b, "Not run: the MCP server ");
+        print(&b, t->server);
+        print(&b, off ? Str(" is turned off in the settings ([mcp ")
+                      : Str("'s tool is turned off in the settings (tools of [mcp "));
+        print(&b, t->server);
+        print(&b, "]).");
+        toolstart(s, scratch);
+        toolend(s, scratch, "denied", finish(&b), 0, 0, {}, 0);
         return 1;
     }
     if (m) {
@@ -10546,11 +11846,10 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     k->trust  = d ? clone(&s->perm, t->server) : Str{};
     k->mcpurl = all.host.len ? clone(&s->perm, all.host) : Str{};
     k->opened = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    b32 wait  = attending(s);
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   what = mcpwhat(&scratch, t, c->args);
@@ -10567,12 +11866,12 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         if (k->trust.len) {
             putstrkey(&w.json, "trust", k->trust);
         }
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -10586,11 +11885,12 @@ static void mcplisted(Engine *e, Arena scratch, McpServer *m, Json *res)
 {
     for (Json *t = jsonget(res, "tools")->child; t; t = t->next) {
         McpTool x = mcptool(&m->arena, m->name, t);
-        if (x.tool.len && mcponly(m->only, x.tool)) {
-            m->tools = push(&m->arena, m->tools, x);
+        if (x.tool.len) {
+            m->tools = push(&m->arena, m->tools, x);  // kept or not (mcpkept)
         }
     }
     Str next = jsonstr(jsonget(res, "nextCursor"));
+    m->truncated = next.len && m->pages+1>=MCP_PAGES;
     if (next.len && ++m->pages<MCP_PAGES) {
         Buf     b(&scratch, 64 + next.len);
         JsonOut w = {&b};
@@ -10604,7 +11904,8 @@ static void mcplisted(Engine *e, Arena scratch, McpServer *m, Json *res)
     }
     m->state     = MCP_READY;
     m->refreshed = 0;
-    mcpwake(e, scratch, m);
+    m->lastuse   = os_ticks(e->os);  // its idle minute from now, however
+    mcpwake(e, scratch, m);          // long it took to start
 }
 
 // One message from a server: a response to one of ours, a request of
@@ -10896,20 +12197,32 @@ static i64 mcpnext(Engine *e)
     }
     for (McpAuth *x = e->mcpauths; x; x = x->next) {
         next = x->by<next ? x->by : next;
+        if (x->stage==MCPAUTH_POLL && x->pollat && x->pollat<next) {
+            next = x->pollat;  // GitHub asked again then
+        }
     }
     return next;
 }
 
 static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why);
 
+static void epdevicepoll(Engine *, Arena, McpAuth *);
+static void mcpauthfree(Engine *, McpAuth *);
+
 static void mcptick(Engine *e, Arena scratch, i64 now)
 {
     for (McpAuth *x = e->mcpauths, *next; x; x = next) {
         next = x->next;
-        if (now >= x->by) {
+        if (now>=x->by && x->stage==MCPAUTH_DONE) {
+            mcpauthfree(e, x);  // nobody came to hear
+        } else if (now >= x->by) {
             mcpauthfail(e, scratch, x, x->stage==MCPAUTH_WAIT
-                        ? Str("nobody signed in within 10 minutes")
+                        ? Str("nobody signed in within 10 minutes") :
+                        x->stage==MCPAUTH_POLL
+                        ? Str("nobody entered the code at GitHub in time")
                         : Str("the server took too long to answer"));
+        } else if (x->stage==MCPAUTH_POLL && x->pollat && now>=x->pollat) {
+            epdevicepoll(e, scratch, x);
         }
     }
     for (McpServer *m = e->mcp; m; m = m->next) {
@@ -10973,10 +12286,10 @@ static void mcpquit(Engine *e)
 // server name and URL, readable only by the user, and are sent only to
 // that URL.
 
-static b32 mcpsavetokens(Engine *e, Arena scratch, Str name, McpTokens *t)
+static b32 mcpsavetokens(Engine *e, Arena scratch, Str name, McpTokens *t, b32 ep = 0)
 {
-    Str path = mcpauthpath(e, &scratch, name, t->url);
-    Str dir  = join(&scratch, join(&scratch, e->statedir, "mcp"), "auth");
+    Str path = mcpauthpath(e, &scratch, name, t->url, ep);
+    Str dir  = mcpauthdir(e, &scratch, ep);
     os_mkdirs(e->os, scratch, dir);
     Buf     b(&scratch, 1<<12);
     JsonOut w = {&b};
@@ -10994,6 +12307,21 @@ static b32 mcpsavetokens(Engine *e, Arena scratch, Str name, McpTokens *t)
     }
     if (t->expires) {
         putintkey(&w, "expires_at", t->expires);
+    }
+    if (t->account.len) {
+        putstrkey(&w, "account_id", t->account);
+    }
+    if (t->email.len) {
+        putstrkey(&w, "email", t->email);
+    }
+    if (t->plan.len) {
+        putstrkey(&w, "plan", t->plan);
+    }
+    if (t->login.len) {
+        putstrkey(&w, "login", t->login);
+    }
+    if (t->api.len) {
+        putstrkey(&w, "api", t->api);
     }
     putend(&w);
     print(&b, "\n");
@@ -11054,12 +12382,41 @@ static void mcprestartall(Engine *e, Arena scratch, Str name, Str url)
     }
 }
 
+static void epauthwake(Engine *, Arena, Str name, Str why);
+static Str  epsigninmsg(Arena *, Str name);
+static void epdeviceend(Engine *, Arena, McpAuth *, Str err);
+
 // A sign-in or refresh ended badly: whoever waits hears why.
 static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why)
 {
+    b32 device = x->stage==MCPAUTH_POLL || x->stage==MCPAUTH_USER;
+    if (device && !x->cmd) {
+        epdeviceend(e, scratch, x, why);  // for the wait to come
+        return;
+    }
     if (x->cmd) {
         Str msg = concat(&scratch, "signing in failed: ", why);
         reply(e, scratch, x->cmd, 0, msg, {});
+    }
+    if (x->ep && x->stage==MCPAUTH_REFRESH) {
+        // Refused, the tokens are no good: forgotten, so that the
+        // endpoint shows as signed out
+        b32 refused = x->status==400 || x->status==401;
+        if (refused) {
+            Str path = mcpauthpath(e, &scratch, x->name, x->resource, 1);
+            os_remove(e->os, scratch, path);
+        }
+        // All that it allocates before the buffer, which holds the rest
+        Str again = refused ? epsigninmsg(&scratch, x->name) : Str("try again");
+        Str name  = clone(&scratch, x->name);
+        Buf b(&scratch, 256 + why.len + again.len);
+        print(&b, "ChatGPT's sign-in could not be refreshed (");
+        print(&b, why);
+        print(&b, refused ? Str("), so it needs you to sign in again: ") : Str("); "));
+        print(&b, again);
+        mcpauthfree(e, x);
+        epauthwake(e, scratch, name, finish(&b));
+        return;
     }
     if (x->stage == MCPAUTH_REFRESH) {
         for (McpServer *m = e->mcp; m; m = m->next) {
@@ -11072,14 +12429,16 @@ static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why)
 }
 
 static b32 mcpauthhttp(Engine *e, Arena scratch, McpAuth *x, Str method, Str url,
-                       Str type, Str body)
+                       Str type, Str body, Str more = {})
 {
     if (x->h) {
         os_httpfree(e->os, x->h);
         x->h = 0;
     }
-    Buf h(&scratch, 128);
+    Buf h(&scratch, 256 + more.len);
     print(&h, "Accept: application/json\r\n");
+    print(&h, "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+    print(&h, more);
     if (type.len) {
         print(&h, "Content-Type: ");
         print(&h, type);
@@ -11127,8 +12486,10 @@ static Str mcpauthform(Arena *a, McpAuth *x, Str grant)
         print(&b, "&client_secret=");
         print(&b, pctencode(a, x->secret));
     }
-    print(&b, "&resource=");
-    print(&b, pctencode(a, x->resource));
+    if (!x->ep) {
+        print(&b, "&resource=");
+        print(&b, pctencode(a, x->resource));
+    }
     return finish(&b);
 }
 
@@ -11262,10 +12623,33 @@ static void mcpauthtokens(Engine *e, Arena scratch, McpAuth *x, Json *j)
     t.refresh  = t.refresh.len ? t.refresh : x->refresh;  // kept unless replaced
     i64 in     = jsonint(jsonget(j, "expires_in"), 0);
     t.expires  = in>0 ? os_time(e->os)/1000 + in : 0;
+    if (x->ep) {
+        // The account, from the id_token's claims, else the access
+        // token's, else as it was; and when the access token expires
+        Str   idt  = jsonstr(jsonget(j, "id_token"));
+        Json *id   = jwtclaims(&scratch, idt);
+        Json *at   = jwtclaims(&scratch, t.access);
+        Json *auth = jsonget(id, "https://api.openai.com/auth");
+        Json *aa   = jsonget(at, "https://api.openai.com/auth");
+        Str   acct = jsonstr(jsonget(auth, "chatgpt_account_id"));
+        acct = acct.len ? acct : jsonstr(jsonget(aa, "chatgpt_account_id"));
+        Str   plan = jsonstr(jsonget(auth, "chatgpt_plan_type"));
+        plan = plan.len ? plan : jsonstr(jsonget(aa, "chatgpt_plan_type"));
+        Str   mail = jsonstr(jsonget(id, "email"));
+        t.account  = acct.len ? acct : x->account;
+        t.plan     = plan.len ? plan : x->plan;
+        t.email    = mail.len ? mail : x->email;
+        i64 exp    = jsonint(jsonget(at, "exp"), 0);
+        t.expires  = t.expires ? t.expires : exp;
+        if (t.access.len && !t.account.len) {
+            mcpauthfail(e, scratch, x, "the sign-in named no ChatGPT account");
+            return;
+        }
+    }
     if (!t.access.len) {
         mcpauthfail(e, scratch, x, "the server's response gave no access token");
         return;
-    } else if (!mcpsavetokens(e, scratch, x->name, &t)) {
+    } else if (!mcpsavetokens(e, scratch, x->name, &t, x->ep)) {
         Str why = concat(&scratch, "the tokens could not be saved: ", os_lasterr(e->os, &scratch));
         mcpauthfail(e, scratch, x, why);
         return;
@@ -11274,8 +12658,13 @@ static void mcpauthtokens(Engine *e, Arena scratch, McpAuth *x, Json *j)
         reply(e, scratch, x->cmd, 1, {}, {});
     }
     Str name = clone(&scratch, x->name), url = clone(&scratch, x->resource);
+    b32 ep   = x->ep;
     mcpauthfree(e, x);
-    mcprestartall(e, scratch, name, url);
+    if (ep) {
+        epauthwake(e, scratch, name, {});
+    } else {
+        mcprestartall(e, scratch, name, url);
+    }
 }
 
 // An OAuth error response's words, for a message.
@@ -11300,6 +12689,9 @@ static Str mcpautherr(Arena *a, McpAuth *x)
     return finish(&b);
 }
 
+static void epdevicerecord(Engine *, Arena, McpAuth *, Json *);
+static b32  jsonflag(Json *, b32 dflt);
+
 static void mcpauthrecord(Engine *e, Arena scratch, McpAuth *x, Record r)
 {
     switch (r.type) {
@@ -11318,6 +12710,15 @@ static void mcpauthrecord(Engine *e, Arena scratch, McpAuth *x, Record r)
     if (!err && x->status==200) {
         j = jsonparse(&scratch, Str{x->body.data, x->body.len}).root;
         j = j->type==JSON_OBJECT ? j : 0;
+    }
+    if (x->stage>=MCPAUTH_DEVICE && x->stage<=MCPAUTH_USER) {
+        if (err) {
+            Str msg = concat(&scratch, "GitHub: ", why.len ? why : Str("no response"));
+            mcpauthfail(e, scratch, x, msg);
+        } else {
+            epdevicerecord(e, scratch, x, j);
+        }
+        return;
     }
     switch (x->stage) {
     case MCPAUTH_PRM:
@@ -11377,10 +12778,10 @@ static McpAuth *mcpauthbyhttp(Engine *e, u64 id)
     return 0;
 }
 
-static McpAuth *mcpauthnew(Engine *e, Arena scratch, Str name, Str url)
+static McpAuth *mcpauthnew(Engine *e, Arena scratch, Str name, Str url, b32 ep = 0)
 {
     for (McpAuth *x = e->mcpauths; x; x = x->next) {
-        if (x->name == name) {
+        if (x->name==name && x->ep==ep) {
             mcpauthfail(e, scratch, x, "another sign-in began");
             break;
         }
@@ -11394,6 +12795,7 @@ static McpAuth *mcpauthnew(Engine *e, Arena scratch, Str name, Str url)
     x->mem      = mem;
     x->name     = clone(&a, name);
     x->resource = clone(&a, url);
+    x->ep       = ep;
     x->by       = os_ticks(e->os) + 10*60*SEC;
     x->arena    = a;
     x->body     = Buf(&x->arena, 1<<12);
@@ -11452,12 +12854,13 @@ static void mcpunauthorized(Engine *e, Arena scratch, McpServer *m, McpHttp *q)
     }
 }
 
-// The URL of a server by name: its section's, else that of a project's
-// server running by that name. Null if it has none.
+// The URL of a server by name: its section's, where that defines it,
+// else that of a project's server running by that name. Null if it has
+// none.
 static Str mcpurlof(Engine *e, Str name)
 {
     Str url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
-    if (url.len || inisection(e->ini, "mcp", name)) {
+    if (mcpdefines(e, name)) {
         return url;
     }
     for (McpServer *m = e->mcp; m; m = m->next) {
@@ -11496,10 +12899,13 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
     }
     x->cmd      = id;
     x->redirect = clone(&x->arena, redirect);
-    Str client  = trim(cfgget(e->cfg, "mcp", name, "client_id", 0));
-    Str secret  = cfgsecret(e->cfg, &scratch, "mcp", name, "client_secret");
-    Str scope   = trim(cfgget(e->cfg, "mcp", name, "scope", 0));
-    Str cname   = trim(cfgget(e->cfg, "mcp", name, "client_name", 0));
+    // The section's client only for its own url: never for a project's
+    // server of the same name, whose url the project chose
+    b32 own     = url == trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    Str client  = own ? trim(cfgget(e->cfg, "mcp", name, "client_id", 0)) : Str{};
+    Str secret  = own ? cfgsecret(e->cfg, &scratch, "mcp", name, "client_secret") : Str{};
+    Str scope   = own ? trim(cfgget(e->cfg, "mcp", name, "scope", 0)) : Str{};
+    Str cname   = own ? trim(cfgget(e->cfg, "mcp", name, "client_name", 0)) : Str{};
     Str said    = {};
     for (McpServer *m = e->mcp; m; m = m->next) {
         if (m->name==name && m->url==url) {
@@ -11525,9 +12931,22 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
 static void cmdmcpcode(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str      name = jsonstr(jsonget(j, "name"));
+    b32      ep   = jsonint(jsonget(j, "endpoint"), 0) != 0;
     McpAuth *x    = 0;
+    McpAuth *dev  = 0;
     for (McpAuth *k = e->mcpauths; k; k = k->next) {
-        x = k->name==name && k->stage==MCPAUTH_WAIT ? k : x;
+        x   = k->name==name && k->ep==ep && k->stage==MCPAUTH_WAIT ? k : x;
+        dev = k->name==name && ep && k->stage>=MCPAUTH_POLL ? k : dev;
+    }
+    if (!x && dev && !dev->cmd) {
+        // A device flow: its end waited for, or heard now if it came
+        if (dev->stage == MCPAUTH_DONE) {
+            dev->cmd = id;
+            epdeviceend(e, scratch, dev, dev->err);
+        } else {
+            dev->cmd = id;
+        }
+        return;
     }
     if (!x) {
         Str why = concat(&scratch, "no sign-in waits for ", name);
@@ -11590,6 +13009,462 @@ static void cmdmcplogout(Engine *e, Arena scratch, i64 id, Json *j)
                 mcpneedauth(e, scratch, m);
             }
         }
+    }
+    reply(e, scratch, id, 1, {}, {});
+}
+
+// Signing in for an endpoint: to ChatGPT (kind chatgpt) or GitHub
+// Copilot (kind copilot)
+//
+// ChatGPT's sign-in is MCP's (McpAuth) with a fixed issuer and client,
+// the Codex CLI's, started by endpoint.auth and finished by mcp.code
+// {endpoint:1}. Tokens are kept in <state>/endpoints/auth, one file per
+// endpoint name and URL (and client, if [endpoint] client_id names one:
+// epauthurl), and read at each request, so that a sign-in or another
+// engine's refresh applies at once. An access token about to expire, or
+// refused (401) once in a turn, is refreshed once for every session and
+// relayed call that needs it, which wait for it (S_AUTH) at no cost:
+// nothing was shown yet. Refused a refresh, the tokens are forgotten,
+// and what waited ends, saying how to sign in.
+//
+// Copilot's is GitHub's device flow, as Prospero's own GitHub app
+// unless client_id names another: endpoint.auth replies with a code for
+// the user to enter at GitHub's page, while the engine asks GitHub every
+// few seconds whether it was (MCPAUTH_POLL), and mcp.code {endpoint:1}
+// with no code waits for the end. GitHub is then asked whether the
+// account has Copilot, and where its API is (MCPAUTH_USER). The token
+// neither expires nor refreshes: refused, the user signs in again.
+
+enum : i32 { EPAUTH_OK, EPAUTH_WAIT, EPAUTH_NONE };
+
+// The message for an endpoint that needs a sign-in.
+static Str epsigninmsg(Arena *a, Str name)
+{
+    Buf b(a, 128 + 2*name.len);
+    print(&b, "in Settings, at endpoint ");
+    print(&b, name);
+    print(&b, ", Sign in, or run: prospero endpoint auth ");
+    print(&b, name);
+    return finish(&b);
+}
+
+// The OAuth client an endpoint signs in as: [endpoint] client_id, else
+// its kind's own, Prospero's GitHub app or the Codex CLI's.
+static Str epclient(Engine *e, Endpoint *ep)
+{
+    Str c = trim(cfgget(e->cfg, "endpoint", ep->name, "client_id", 0));
+    return c.len ? c : ep->kind==EP_COPILOT ? copilotclient : chatgptclient;
+}
+
+static McpAuth *eprefreshing(Engine *e, Str name)
+{
+    for (McpAuth *x = e->mcpauths; x; x = x->next) {
+        if (x->ep && x->name==name && x->stage==MCPAUTH_REFRESH) {
+            return x;
+        }
+    }
+    return 0;
+}
+
+// Whether a chatgpt endpoint's tokens will do for a request: EPAUTH_OK,
+// else EPAUTH_WAIT with a refresh under way (begun if need be), else
+// EPAUTH_NONE with *why saying so. stale is the hash of an access token
+// refused, to be refreshed unless another has replaced it already.
+static i32 epauth(Engine *e, Arena *a, Endpoint *ep, u64 stale, Str *why)
+{
+    Str       key = epauthurl(e, a, ep);
+    McpTokens t   = mcptokens(e, a, ep->name, key, 1);
+    if (!t.access.len) {
+        Str msg = concat(a, "endpoint ", ep->name);
+        msg  = concat(a, msg, " is not signed in to ");
+        msg  = concat(a, msg, epservice(ep->kind));
+        *why = concat(a, msg, concat(a, ": sign in ",
+                                            epsigninmsg(a, ep->name)));
+        return EPAUTH_NONE;
+    } else if (ep->kind == EP_COPILOT) {
+        return EPAUTH_OK;  // never expires; refused, it is signed in again
+    }
+    i64 now     = os_time(e->os) / 1000;
+    b32 expired = t.expires && now>=t.expires-60;
+    b32 refused = stale && hash(t.access)==stale;
+    if (!expired && !refused) {
+        return EPAUTH_OK;
+    } else if (eprefreshing(e, ep->name)) {
+        return EPAUTH_WAIT;
+    } else if (!t.refresh.len) {
+        Str msg = concat(a, "endpoint ", ep->name);
+        msg  = concat(a, msg, "'s ChatGPT sign-in expired: sign in again ");
+        *why = concat(a, msg, epsigninmsg(a, ep->name));
+        return EPAUTH_NONE;
+    }
+    for (McpAuth *x = e->mcpauths; x; x = x->next) {
+        if (x->ep && x->name==ep->name) {
+            *why = "signing in to ChatGPT is under way: finish it in the "
+                   "browser, then try again";
+            return EPAUTH_NONE;
+        }
+    }
+    McpAuth *x = mcpauthnew(e, *a, ep->name, key, 1);
+    if (!x) {
+        *why = "out of memory";
+        return EPAUTH_NONE;
+    }
+    x->stage    = MCPAUTH_REFRESH;
+    x->by       = os_ticks(e->os) + 60*SEC;
+    x->issuer   = clone(&x->arena, e->chatgptauth);
+    x->tokenurl = clone(&x->arena, concat(a, e->chatgptauth, "/oauth/token"));
+    x->client   = clone(&x->arena, epclient(e, ep));
+    x->refresh  = clone(&x->arena, t.refresh);
+    x->account  = clone(&x->arena, t.account);
+    x->email    = clone(&x->arena, t.email);
+    x->plan     = clone(&x->arena, t.plan);
+    Str grant   = concat(a, "grant_type=refresh_token&refresh_token=",
+                         pctencode(a, t.refresh));
+    grant = concat(a, grant, "&scope=openid%20profile%20email");
+    Str form    = mcpauthform(a, x, grant);
+    if (!mcpauthhttp(e, *a, x, "POST", x->tokenurl,
+                     "application/x-www-form-urlencoded", form)) {
+        mcpauthfree(e, x);
+        *why = "ChatGPT's sign-in could not be refreshed: the token request "
+               "could not be made";
+        return EPAUTH_NONE;
+    }
+    return EPAUTH_WAIT;
+}
+
+// A chatgpt endpoint's request headers, beyond authheaders': its access
+// token and account, and Codex's own. Nothing if it is not signed in,
+// which the server then refuses. sid is the session's, for session_id,
+// and *sent, if given, gets the token's hash.
+static Str chatgptheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, u64 *sent)
+{
+    McpTokens t = mcptokens(e, a, ep->name, epauthurl(e, a, ep), 1);
+    Buf       b(a, 256 + t.access.len + t.account.len + sid.len);
+    if (t.access.len) {
+        print(&b, "Authorization: Bearer ");
+        print(&b, t.access);
+        print(&b, "\r\nchatgpt-account-id: ");
+        print(&b, t.account);
+        print(&b, "\r\n");
+    }
+    print(&b, "OpenAI-Beta: responses=experimental\r\noriginator: ");
+    print(&b, chatgptoriginator);
+    print(&b, "\r\n");
+    if (sid.len) {
+        print(&b, "session_id: ");
+        print(&b, sid);
+        print(&b, "\r\n");
+    }
+    if (sent) {
+        *sent = t.access.len ? hash(t.access) : 0;
+    }
+    return finish(&b);
+}
+
+// A copilot endpoint's request headers, beyond authheaders': its token,
+// the API's version, what the request is (CpHint, none for a listing),
+// and the product [endpoint] integration_id names, if it does. Nothing
+// of the token if it is not signed in, which the server then refuses.
+static Str copilotheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, CpHint h)
+{
+    McpTokens t = mcptokens(e, a, ep->name, epauthurl(e, a, ep), 1);
+    Buf       b(a, 512 + t.access.len + sid.len);
+    if (t.access.len) {
+        print(&b, "Authorization: Bearer ");
+        print(&b, t.access);
+        print(&b, "\r\n");
+    }
+    print(&b, "X-GitHub-Api-Version: ");
+    print(&b, copilotapiver);
+    print(&b, "\r\nOpenai-Intent: conversation-edits\r\n");
+    if (h.initiator.len) {
+        print(&b, "x-initiator: ");
+        print(&b, h.initiator);
+        print(&b, "\r\nX-Interaction-Type: ");
+        print(&b, h.interaction);
+        print(&b, "\r\n");
+    }
+    if (sid.len) {
+        print(&b, "X-Interaction-Id: ");
+        print(&b, sid);
+        print(&b, "\r\n");
+    }
+    if (h.vision) {
+        print(&b, "Copilot-Vision-Request: true\r\n");
+    }
+    // As the user names it, at their own risk: never one of our own
+    Str product = trim(cfgget(e->cfg, "endpoint", ep->name, "integration_id", 0));
+    if (relayname(product)) {
+        print(&b, "Copilot-Integration-Id: ");
+        print(&b, product);
+        print(&b, "\r\n");
+    }
+    return finish(&b);
+}
+
+static void relayauthwake(Engine *, Str name);
+static void proceed(Session *, Arena);
+
+// An endpoint's refresh ended, with why empty if it went well: what
+// waited for it goes on, or ends saying why.
+static void epauthwake(Engine *e, Arena scratch, Str name, Str why)
+{
+    for (Session *s = e->sessions; s; s = s->next) {
+        if (s->state==S_AUTH && reqep(s)->name==name) {
+            if (why.len) {
+                endturn(s, scratch, "error", why);
+            } else {
+                proceed(s, scratch);
+            }
+        }
+    }
+    relayauthwake(e, name);
+}
+
+// A session's request to a chatgpt endpoint waits for its tokens, as
+// epauth says: 1 to go on. Relayed, the computer relaying it signs in.
+static b32 authgate(Session *s, Arena scratch, Endpoint *ep)
+{
+    if (!epsigned(ep->kind) || ep->relay.len) {
+        return 1;
+    }
+    Str why = {};
+    switch (epauth(s->e, &scratch, ep, s->authstale, &why)) {
+    case EPAUTH_OK:
+        s->authstale = 0;
+        return 1;
+    case EPAUTH_WAIT:
+        setstate(s, S_AUTH);
+        return 0;
+    }
+    s->authstale = 0;
+    endturn(s, scratch, "error", why);
+    return 0;
+}
+
+// The signed-in endpoint (chatgpt or copilot) of a command by name, or
+// null with *why set.
+static b32 epsignedin(Engine *e, Arena *a, Str name, Endpoint *ep, Str *why)
+{
+    if (!name.len || !endpointconf(e, a, name, ep) || ep->name!=name) {
+        *why = concat(a, "no endpoint is named ", name.len ? name : Str("\"\""));
+        return 0;
+    } else if (!epsigned(ep->kind)) {
+        *why = concat(a, concat(a, "endpoint ", name),
+                      Str(" is not of kind chatgpt or copilot"));
+        return 0;
+    } else if (ep->relay.len) {
+        *why = concat(a, concat(a, "endpoint ", name),
+                      Str(" is relayed: sign in on the computer that relays it"));
+        return 0;
+    }
+    return 1;
+}
+
+// A JSON body for GitHub's device flow, of keys and values in pairs.
+static Str ghform(Arena *a, Slice<Str> kv)
+{
+    Buf     b(a, 256);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (iz i = 0; i+1 < kv.len; i += 2) {
+        putstrkey(&w, kv[i], kv[i+1]);
+    }
+    putend(&w);
+    return finish(&b);
+}
+
+// Ask GitHub again whether the code was entered.
+static void epdevicepoll(Engine *e, Arena scratch, McpAuth *x)
+{
+    Str kv[] = {"client_id", x->client, "device_code", x->device,
+                "grant_type", "urn:ietf:params:oauth:grant-type:device_code"};
+    Str body = ghform(&scratch, {kv, countof(kv)});
+    x->pollat = 0;
+    if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl, "application/json", body)) {
+        mcpauthfail(e, scratch, x, "GitHub could not be asked whether the code was entered");
+    }
+}
+
+// The device flow ended: whoever waits (mcp.code) hears, or the end is
+// kept a minute for the wait to come (stage MCPAUTH_DONE, err empty if
+// it went well).
+static void epdeviceend(Engine *e, Arena scratch, McpAuth *x, Str err)
+{
+    if (x->cmd) {
+        if (err.len) {
+            Str msg = concat(&scratch, "signing in failed: ", err);
+            reply(e, scratch, x->cmd, 0, msg, {});
+        } else {
+            reply(e, scratch, x->cmd, 1, {}, {});
+        }
+        x->cmd = 0;
+        mcpauthfree(e, x);
+        return;
+    }
+    x->stage = MCPAUTH_DONE;
+    x->err   = clone(&x->arena, err);
+    x->by    = os_ticks(e->os) + 60*SEC;
+}
+
+// A device-flow stage's response.
+static void epdevicerecord(Engine *e, Arena scratch, McpAuth *x, Json *j)
+{
+    i64 now = os_ticks(e->os);
+    switch (x->stage) {
+    case MCPAUTH_DEVICE: {
+        Str dc  = jsonstr(jsonget(j, "device_code"));
+        Str uc  = jsonstr(jsonget(j, "user_code"));
+        Str uri = jsonstr(jsonget(j, "verification_uri"));
+        if (!dc.len || !uc.len || !uri.len) {
+            Str why = concat(&scratch, "GitHub gave no code: ", mcpautherr(&scratch, x));
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        i64 every = jsonint(jsonget(j, "interval"), 5);
+        i64 life  = jsonint(jsonget(j, "expires_in"), 900);
+        x->device = clone(&x->arena, dc);
+        x->every  = (every>0 ? every : 0)*SEC + SEC;
+        x->pollat = now + x->every;
+        x->by     = now + (life>0 ? life : 900)*SEC;
+        x->stage  = MCPAUTH_POLL;
+        Buf   b(&scratch, 256 + uri.len + uc.len);
+        EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+        putintkey(&w.json, "id", x->cmd);
+        putintkey(&w.json, "ok", 1);
+        putstrkey(&w.json, "url", uri);
+        putstrkey(&w.json, "code", uc);
+        emit(e, evend(&w));
+        x->cmd = 0;
+    } return;
+
+    case MCPAUTH_POLL: {
+        Str tok = jsonstr(jsonget(j, "access_token"));
+        Str err = jsonstr(jsonget(j, "error"));
+        if (tok.len) {
+            x->access = clone(&x->arena, tok);
+            x->stage  = MCPAUTH_USER;
+            x->by     = now + 60*SEC;
+            Str auth  = concat(&scratch, concat(&scratch, "Authorization: Bearer ", tok),
+                               "\r\nX-GitHub-Api-Version: 2025-04-01\r\n");
+            Str url   = concat(&scratch, e->ghapi, "/copilot_internal/user");
+            if (!mcpauthhttp(e, scratch, x, "GET", url, {}, {}, auth)) {
+                mcpauthfail(e, scratch, x, "GitHub could not be asked about the account");
+            }
+            return;
+        } else if (err=="authorization_pending" || err=="slow_down") {
+            i64 more  = jsonint(jsonget(j, "interval"), 0);
+            x->every  = err!="slow_down" ? x->every :
+                        more>0           ? more*SEC + SEC : x->every + 5*SEC;
+            x->pollat = now + x->every;
+            return;
+        }
+        Str why = err=="expired_token" ? Str("the code expired before it was entered") :
+                  err=="access_denied" ? Str("the sign-in was declined at GitHub") :
+                  concat(&scratch, "GitHub said ", mcpautherr(&scratch, x));
+        mcpauthfail(e, scratch, x, why);
+    } return;
+
+    case MCPAUTH_USER: {
+        if (x->status == 401) {
+            mcpauthfail(e, scratch, x, "GitHub refused the new token");
+            return;
+        } else if (j && !jsonflag(jsonget(j, "chat_enabled"), 1)) {
+            Str why = jsonflag(jsonget(j, "can_signup_for_limited"), 0)
+                ? Str("this GitHub account has no Copilot: sign up for Copilot Free "
+                      "at https://github.com/features/copilot/plans, then sign in again")
+                : Str("this GitHub account has no Copilot access: it needs a "
+                      "Copilot plan, or a seat its organization assigns");
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        // Any other failure to say is no reason to refuse the sign-in
+        McpTokens t = {};
+        t.url    = x->resource;
+        t.issuer = x->issuer;
+        t.client = x->client;
+        t.access = x->access;
+        t.login  = jsonstr(jsonget(j, "login"));
+        t.plan   = jsonstr(jsonget(j, "copilot_plan"));
+        Str api  = jsonstr(jsonget(jsonget(j, "endpoints"), "api"));
+        t.api    = api.len && parseurl(api).ok ? api : Str{};
+        if (!mcpsavetokens(e, scratch, x->name, &t, 1)) {
+            Str why = concat(&scratch, "the token could not be saved: ",
+                             os_lasterr(e->os, &scratch));
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        Str name = clone(&scratch, x->name);
+        epdeviceend(e, scratch, x, {});
+        epauthwake(e, scratch, name, {});
+    } return;
+    }
+}
+
+// endpoint.auth {name, redirect}: for ChatGPT, replies, late, with the
+// URL the browser is to visit to sign in, its redirect to the given
+// one, which mcp.code {name, endpoint:1, ...} then completes. For
+// Copilot, no redirect: replies, late, with GitHub's page (url) and the
+// code to enter there (code), and mcp.code {name, endpoint:1} waits for
+// it to be.
+static void cmdepauth(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str      name     = jsonstr(jsonget(j, "name"));
+    Str      redirect = jsonstr(jsonget(j, "redirect"));
+    Endpoint ep       = {};
+    Str      why      = {};
+    b32      cp       = 0;
+    if (!epsignedin(e, &scratch, name, &ep, &why)) {
+        reply(e, scratch, id, 0, why, {});
+        return;
+    } else if (!(cp = ep.kind==EP_COPILOT) && !redirect.len) {
+        reply(e, scratch, id, 0, "no redirect was given", {});
+        return;
+    }
+    Str      key = epauthurl(e, &scratch, &ep);
+    McpAuth *x   = mcpauthnew(e, scratch, name, key, 1);
+    if (!x) {
+        reply(e, scratch, id, 0, "out of memory", {});
+        return;
+    }
+    x->cmd    = id;
+    x->client = clone(&x->arena, epclient(e, &ep));
+    if (cp) {
+        x->issuer   = clone(&x->arena, e->ghauth);
+        x->tokenurl = clone(&x->arena, concat(&scratch, e->ghauth, "/login/oauth/access_token"));
+        x->stage    = MCPAUTH_DEVICE;
+        x->by       = os_ticks(e->os) + 60*SEC;
+        Str kv[]    = {"client_id", x->client, "scope", "read:user"};
+        Str url     = concat(&scratch, e->ghauth, "/login/device/code");
+        Str body    = ghform(&scratch, {kv, countof(kv)});
+        if (!mcpauthhttp(e, scratch, x, "POST", url, "application/json", body)) {
+            mcpauthfail(e, scratch, x, "GitHub could not be asked for a code");
+        }
+        return;
+    }
+    x->redirect = clone(&x->arena, redirect);
+    x->issuer   = clone(&x->arena, e->chatgptauth);
+    x->authz    = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/authorize"));
+    x->tokenurl = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/token"));
+    x->scope    = clone(&x->arena, chatgptscope);
+    mcpauthgo(e, scratch, x);
+}
+
+// endpoint.logout {name}: its tokens forgotten.
+static void cmdeplogout(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str      name = jsonstr(jsonget(j, "name"));
+    Endpoint ep   = {};
+    Str      why  = {};
+    if (!epsignedin(e, &scratch, name, &ep, &why)) {
+        reply(e, scratch, id, 0, why, {});
+        return;
+    }
+    Str path = mcpauthpath(e, &scratch, name, epauthurl(e, &scratch, &ep), 1);
+    if (os_stat(e->os, scratch, path).type!=STAT_MISSING && !os_remove(e->os, scratch, path)) {
+        why = concat(&scratch, "its tokens could not be removed: ", os_lasterr(e->os, &scratch));
+        reply(e, scratch, id, 0, why, {});
+        return;
     }
     reply(e, scratch, id, 1, {}, {});
 }
@@ -11678,7 +13553,10 @@ static Str mcpstatename(McpServer *m)
     return "stopped";
 }
 
-static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServer *m)
+static void putmcptools(Engine *, Arena, JsonOut *, McpServer *);
+
+static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServer *m,
+                         b32 tools)
 {
     Str url = m ? m->url : trim(cfgget(e->cfg, "mcp", name, "url", 0));
     putobject(w);
@@ -11687,7 +13565,7 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
     if (m && m->project.len) {
         putstrkey(w, "file", m->project);
     }
-    if (m && m->cwd.len) {
+    if (m && m->cwd.len && !url.len) {
         putstrkey(w, "cwd", m->cwd);
     }
     putstrkey(w, "transport", url.len ? Str("http") : Str("stdio"));
@@ -11708,7 +13586,28 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
         }
     }
     putstrkey(w, "state", mcpstatename(m));
-    putintkey(w, "tools", m && m->state==MCP_READY ? m->tools.len : 0);
+    i32 kept = 0;
+    for (iz i = 0; m && i < m->tools.len; i++) {
+        kept += mcpkept(e, m->name, m->tools[i].tool);
+    }
+    putintkey(w, "tools", m && m->state==MCP_READY ? kept : 0);  // what sessions get
+    if (m && m->tools.len) {
+        // Its tools as last listed, by this or an earlier start
+        putintkey(w, "kept", kept);
+        putintkey(w, "listed", m->tools.len);
+        if (m->state != MCP_READY) {
+            putintkey(w, "aslisted", 1);
+        }
+        if (m->truncated) {
+            putintkey(w, "truncated", 1);
+        }
+    }
+    if (cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0))) == 0) {
+        putintkey(w, "enabled", 0);
+    }
+    if (tools && m && m->tools.len && m->state!=MCP_STARTING && m->state!=MCP_LISTING) {
+        putmcptools(e, scratch, w, m);
+    }
     if (m && m->state==MCP_FAILED && m->err.len) {
         putstrkey(w, "err", m->err);
     }
@@ -11718,31 +13617,231 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
     putend(w);
 }
 
-// mcp: the servers, those of the configuration first, each once by
-// name, then any of projects', as they are now.
-static void cmdmcp(Engine *e, Arena scratch, i64 id)
+static i32 mcprank(McpServer *m)
 {
+    switch (m->state) {
+    case MCP_READY:    return 4;
+    case MCP_STARTING:
+    case MCP_LISTING:  return 3;
+    case MCP_FAILED:   return 2;
+    }
+    return 1;
+}
+
+// The instance of the configuration's server by that name to show:
+// running, else starting, else failed, else stopped, the most recently
+// used first. Null if none.
+static McpServer *mcpbest(Engine *e, Str name)
+{
+    McpServer *best = 0;
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name!=name || m->project.len) {
+            continue;
+        }
+        i32 r = mcprank(m);
+        i32 b = best ? mcprank(best) : 0;
+        if (r>b || (r==b && m->lastuse>best->lastuse)) {
+            best = m;
+        }
+    }
+    return best;
+}
+
+// Whether a server's own name for a tool can go in its tools key: words
+// there are split at blanks and commas, so only these.
+static b32 mcpfilterable(Str tool)
+{
+    for (iz i = 0; i < tool.len; i++) {
+        u8 c = tool[i];
+        if (!(letter(c) || digit(c) || c=='_' || c=='.' || c=='-')) {
+            return 0;
+        }
+    }
+    return tool.len>0 && !(tool.len>1 && tool[0]=='-');
+}
+
+// A tool's parameters, briefly, for a person: "name: type, name?: type"
+// from its schema, cut.
+static Str mcpparams(Arena *a, Str schema)
+{
+    Json *root  = jsonparse(a, schema).root;
+    Json *props = jsonget(root, "properties");
+    Json *req   = jsonget(root, "required");
+    Buf   b(a, 256);
+    for (Json *k = props->child; k && b.len<1000; k = k->next) {
+        b32 must = 0;
+        for (Json *r = req->child; r; r = r->next) {
+            must |= r->str == k->key;
+        }
+        print(&b, b.len ? Str(", ") : Str(""));
+        print(&b, utf8head(k->key, 64));
+        print(&b, must ? Str(": ") : Str("?: "));
+        Str type = jsonstr(jsonget(k, "type"));
+        print(&b, type.len ? utf8head(type, 32) : Str("any"));
+    }
+    return finish(&b);
+}
+
+// Why a server's tool i is not offered though kept: its name for the
+// APIs is a built-in tool's, or an earlier kept tool's (mcpident makes
+// "a.b" and "a_b" one name). Null if neither.
+static Str mcptaken(Engine *e, Arena *a, McpServer *m, iz i)
+{
+    Str name = m->tools[i].name;
+    if (toolfind(name) != TOOL_NONE) {
+        return "its name is a built-in tool's";
+    }
+    for (iz k = 0; k < i; k++) {
+        McpTool *o = &m->tools[k];
+        if (o->name==name && mcpkept(e, m->name, o->tool)) {
+            return concat(a, "its name is taken by ", utf8head(o->tool, 128));
+        }
+    }
+    return {};
+}
+
+// A server's tools, for its page or the CLI: each as the server names
+// it, and whether sessions get it (kept, and offered under a name no
+// other tool has).
+static void putmcptools(Engine *e, Arena scratch, JsonOut *w, McpServer *m)
+{
+    iz most = 512;  // a server may list any number: the page needs no more
+    putkey(w, "toollist");
+    putarray(w);
+    for (iz i = 0; m && i < m->tools.len && i < most; i++) {
+        Arena    tmp  = scratch;  // each tool's own
+        McpTool *t    = &m->tools[i];
+        b32      kept = mcpkept(e, m->name, t->tool);
+        Str      why  = mcptaken(e, &tmp, m, i);
+        putobject(w);
+        putstrkey(w, "tool", utf8head(t->tool, 128));
+        if (t->desc.len) {
+            putstrkey(w, "desc", t->desc);
+        }
+        putintkey(w, "ro", t->ro != 0);
+        putintkey(w, "kept", kept);
+        putintkey(w, "filterable", mcpfilterable(t->tool));
+        putintkey(w, "offered", kept && !why.len);
+        if (kept && why.len) {
+            putstrkey(w, "why", why);
+        }
+        Str params = mcpparams(&tmp, t->schema);
+        if (params.len) {
+            putstrkey(w, "params", params);
+        }
+        putend(w);
+    }
+    putend(w);
+    if (m && m->tools.len>most) {
+        putintkey(w, "toolsmore", m->tools.len - most);
+    }
+}
+
+// A server of the configuration, started for its page or the CLI to see
+// its tools (mcp {start}), by no session: in its section's cwd, else the
+// home directory, unless an instance is there already. Null, with why,
+// if it may not start now: not the configuration's, turned off, its url
+// not approved, waiting for a sign-in, or failed and not to be tried
+// again yet.
+static McpServer *mcpstartlist(Engine *e, Arena *a, Str name, Str *why)
+{
+    Arena scratch = *a;
+    Str url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    Str cmd = trim(cfgget(e->cfg, "mcp", name, "command", 0));
+    if (!url.len && !cmd.len) {
+        *why = "the configuration defines no server by that name";
+        return 0;
+    } else if (cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0))) == 0) {
+        *why = "it is turned off (enabled = no)";
+        return 0;
+    } else if (url.len && apprpending(e, &scratch, "mcp", name, url).len) {
+        *why = mcpapprovemsg(a, name);
+        return 0;
+    }
+    McpServer *m   = mcpbest(e, name);
+    i64        now = os_ticks(e->os);
+    if (!m) {
+        Str dir = trim(cfgget(e->cfg, "mcp", name, "cwd", 0));
+        b32 win = e->te.windows;
+        Str cwd = url.len ? url : !dir.len ? e->home
+                : normpath(&scratch, e->home, expandhome(&scratch, dir, e->home, win), win);
+        m = alloc<McpServer>(&e->perm);
+        m->name    = clone(&e->perm, name);
+        m->cwd     = clone(&e->perm, cwd);
+        m->origin  = "config";
+        m->def     = clone(&e->perm, concat(&scratch, concat(&scratch, url, "\n"), cmd));
+        m->forlist = 1;
+        m->next    = e->mcp;
+        e->mcp     = m;
+    }
+    m->lastuse = now;
+    if (m->needauth) {
+        *why = "it needs you to sign in";
+        return 0;
+    } else if (m->state==MCP_FAILED && now<m->retryat) {
+        *why = m->err;
+        return 0;
+    } else if (m->state==MCP_STOPPED || m->state==MCP_FAILED) {
+        mcpstart(e, scratch, m, 0);
+    }
+    if (m->state == MCP_FAILED) {
+        *why = m->err;
+    }
+    return m;
+}
+
+// mcp: the servers, those of the configuration first, each once by
+// name, then any of projects', as they are now. With a name, only that
+// name's; with tools, each one's tools too, which keeps them up a while
+// longer; with start, the configuration's server started first if it
+// may be (mcpstartlist), its why if it may not.
+static void cmdmcp(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str only  = jsonstr(jsonget(j, "name"));
+    b32 tools = only.len && jsonflag(jsonget(j, "tools"), 0);
+    Str why   = {};
+    if (only.len && jsonflag(jsonget(j, "start"), 0)) {
+        mcpstartlist(e, &scratch, only, &why);
+    }
+    // What each server's entry needs for a while, apart from the reply,
+    // which grows at the end of scratch
+    Arena tmp = carve(&scratch, 1<<20);
     Buf   b(&scratch, 1<<14);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
+    if (why.len) {
+        putstrkey(&w.json, "why", why);
+    }
     putkey(&w.json, "servers");
     putarray(&w.json);
+    i64 now = os_ticks(e->os);
     for (IniSection *s = inifirst(e->ini, "mcp"); s; s = ininext(s)) {
-        if (!s->name.len) {
+        if (!s->name.len || (only.len && s->name!=only)) {
+            continue;
+        } else if (!mcpdefines(e, s->name)) {
+            // Only settings for projects' servers of its name
+            putobject(&w.json);
+            putstrkey(&w.json, "name", s->name);
+            putstrkey(&w.json, "source", "overlay");
+            if (cfgbool(trim(cfgget(e->cfg, "mcp", s->name, "enabled", 0))) == 0) {
+                putintkey(&w.json, "enabled", 0);
+            }
+            putend(&w.json);
             continue;
         }
-        McpServer *best = 0;
-        for (McpServer *m = e->mcp; m; m = m->next) {
-            if (m->name==s->name && !m->project.len) {
-                best = !best || m->state>best->state ? m : best;
+        McpServer *best = mcpbest(e, s->name);
+        if (tools) {
+            for (McpServer *m = e->mcp; m; m = m->next) {
+                m->lastuse = m->name==only && m->state==MCP_READY ? now : m->lastuse;
             }
         }
-        putmcpserver(e, scratch, &w.json, s->name, best);
+        putmcpserver(e, tmp, &w.json, s->name, best, tools);
     }
     for (McpServer *m = e->mcp; m; m = m->next) {
-        if (m->project.len) {
-            putmcpserver(e, scratch, &w.json, m->name, m);
+        if (m->project.len && (!only.len || m->name==only)) {
+            m->lastuse = tools && m->state==MCP_READY ? now : m->lastuse;
+            putmcpserver(e, tmp, &w.json, m->name, m, tools);
         }
     }
     putend(&w.json);
@@ -11774,7 +13873,7 @@ static b32 runtool(Session *s, Arena scratch)
     b32 bypass = bypassing(s);
     if (!s->blocked && tool==TOOL_EDIT && s->te.edit==EDIT_PATCH && !args.issues.len) {
         PatchGuard pg = patchguard(s, &scratch, &args.patch, {});
-        if (planpatchout(s, &args.patch).data || bypass) {
+        if (planpatchout(s, scratch, &args.patch).data || bypass) {
             toolstart(s, scratch);
             return runfile(s, scratch, tool, s->guard.cwd, &args);  // or refused
         } else if (pg.many) {
@@ -12101,8 +14200,9 @@ static void compactor(Session *s, Arena scratch, Compact *cp)
 }
 
 // Make room in the context: prune old tool outputs, and if the prompt
-// is still not under enough tokens, summarize the older messages so
-// that it comes to goal. The step goes on (proceed) once there is room,
+// is still not under enough tokens (at a threshold, well under it, so
+// that the room lasts), summarize the older messages so that it comes
+// to goal. The step goes on (proceed) once there is room,
 // or else the turn ends saying why. A compaction the user asked for
 // summarizes, without pruning first.
 static void compact(Session *s, Arena scratch, i64 enough, i64 goal, i32 why)
@@ -12161,13 +14261,22 @@ static void sendcompact(Session *s, Arena scratch)
     Str convo = transcript(&s->attempt, scratch, s->history, cp->start,
                            cp->cut, limit);
     i64 words = sumbudget(cp->goal) * 3/4;
-    b32 an    = cp->ep.kind == EP_ANTHROPIC;
-    Str body  = an ? ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                               cp->focus)
-                   : encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                                   cp->focus);
-    Str url   = apiurl(&scratch, cp->ep.url, an ? Str("messages")
-                                                : Str("chat/completions"));
+    if (cp->toolong) {
+        // Asked again, after a summary too long: fewer words, by as much
+        // as it was over and a quarter more
+        words = words * COMPACT_SUMMAX / cp->toolong * 3/4;
+    }
+    i64 over  = cp->toolong;
+    i32 wire  = cp->ep.wire;
+    Str body  = wire==EP_ANTHROPIC ?
+                    ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                              cp->focus, over) :
+                epresponses(wire) ?
+                    rssummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                              cp->focus, over, cp->ep.kind==EP_CHATGPT) :
+                    encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                                  cp->focus, over);
+    Str url   = callurl(&scratch, &cp->ep);
     cp->inbytes = convo.len;
     if (!startreq(s, scratch, &cp->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(s->e->os, &scratch);
@@ -12185,8 +14294,10 @@ static void sendcompact(Session *s, Arena scratch)
 // compaction at the threshold (the progress guard): compacting again
 // would make no headway, so the turn ends instead. A compaction the
 // user asked for is its turn's whole work, which ends. A summary declined
-// (refusal) or cut off (length) is never used, since the history it
-// stands for would be gone for good, and asking again would end alike.
+// (refusal), cut off (length), over COMPACT_SUMMAX or without its Goal
+// (hasgoal) is never used, since the history it stands for would be gone
+// for good. One over COMPACT_SUMMAX is asked for once more, shorter, and
+// told how long it was; the others would most likely end alike.
 static void compacted(Session *s, Arena scratch, Partial *p)
 {
     Engine *e    = s->e;
@@ -12221,8 +14332,46 @@ static void compacted(Session *s, Arena scratch, Partial *p)
         failcompact(s, scratch, CLASS_TRANSIENT, 0, "the summary was empty", -1);
         return;
     }
-    iz most = (iz)bytesof(s->rate, COMPACT_SUMMAX);
-    text = text.len>most ? utf8head(text, most) : text;
+    i64 size = tokensof(s->rate, text.len);
+    if (size>COMPACT_SUMMAX && !cp.toolong) {
+        Buf b(&scratch, 128);
+        print(&b, "the summary was too long, about ");
+        print(&b, size);
+        print(&b, " tokens: asking for a shorter one");
+        s->cp.toolong = size;
+        retryevent(s, scratch, RETRY_QUICK, CLASS_DETERMINISTIC, 0, 0, finish(&b));
+        request(s, scratch);
+        return;
+    }
+    if (size>COMPACT_SUMMAX || !hasgoal(text)) {
+        // Not cut to fit, which would drop its last sections, nor taken
+        // without them: the history it stands for would be gone for good
+        b32 big = size > COMPACT_SUMMAX;
+        Buf b(&scratch, 768);
+        print(&b, "The summarizer, ");
+        print(&b, cp.model);
+        if (big) {
+            print(&b, ", wrote about ");
+            print(&b, size);
+            print(&b, " tokens, over the ");
+            print(&b, (i64)COMPACT_SUMMAX);
+            print(&b, " a summary may have, even when asked again after one "
+                      "of about ");
+            print(&b, cp.toolong);
+        } else {
+            print(&b, ", wrote no summary in the sections it was asked for "
+                      "(it has no Goal)");
+        }
+        print(&b, ", so the conversation was not compacted and the turn "
+                  "ends here. An instruction file that asks summaries for "
+                  "more, such as copies of messages, can cause this; else "
+                  "set [model] compactor to another model.");
+        note(s, scratch, "error", finish(&b));
+        Str why = big ? Str("the summary was too long")
+                      : Str("the summary had no Goal section");
+        failcompact(s, scratch, CLASS_DETERMINISTIC, 0, why, -1);
+        return;
+    }
     Files f = summaryfiles(&scratch, s->summary);
     f = addfiles(&scratch, f, s->history, cp.start, cp.cut);
     Str summary = withfiles(&s->perm, text, f);
@@ -12252,7 +14401,12 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     s->shellheard = s->shellpre;  // and a shell other than the tool's
     shellheed(s, scratch);
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
-    if (modeof(s)!=MODE_BUILD && cp.why!=CW_MANUAL) {
+    moveheed(s, scratch);  // and a fork into another folder, where it moved
+    compactheed(s, scratch);  // and what it was told of its instructions
+    // Right after the summary, in every mode: the step that follows is
+    // made from these, never left to learn them a step late. A manual
+    // compaction's wait for the next turn's prompt
+    if (cp.why != CW_MANUAL) {
         deliver(s, scratch);
     }
 
@@ -12365,9 +14519,11 @@ static void finalize(Session *s, Arena scratch)
                 return;
             }
             prepare(s, scratch);
-        } else if (announces(finish(&p->text))) {
+        } else if (announces(finish(&p->text)) && !jobwaiting(s)) {
             // It said it would go on, but stopped: remind it, a few
-            // times, and past that let the turn end as it chose
+            // times, and past that let the turn end as it chose. Not
+            // while a job of this turn runs, whose end brings it back:
+            // "I'll wait for the build" is then just what it should do.
             Str text = "Your response says you will continue, but it ended "
                        "without a tool call, so nothing was done. If there is "
                        "more to do, do it now with a tool call; if the task "
@@ -12411,7 +14567,7 @@ static void prepare(Session *s, Arena scratch)
 {
     for (iz i = 0; i < s->steers.len; i++) {
         adduser(s, scratch, s->steers[i].text, "steer", s->steers[i].images,
-                s->steers[i].files);
+                s->steers[i].files, s->steers[i].sessions);
         userinput(s);
     }
     if (s->steers.len) {
@@ -12527,6 +14683,7 @@ static void beginturn(Session *s, Arena scratch, Str via)
 {
     s->apprno    = {};  // refused for that turn: asked again
     s->cancelled = 0;
+    s->authretried = 0;
     s->msgsent   = 0;
     s->turn++;
     {
@@ -12541,6 +14698,7 @@ static void beginturn(Session *s, Arena scratch, Str via)
             putintkey(&w.json, "hop", s->hop);
         }
         ssend(s, &w);
+        lastactput(s, a, w.ts);
     }
     s->steps      = 0;
     s->attempts   = 0;
@@ -12569,13 +14727,14 @@ static void turnready(Session *s, Arena scratch)
 
 // A subagent's task carries its parent's hop, and user input resets it.
 static void startturn(Session *s, Arena scratch, Str text, Str via,
-                      Slice<MsgImage> images = {}, Slice<MsgFile> files = {})
+                      Slice<MsgImage> images = {}, Slice<MsgFile> files = {},
+                      Slice<MsgSess> refs = {})
 {
     s->cancelled = 0;
     if (via != "task") {
         userinput(s);
     }
-    adduser(s, scratch, text, via, images, files);
+    adduser(s, scratch, text, via, images, files, refs);
     if (!s->title.len) {
         Str title = cleantitle(&scratch, text, TITLE_MAX);
         settitle(s, scratch, title, "auto");
@@ -12642,6 +14801,7 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         }
         putgauge(s, &w.json, estimate(s));  // as it rests
         ssend(s, &w);
+        lastactput(s, a, w.ts);
     }
     setstate(s, S_IDLE);
 
@@ -12665,7 +14825,7 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     if (next.text.data) {
         // Its message goes out ahead of the queue without it, so that a
         // frontend never shows it in neither
-        startturn(s, scratch, next.text, "queue", next.images, next.files);
+        startturn(s, scratch, next.text, "queue", next.images, next.files, next.sessions);
         sendqueue(s, scratch);
     } else if (mhop) {
         s->hop = mhop;
@@ -12810,7 +14970,8 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
         ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", 0)*MS;
         ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", 0)*MS;
         ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", 0)*MS;
-        ep->kind      = ru.anthropic ? EP_ANTHROPIC : EP_OPENAI;
+        ep->kind      = ru.kind;
+        ep->wire      = ru.kind==EP_COPILOT ? EP_OPENAI : ru.kind;  // until discovered
         return 1;
     }
     Url u = parseurl(url);
@@ -12834,7 +14995,15 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     }
     ep->key       = ep->held ? Str{} : cfgsecret(cfg, perm, "endpoint", name, "key");
     Str kind      = trim(cfgget(cfg, "endpoint", name, "kind", 0));
-    ep->kind      = kind=="anthropic" ? EP_ANTHROPIC : EP_OPENAI;
+    ep->kind      = epkindof(kind);
+    ep->wire      = ep->kind==EP_COPILOT ? EP_OPENAI : ep->kind;  // until discovered
+    ep->api       = {};
+    if (ep->kind==EP_COPILOT && name.len && sameurl(url, epkindurl(EP_COPILOT))) {
+        // The account's own API, which signing in learned, in place of
+        // the kind's: a url the user wrote is used as written
+        McpTokens t = mcptokens(e, perm, name, epauthurl(e, perm, ep), 1);
+        ep->api     = t.api;
+    }
     return 1;
 }
 
@@ -12924,12 +15093,24 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
     mc->hidethink = td == "omitted";
     mc->effort    = ef.len ? clone(perm, ef) : Str{};
 
+    // For OpenAI chat: effort where effort_as says, as effort_map says
+    {
+        CfgEffort ce = cfgeffort(perm, mc->effort,
+                                 trim(cfgget(cfg, "model", model, "effort_as", 0)),
+                                 trim(cfgget(cfg, "model", model, "effort_map", 0)),
+                                 mc->kwargs);
+        mc->effkey  = ce.key;
+        mc->effjson = ce.json;
+        mc->chatkw  = ce.kwargs;
+    }
+
     // For the desktop tool's screenshots
     Str co = trim(cfgget(cfg, "model", model, "coordinates", 0));
     Int ie = parseint(trim(cfgget(cfg, "model", model, "image_edge", 0)));
     Int ip = parseint(trim(cfgget(cfg, "model", model, "image_pixels", 0)));
     mc->coords    = co=="norm1000" ? COORDS_NORM1000 : COORDS_PIXELS;
     mc->novision  = !cfgbool(cfgget(cfg, "model", model, "vision", 0));
+    mc->nopdf     = !cfgbool(cfgget(cfg, "model", model, "pdf", 0));
     mc->imgedge   = ie.ok && ie.val>=16 && ie.val<=16384 ? ie.val : 0;
     mc->imgpixels = ip.ok && ip.val>=256 && ip.val<=(i64)1<<28 ? ip.val : 0;
 }
@@ -13450,6 +15631,7 @@ static void jobconf(Session *s)
     max = max<1 ? 1 : max;
     s->te.jobmax     = max;
     s->te.jobtimeout = dft<1 ? 1 : dft>max ? max : dft;
+    s->te.resume     = parseint(trim(cfgget(cfg, "tools", "", "auto_resume", 0))).val > 0;
 }
 
 // Discover the session's instruction files, unless its log told which
@@ -13467,7 +15649,7 @@ static void instrstart(Session *s, Arena scratch)
     Instructions in     = instructions(e->os, &scratch, cwd, global, names,
                                        e->home, s->te.windows);
     s->instr = in.text.data ? clone(&s->perm, in.text) : Str{(u8 *)"", 0};
-    instrstamp(s, in.files);
+    instrstamp(s, in.files, {});
     webnote(s, scratch, s->instr, 0);
 
     Instructions *p = &s->instrpend;
@@ -13513,6 +15695,7 @@ static void buildprefix(Session *s, Arena scratch)
     s->te.shellenum = shellsenum(&s->perm, scratch, s->te.shells);
     s->te.coords    = s->mc.coords;
     s->te.vision    = !s->mc.novision;
+    s->te.pdf       = pdfon(s);
     s->te.year      = (i32)civil(os_time(e->os)).year;  // web_search names it
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
@@ -13601,6 +15784,7 @@ static void buildprefix(Session *s, Arena scratch)
         Arena  a  = scratch;
         Skills sk = sessskills(s, &a);
         skillsee(s, sk.list);
+        s->skillsys = s->skillseen;
         Buf t(&a, 1024);
         for (iz i = 0; i < s->skillseen.len; i++) {
             print(&t, "\n- ");
@@ -13630,6 +15814,7 @@ static void buildprefix(Session *s, Arena scratch)
     if (mem.len) {
         s->system = concat(&s->perm, s->system, mem);
     }
+    s->memsys = s->memseen;
 }
 
 // The prefix's durable record, so that the session opened again, or
@@ -13685,6 +15870,9 @@ static void logprefix(Session *s, Arena scratch)
             putstrkey(&w.json, "tool", t->tool);
             if (t->ro) {
                 putintkey(&w.json, "ro", 1);
+            }
+            if (t->origin.len) {
+                putstrkey(&w.json, "origin", t->origin);
             }
             putend(&w.json);
         }
@@ -13989,6 +16177,20 @@ static Role findrole(Engine *e, Str name)
     return r;
 }
 
+// A role's instructions, in perm: its prompt, then its prompt_file's
+// contents, read now so that the session keeps them as they were.
+static Str roleprompt(Engine *e, Arena *perm, Arena scratch, Role r)
+{
+    Str file = cfgrolepromptfile(e->cfg, &scratch, r.name);
+    if (!file.len) {
+        return clone(perm, r.prompt);
+    } else if (!r.prompt.len) {
+        return clone(perm, file);
+    }
+    Str p = concat(perm, r.prompt, "\n\n");
+    return concat(perm, p, file);
+}
+
 // The roles there are: the built-in ones, then the configuration's in
 // its order.
 static Slice<Str> rolenames(Engine *e, Arena *a)
@@ -14202,7 +16404,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     modelconf(e, &s->perm, s->ep.name, s->model, &s->mc);
     s->te.edit = s->mc.edit;
     s->role    = clone(&s->perm, r.name);
-    s->rolepr  = clone(&s->perm, r.prompt);
+    s->rolepr  = roleprompt(e, &s->perm, scratch, r);
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
                  deskdeny(e, scratch, 1) | skilldeny(e) | webdeny(e) |
@@ -14339,11 +16541,10 @@ static b32 taskasks(Session *s, Arena scratch)
         q->tool   = TOOL_TASK;
         q->grant  = args.network ? Str{} : clone(&s->perm, args.image);
         q->opened = os_ticks(e->os);
-        b32 steer = s->steers.len > 0;
-        b32 wait  = attending(s) && !steer;
-        i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+        b32 wait  = attending(s);
+        i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
         if (wait) {
-            arm(s, T_ASK, delay);
+            askarm(s, delay);
         }
         {
             Buf b(&a, 512 + args.image.len + args.copy.len);
@@ -14370,7 +16571,7 @@ static b32 taskasks(Session *s, Arena scratch)
                 putstrkey(&w.json, "always", q->grant);
                 putstrkey(&w.json, "scope", "container");
             }
-            putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+            putintkey(&w.json, "deadline", askdue(s, wait, delay));
             putstrkey(&w.json, "dflt", "deny");
             ssend(s, &w);
         }
@@ -14378,7 +16579,7 @@ static b32 taskasks(Session *s, Arena scratch)
             setstate(s, S_ASK);
             return 0;
         }
-        resolve(s, a, 0, steer ? DENY_STEER : DENY_POLICY, {});  // recorded
+        resolve(s, a, 0, DENY_POLICY, {});  // recorded
     }
     return 1;
 }
@@ -15053,6 +17254,19 @@ static Str sidecarput(Engine *e, Arena scratch, Str sid, Str name, Str data)
     return ok ? Str{} : Str("cannot write the session's files");
 }
 
+// Keep the time of the session's latest activity (evactivity) in its
+// lastact sidecar, which the listing reads instead of the log: as the
+// three writers of those records send each one. Forks, imports and the
+// crash record of an open never come this way. Best effort: a session
+// whose sidecar fails lists at an earlier time.
+static void lastactput(Session *s, Arena scratch, i64 ts)
+{
+    Buf b(&scratch, 24);
+    print(&b, ts);
+    Str v = finish(&b);
+    sidecarwrite(s->e, scratch, s->sid, "lastact", v);
+}
+
 // When a session went to the Trash (epoch ms), as its trashed sidecar
 // says, else as that file's time says; 0 if it is not in the Trash.
 static i64 trashedat(Engine *e, Arena scratch, Str sid)
@@ -15065,7 +17279,8 @@ static i64 trashedat(Engine *e, Arena scratch, Str sid)
     if (t.ok && t.val>0) {
         return t.val;
     }
-    Stat st = os_stat(e->os, scratch, sidecarpath(&scratch, e, sid, "trashed"));
+    Str  path = sidecarpath(&scratch, e, sid, "trashed");
+    Stat st   = os_stat(e->os, scratch, path);
     return st.mtime>0 ? st.mtime : 1;
 }
 
@@ -15112,6 +17327,7 @@ struct ListEntry {
     Str       group;   // empty if in none
     Str       scratch; // its scratch directory, if any
     i64       mtime;
+    i64       lastact; // its latest activity (epoch ms), never before it was made
     b32       locked;  // open in another process
     b32       parked;
     b32       archived;
@@ -15122,6 +17338,19 @@ struct ListEntry {
     b32       shown;
     Slice<iz> kids;    // its subagents, oldest first
 };
+
+// A session's latest activity, from its lastact sidecar (lastactput),
+// but never before the time in its id, else made, its session record's:
+// a fork or import starts at its own making, not the original's last
+// turn, and one with no turn yet, or made before the sidecar was kept,
+// at its making.
+static i64 lastactof(Engine *e, Arena scratch, Str sid, i64 made)
+{
+    i64 floor = sidms(sid);
+    floor = floor ? floor : made;
+    Int v = parseint(sidecarget(e, &scratch, sid, "lastact", 32));
+    return v.ok && v.val>floor ? v.val : floor;
+}
 
 static b32 listbefore(ListEntry *a, ListEntry *b)
 {
@@ -15172,6 +17401,7 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.wt       = wtfrom(a, jsonget(rec.root, "worktree"));
         en.wtgone   = en.wt.name.len && !wtexists(e, *a, &en.wt);
         en.mtime    = d->mtime;
+        en.lastact  = lastactof(e, *a, d->name, rec.ts);
         en.parked   = !s && parkedat(e, d->name)>=0;  // its lock is ours
         en.locked   = (!s || s->readonly) && !en.parked &&
                       os_lockheld(e->os, *a, lock);
@@ -15932,7 +18162,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->model      = clone(&s->perm, model);
     s->attended   = jsonflag(jsonget(j, "attended"), 0);
     s->role       = clone(&s->perm, role.name);
-    s->rolepr     = clone(&s->perm, role.prompt);
+    s->rolepr     = roleprompt(e, &s->perm, scratch, role);
     s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
                     deskdeny(e, scratch, role.ok) | skilldeny(e) | webdeny(e);
     if (task.ok) {
@@ -16104,8 +18334,8 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         m.text = clone(&s->perm, jsonstr(jsonget(j, "text")));
         m.seq  = r->seq;  // a later compaction's cut keeps it or not
         addmsg(s, m);
-        webnotenotice(s, scratch, jsonstr(jsonget(j, "kind")), m.text,
-                      geturls(&scratch, jsonget(j, "urls")));
+        Slice<Str> urls = geturls(&scratch, jsonget(j, "urls"));
+        webnotenotice(s, scratch, jsonstr(jsonget(j, "kind")), m.text, urls);
         Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));
         if (jb && jsonstr(jsonget(j, "kind"))=="job") {
             jb->quiet = 1;
@@ -16162,12 +18392,22 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
                 at = s->instrfiles[i].path==path ? &s->instrfiles[i] : at;
             }
             if (!at) {
-                InstrStamp n = {clone(&s->perm, path), 0, 0};
+                InstrStamp n = {};
+                n.path = clone(&s->perm, path);
+                if (why == "nested") {
+                    Str first = jsonstr(jsonget(jsonget(j, "files")->child, "path"));
+                    n.under = normpath(&s->perm, first, "..", s->te.windows);
+                }
                 s->instrfiles = push(&s->perm, s->instrfiles, n);
                 at = &s->instrfiles[s->instrfiles.len-1];
             }
             at->size  = jsonint(jsonget(k, "bytes"), 0);
             at->mtime = jsonint(jsonget(k, "mtime"), 0);
+            if (why == "start") {
+                at->prompt = 1;
+                at->psize  = at->size;
+                at->pmtime = at->mtime;
+            }
         }
     } break;
 
@@ -16176,6 +18416,9 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         if (dir.len) {
             s->memdir   = clone(&s->perm, dir);
             s->memseen  = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            if (jsonstr(jsonget(j, "why")) == "start") {
+                s->memsys = s->memseen;  // as the prompt was built
+            }
             s->te.deny &= ~(u32)TOOL_MEMMASK;
         }
     } break;
@@ -16320,6 +18563,12 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             b32 asks    = jsonflag(jsonget(j, "questions"), 0);
             s->te.deny  = asks ? s->te.deny & ~(u32)TOOL_ASKMASK
                                : s->te.deny |  (u32)TOOL_ASKMASK;
+            // Forked into another folder: its memory, if it had one, is
+            // that folder's, decided as the session opens (memstart)
+            s->movedfrom = clone(&s->perm, jsonstr(jsonget(j, "moved_from")));
+            if (jsonflag(jsonget(j, "memory"), 0)) {
+                s->te.deny &= ~(u32)TOOL_MEMMASK;
+            }
         } break;
         case EV_TITLE:
             s->title     = clone(&s->perm, jsonstr(jsonget(j, "text")));
@@ -16391,6 +18640,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.seq    = r.seq;
             m.images = getimages(&s->perm, jsonget(j, "images"));
             m.files  = getfiles(&s->perm, jsonget(j, "files"));
+            m.sessions = getsessrefs(&s->perm, jsonget(j, "sessions"));
             addmsg(s, m);
             if (r.ev == EV_USER) {
                 Slice<Str> urls = geturls(&t, jsonget(j, "urls"));
@@ -16448,18 +18698,18 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.spill  = clone(&s->perm, jsonstr(jsonget(j, "spill")));
             m.error  = toolfailed(jsonstr(jsonget(j, "status")));
             m.seq    = r.seq;
-            m.image  = clone(&s->perm, jsonstr(jsonget(j, "image")));
-            m.imgw   = (i32)jsonint(jsonget(j, "width"), 0);
-            m.imgh   = (i32)jsonint(jsonget(j, "height"), 0);
-            m.imgread = m.image.len && !jsonstr(jsonget(j, "shot")).len;
-            if (m.image.len) {
+            getcallimages(&s->perm, j, &m);
+            if (m.image.len && !m.pages) {
                 // Points refer to the latest screenshot, as they did
                 DeskShot sh = deskshotparse(&s->perm, jsonstr(jsonget(j, "shot")));
                 s->desk.shot = sh.ok ? sh : s->desk.shot;
             }
             addmsg(s, m);
-            webnotetool(s, t, callname(s, m.callid), jsonstr(jsonget(j, "status")),
-                        m.text, geturls(&t, jsonget(j, "urls")));
+            {
+                Slice<Str> urls = geturls(&t, jsonget(j, "urls"));
+                webnotetool(s, t, callname(s, m.callid), jsonstr(jsonget(j, "status")),
+                            m.text, urls);
+            }
             break;
         case EV_PREFIX:
             // As it began, rather than as the configuration has it now
@@ -16473,6 +18723,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->system.data   = s->system.data ? s->system.data : (u8 *)"";
             s->skillson      = jsonget(j, "skills")->type == JSON_ARRAY;
             skillseenfrom(s, jsonget(j, "skills"));
+            s->skillsys      = s->skillseen;
             s->mcpfixed      = jsonflag(jsonget(j, "mcp_fixed"), 0);
             s->mcpfilter     = jsonget(j, "mcp_filter")->type==JSON_STRING
                                ? clone(&s->perm, jsonstr(jsonget(j, "mcp_filter"))) : Str{};
@@ -16483,6 +18734,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 t.server = clone(&s->perm, jsonstr(jsonget(k, "server")));
                 t.tool   = clone(&s->perm, jsonstr(jsonget(k, "tool")));
                 t.ro     = jsonflag(jsonget(k, "ro"), 0);
+                t.origin = clone(&s->perm, jsonstr(jsonget(k, "origin")));
                 if (t.name.len && t.server.len && t.tool.len) {
                     s->mcptools = push(&s->perm, s->mcptools, t);
                 }
@@ -16734,8 +18986,16 @@ static void cmdunqueue(Engine *e, Session *s, Arena scratch, i64 id, i64 item)
             putintkey(&w.json, "id", id);
             putintkey(&w.json, "ok", 1);
             putstrkey(&w.json, "text", q.text);
-            if (q.images.len) {
-                putimages(&w.json, q.images);  // to attach again
+            // To attach again: the user's own images, not a PDF's, which
+            // its file brings again (pdfattaching)
+            Slice<MsgImage> own = {};
+            for (iz n = 0; n < q.images.len; n++) {
+                if (!q.images[n].label.len) {
+                    own = push(&scratch, own, q.images[n]);
+                }
+            }
+            if (own.len) {
+                putimages(&w.json, own);
             }
             if (q.files.len) {
                 putfiles(&w.json, q.files);
@@ -17333,6 +19593,28 @@ static void cmduncut(Engine *e, Session *s, Arena scratch, i64 id)
 // size, and more:1 if there is more after it. With encoding "base64",
 // for a binary file such as a screenshot, the part comes as is in
 // base64, as data rather than text, and cut anywhere.
+// The real path of path inside dir, links resolved, or null when it is
+// not one: path must be plain names below dir, with no root, drive, ".."
+// or NUL, and what it resolves to must stay inside dir's own real path.
+static Str pathinside(Os *os, Arena *a, Str dir, Str path)
+{
+    b32 bad = !path.len || path[0]=='/' || path[0]=='\\' ||
+              cut(path, 0).ok || cut(path, ':').ok;
+    for (Str rest = path; !bad && rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && rest[i]!='/' && rest[i]!='\\'; i++) {}
+        bad  = takehead(rest, i) == "..";
+        rest = cuthead(rest, i + (i<rest.len));
+    }
+    Str rdir = bad ? Str{} : os_realpath(os, a, dir);
+    Str real = rdir.data ? os_realpath(os, a, join(a, dir, path)) : Str{};
+    if (!real.data || !within(normpath(a, rdir, ".", HOST_WINDOWS),
+                              normpath(a, rdir, real, HOST_WINDOWS), HOST_WINDOWS)) {
+        return {};
+    }
+    return real;
+}
+
 static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
     Os *os     = e->os;
@@ -17345,19 +19627,8 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     most = most<(iz)FILECMD_MAX ? most : (iz)FILECMD_MAX;
     max  = max<1 || max>most ? most : max;
 
-    // Plain names below the directory: no root, drive, "..", or NUL
-    b32 bad = !path.len || off<0 || path[0]=='/' || path[0]=='\\' ||
-              cut(path, 0).ok || cut(path, ':').ok;
-    for (Str rest = path; !bad && rest.len;) {
-        iz i = 0;
-        for (; i<rest.len && rest[i]!='/' && rest[i]!='\\'; i++) {}
-        bad  = takehead(rest, i) == "..";
-        rest = cuthead(rest, i + (i<rest.len));
-    }
-    Str dir  = bad ? Str{} : os_realpath(os, &scratch, s->dir);
-    Str real = dir.data ? os_realpath(os, &scratch, join(&scratch, s->dir, path)) : Str{};
-    if (!real.data || !within(normpath(&scratch, dir, ".", HOST_WINDOWS),
-                              normpath(&scratch, dir, real, HOST_WINDOWS), HOST_WINDOWS)) {
+    Str real = off<0 ? Str{} : pathinside(os, &scratch, s->dir, path);
+    if (!real.data) {
         reply(e, scratch, id, 0, "no such file in the session's directory", s->sid);
         return;
     }
@@ -17471,6 +19742,7 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     putstrkey(w, "model", en->model);
     putstrkey(w, "state", state);
     putintkey(w, "mtime", en->mtime);
+    putintkey(w, "lastact", en->lastact);
     putintkey(w, "locked", en->locked);
     putintkey(w, "jobs", live ? jobsrunning(live) : 0);
     if (en->parent.len) {
@@ -17512,9 +19784,10 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     }
 }
 
-// list {trash}: the sessions in the state directory, newest first, but
-// a subagent's under its parent, oldest first: in the order a sidebar
-// shows them. Those in the Trash, with their subagents, only with trash,
+// list {trash}: the sessions in the state directory, newest made first,
+// but a subagent's under its parent, oldest first, each with its latest
+// activity (lastact), which a sidebar may order them by instead. Those
+// in the Trash, with their subagents, only with trash,
 // as a frontend that knows the Trash asks (an older one would show them
 // as any other); trash_days says how long the Trash keeps them here.
 static void cmdlist(Engine *e, Arena scratch, i64 id, Json *j)
@@ -18237,6 +20510,9 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
     Slice<Str> mines   = {};  // their scratch directories
     err = deletetree(e, &scratch, &sc, tree, &deleted, &mines);
     removelater(e, ownscratch(e, &scratch, &sc, deleted, mines));
+    for (iz i = 0; i < deleted.len; i++) {
+        termhangupall(e, -1, deleted[i]);
+    }
     replydeleted(e, scratch, id, sid, err, deleted);
 }
 
@@ -18318,6 +20594,7 @@ static void cmdtrash(Engine *e, Arena scratch, i64 id, Json *j)
             e->parked.len--;
         }
         trashed = push(&scratch, trashed, msid);
+        termhangupall(e, -1, msid);
     }
     e->wtdue = push(&e->perm, e->wtdue, clone(&e->perm, sid));
 
@@ -18422,6 +20699,15 @@ static b32 copytree(Os *os, Arena scratch, Str from, Str to, i32 depth)
 // notice says where it works, and its first prompt titles it. git makes
 // the worktree in the background, which its first turn waits for. The
 // reply has worktree: {name, branch, path}.
+//
+// fork {sid, turn?, cwd}: a fork into another folder (cap "fork.cwd"), an
+// existing directory, ~ the home directory, other than the original's,
+// made only between turns. Its log is the conversation (logcopy,
+// COPY_MOVE): it opens with the new folder's prompt, instructions and
+// memory, none of the original's snapshots or grants of paths in its
+// folder, and a notice of kind "moved" that says where it was, also
+// again after each compaction (moveheed). A folder of the original's own
+// (new {nofolder}) is left behind. The reply has cwd.
 static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Os   *os   = e->os;
@@ -18432,8 +20718,17 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     i64   turn = all ? -1 : jsonint(tj, -1);
     Json *wtj  = jsonget(j, "worktree");
     b32   inwt = wtj->type != JSON_MISSING;
+    Json *cj   = jsonget(j, "cwd");
+    b32   move = cj->type != JSON_MISSING;
     if (!validsid(sid)) {
         reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (move && (side || inwt)) {
+        reply(e, scratch, id, 0, "a fork into another folder is neither a side "
+              "chat nor a worktree session", sid);
+        return;
+    } else if (move && (cj->type!=JSON_STRING || !cj->str.len)) {
+        reply(e, scratch, id, 0, "cwd must name a directory", sid);
         return;
     } else if (inwt && (!side || wtj->type!=JSON_OBJECT)) {
         reply(e, scratch, id, 0, "a worktree session is a side chat: give side:1, "
@@ -18480,7 +20775,32 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     // A worktree of its own, from the original's folder
     WtSess wt = {};
     CopyWt cw = {};
-    if (inwt) {
+    if (move) {
+        Json    *rec  = evparse(&scratch, rp.lines[0]).root;
+        Str      pcwd = jsonstr(jsonget(rec, "cwd"));
+        HomePath hp   = tildepath(&scratch, cj->str, e->home, HOST_WINDOWS);
+        if (hp.err.len) {
+            reply(e, scratch, id, 0, hp.err, sid);
+            return;
+        }
+        Str real = os_realpath(os, &scratch, hp.path);
+        Str old  = pcwd.len ? os_realpath(os, &scratch, pcwd) : Str{};
+        if (!real.len || os_stat(os, scratch, real).type!=STAT_DIR) {
+            reply(e, scratch, id, 0, "cwd must name an existing directory", sid);
+            return;
+        } else if (real==pcwd || (old.len && real==old)) {
+            reply(e, scratch, id, 0, "the session works in that folder already", sid);
+            return;
+        } else if (jsonstr(jsonget(rec, "kept")).len) {
+            reply(e, scratch, id, 0, "a container's session, kept to read, works "
+                  "nowhere to move from", sid);
+            return;
+        }
+        cw.cwd    = real;
+        cw.src    = pcwd;
+        cw.alt    = old==pcwd ? Str{} : old;
+        cw.notice = movenotice(&scratch, pcwd, real);
+    } else if (inwt) {
         Json *rec   = evparse(&scratch, rp.lines[0]).root;
         Str   pcwd  = jsonstr(jsonget(rec, "cwd"));
         Str   title = s ? s->title : sidecarget(e, &scratch, sid, "title", 1024);
@@ -18495,9 +20815,9 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
             return;
         }
     }
-    LogCopy c = logcopy(&lines, scratch, rp.lines, sid, to, olds, news, turn,
-                        os_time(os), HOST_WINDOWS, side ? COPY_SIDE : COPY_FORK,
-                        inwt ? &cw : 0);
+    i32     kind = move ? COPY_MOVE : side ? COPY_SIDE : COPY_FORK;
+    LogCopy c    = logcopy(&lines, scratch, rp.lines, sid, to, olds, news, turn,
+                           os_time(os), HOST_WINDOWS, kind, inwt || move ? &cw : 0);
     if (c.err.len) {
         reply(e, scratch, id, 0, c.err, sid);
         return;
@@ -18539,10 +20859,11 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     if (ok && os_stat(os, scratch, plan).type==STAT_FILE) {
         ok = os_copyfile(os, scratch, plan, copy);
     }
-    // A folder of its own (new {nofolder}), whole, as the fork's own
+    // A folder of its own (new {nofolder}), whole, as the fork's own,
+    // unless the fork works elsewhere
     Str work  = join(&scratch, from, "work");
     Str wcopy = join(&scratch, dir, "work");
-    if (ok && os_stat(os, scratch, work).type==STAT_DIR) {
+    if (ok && !move && os_stat(os, scratch, work).type==STAT_DIR) {
         ok = copytree(os, scratch, work, wcopy, 0);
     }
     Str group = sidecarget(e, &scratch, sid, "group", GROUP_MAX);
@@ -18574,6 +20895,9 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
             putstrkey(&w.json, "path", wt.path);
             putend(&w.json);
         }
+        if (move) {
+            putstrkey(&w.json, "cwd", cw.cwd);
+        }
         if (side) {
             putintkey(&w.json, "side", 1);
         } else if (!pass && c.next.len) {
@@ -18590,6 +20914,15 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         if (err.len) {
             wtsay(e, scratch, to, wt.path, "failed", {}, err, {});  // its turn asks again
         }
+    }
+}
+
+// After a compaction, which may have left it out: a fork into another
+// folder is told again that it moved, and from where.
+static void moveheed(Session *s, Arena scratch)
+{
+    if (s->movedfrom.len) {
+        notify(s, "moved", movenotice(&scratch, s->movedfrom, s->cwd), 0);
     }
 }
 
@@ -18645,6 +20978,20 @@ static void sweepuploads(Engine *e, Arena scratch)
 // its first frame. One too large for the APIs, over ATTACH_EDGE pixels
 // on a side or ATTACH_BYTES as base64, is shrunk to fit, as a PNG.
 
+// A tool result's image's name, as tools make them: a file of out/,
+// out/NAME.png or out/NAME.jpg, NAME neither a path nor hidden.
+static b32 validout(Str name)
+{
+    b32 ok = name.len<=128 && startswith(name, "out/") &&
+             (endswith(name, ".png") || endswith(name, ".jpg"));
+    Str n  = ok ? cuttail(cuthead(name, 4), 4) : Str{};
+    ok = n.len>0 && n[0]!='.';
+    for (iz i = 0; ok && i < n.len; i++) {
+        ok = n[i]!='/' && n[i]!='\\' && n[i]!=':';
+    }
+    return ok;
+}
+
 // An attached image's name, as attaching makes them.
 static b32 validimage(Str name)
 {
@@ -18659,11 +21006,6 @@ static b32 validimage(Str name)
         ok = n[i]>='0' && n[i]<='9';
     }
     return ok;
-}
-
-static iz base64len(iz n)
-{
-    return (n + 2)/3 * 4;
 }
 
 // An image as a PNG that fits the APIs: decoded, within edge pixels on
@@ -18687,28 +21029,7 @@ static Converted topng(Os *os, Arena *a, Str data, b32 big, i64 edge, i64 pixels
         os_release(os, reg);
         return r;
     }
-    i32 w    = p.width;
-    i32 h    = p.height;
-    i32 most = w>h ? w : h;
-    f64 s    = most>edge ? (f64)edge/most : 1;
-    while ((f64)w*s*h*s > (f64)pixels) {
-        s *= 0.97;
-    }
-    for (i32 tries = 0; tries<8 && !r.png.data; tries++, s *= 0.75) {
-        Arena t  = mem;
-        i32   tw = (i32)(w*s);
-        i32   th = (i32)(h*s);
-        tw = tw<1 ? 1 : tw;
-        th = th<1 ? 1 : th;
-        u8 *px  = tw==w && th==h ? p.rgba : shrink(&t, p.rgba, w, h, tw, th);
-        Str out = pngencodez(&t, px, tw, th, 0);
-        if (base64len(out.len) <= ATTACH_BYTES) {
-            r.png = clone(a, out);
-        }
-    }
-    if (!r.png.data) {
-        r.err = "the image is too large, and does not shrink to fit";
-    }
+    r = pngfit(a, mem, p.rgba, p.width, p.height, edge, pixels, ATTACH_BYTES);
     os_release(os, reg);
     return r;
 }
@@ -18717,6 +21038,33 @@ struct Attached {
     MsgImage img;
     Str      err;
 };
+
+// Keep data, an image of extension ext (png or jpg), as the next image
+// of the session whose directory is sdir, numbered one past the highest
+// there: its name, img/N.ext, in a, or null if it could not be kept.
+static Str keepimage(Os *os, Arena *a, Str sdir, Str data, Str ext)
+{
+    Str dir = join(a, sdir, "img");
+    i64 n   = 0;
+    for (Dirent *d = os_list(os, a, dir); d; d = d->next) {
+        Str name = concat(a, "img/", d->name);
+        if (validimage(name)) {
+            Int v = parseint(takehead(d->name, d->name.len-4));
+            n = v.ok && v.val>n ? v.val : n;
+        }
+    }
+    Buf b(a, 32);
+    print(&b, "img/");
+    print(&b, n+1);
+    putbyte(&b, '.');
+    print(&b, ext);
+    Str name = finish(&b);
+    Str file = join(a, sdir, name);
+    if (!os_mkdirs(os, *a, dir) || !os_write(os, *a, file, data)) {
+        return {};
+    }
+    return name;
+}
 
 // Keep the image a complete upload staged at path, which goes, as session
 // sid's next, converted or shrunk if it must be, all in a. The image, or
@@ -18753,25 +21101,9 @@ static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
         k    = imagekind(*a, data);
     }
 
-    // The next number: one past the highest there
     Str sdir = join(a, join(a, e->statedir, "sessions"), sid);
-    Str dir  = join(a, sdir, "img");
-    i64 n    = 0;
-    for (Dirent *d = os_list(os, a, dir); d; d = d->next) {
-        Str name = concat(a, "img/", d->name);
-        if (validimage(name)) {
-            Int v = parseint(takehead(d->name, d->name.len-4));
-            n = v.ok && v.val>n ? v.val : n;
-        }
-    }
-    Buf b(a, 32);
-    print(&b, "img/");
-    print(&b, n+1);
-    putbyte(&b, '.');
-    print(&b, k.ext);
-    Str name = finish(&b);
-    Str file = join(a, sdir, name);
-    if (!os_mkdirs(os, *a, dir) || !os_write(os, *a, file, data)) {
+    Str name = keepimage(os, a, sdir, data, k.ext);
+    if (!name.data) {
         r.err = "cannot keep the image in the session's directory";
         return r;
     }
@@ -18833,9 +21165,49 @@ struct AttachedFile {
     Str     err;
 };
 
+// A PDF's text, extracted (pdfread) for attaching it as safe, in a, or
+// null and *err why not: an encrypted PDF is refused, as one with no
+// text to read is. *notpdf if its bytes only begin as one's do, for the
+// caller to take it as any other file.
+static Str attachpdftext(Os *os, Arena *a, Str data, Str safe, Str *err, b32 *notpdf)
+{
+    Region *reg = os_reserve(os, PDF_REGION);
+    if (!reg) {
+        *err = concat(a, safe, " is a PDF, which cannot be read now: out of memory");
+        return {};
+    }
+    Arena mem = newarena(reg);
+    Str   r   = {};
+    if (pdflocked(mem, data)) {
+        *err = concat(a, safe, " is a PDF, encrypted, so it is not attached: the shell "
+                               "may extract its text with its password (pdftotext -upw)");
+    } else {
+        PdfOut o = pdfread(a, mem, data, 0);
+        b32    no = o.status==PDFR_NOTPDF || o.status==PDFR_NOPAGES;
+        if (no && !pdflikely(data)) {
+            *notpdf = 1;  // a text file that mentions "%PDF-"
+        } else if (o.status == PDFR_NOTPDF) {
+            *notpdf = 1;
+        } else if ((o.status!=PDFR_OK && o.status!=PDFR_PARTIAL) || !o.text.len) {
+            Buf b(a, 128 + safe.len + o.why.len);
+            print(&b, safe);
+            print(&b, " is a PDF whose text cannot be read (");
+            print(&b, o.why.len ? o.why : Str("none was found"));
+            print(&b, "), so it is not attached: it may be damaged");
+            *err = finish(&b);
+        } else {
+            r = o.text;
+        }
+    }
+    os_release(os, reg);
+    return r;
+}
+
 // Keep the text file a complete upload staged at path, named orig, as
 // session sid's next, all in a. The file, or why not: a binary one, by
-// read's measure, is not taken.
+// read's measure, is not taken. A PDF is kept as files/N-NAME.pdf, and
+// its text, extracted, beside it as files/N-NAME.pdf.txt, which the file
+// names, as requests show it (filestext).
 static AttachedFile attachfile(Engine *e, Arena *a, Str sid, Str path, Str orig)
 {
     Os          *os   = e->os;
@@ -18846,12 +21218,40 @@ static AttachedFile attachfile(Engine *e, Arena *a, Str sid, Str path, Str orig)
     if (rd.err != READ_OK) {
         r.err = "cannot read the staged upload";
         return r;
-    } else if (readbinary(rd.data)) {
+    }
+    Str text = rd.data;  // what the file names
+    b32 pdf  = pdfsniff(rd.data);
+    if (pdf) {
+        b32 notpdf = 0;
+        text = attachpdftext(os, a, rd.data, safe, &r.err, &notpdf);
+        if (r.err.len) {
+            return r;
+        }
+        pdf  = !notpdf;
+        text = pdf ? text : rd.data;
+    }
+    if (pdf) {
+        // Named as one, its extension in lower case whatever case it was
+        // in, as its text's name, NAME.pdf.txt, is how it is known for
+        // one (filepdf, and the GUI's chips)
+        Str tail = cuthead(safe, safe.len>4 ? safe.len-4 : 0);
+        b32 ext  = safe.len > 4;
+        for (iz i = 0; ext && i < 4; i++) {
+            u8 c = tail[i];
+            ext = (c>='A' && c<='Z' ? (u8)(c + 'a' - 'A') : c) == ".pdf"[i];
+        }
+        safe = ext ? concat(a, cuttail(safe, 4), ".pdf") : concat(a, safe, ".pdf");
+    } else if (endswith(safe, ".pdf.txt")) {
+        // Not one, but named as a PDF's text is: renamed, so that no
+        // request or chip takes it for a PDF's
+        safe = concat(a, cuttail(safe, 8), "_pdf.txt");
+    }
+    if (!pdf && readbinary(rd.data)) {
         Buf b(a, 128 + safe.len);
         print(&b, safe);
         print(&b, " is a binary file (");
         print(&b, (i64)rd.data.len);
-        print(&b, " bytes), so it is not attached: only text files and images are");
+        print(&b, " bytes), so it is not attached: only text files, PDFs and images are");
         r.err = finish(&b);
         return r;
     }
@@ -18877,10 +21277,18 @@ static AttachedFile attachfile(Engine *e, Arena *a, Str sid, Str path, Str orig)
         r.err = "cannot keep the file in the session's directory";
         return r;
     }
+    if (pdf) {
+        name = concat(a, name, ".txt");
+        Str txt = join(a, sdir, name);
+        if (!os_write(os, *a, txt, text)) {
+            os_remove(os, *a, to);
+            r.err = "cannot keep the file in the session's directory";
+            return r;
+        }
+    }
     r.file.name  = name;
-    r.file.bytes = rd.data.len;
-    r.file.lines = countlines(startswith(rd.data, "\xef\xbb\xbf") ? cuthead(rd.data, 3)
-                                                                      : rd.data);
+    r.file.bytes = text.len;
+    r.file.lines = countlines(startswith(text, "\xef\xbb\xbf") ? cuthead(text, 3) : text);
     return r;
 }
 
@@ -18926,6 +21334,74 @@ static Slice<MsgFile> attachingfiles(Session *s, Arena *perm, Arena scratch, Jso
         r[i].name = clone(perm, fs[i].name);
     }
     return r;
+}
+
+// The images of an attached PDF's text, f, that the window of it a
+// request shows (filestext) has, for a model that takes images: picked
+// as read picks them (pdfpick), each kept as the session's next img/N,
+// labelled "image 3 (page 2) of NAME.pdf", appended to imgs in perm, as
+// many as room allows. The PDF is parsed again to decode them, in a
+// region of its own; an image that cannot be is left out.
+static Slice<MsgImage> pdfattachimages(Session *s, Arena *perm, Arena scratch,
+                                       Slice<MsgImage> imgs, MsgFile f, iz room)
+{
+    Os  *os   = s->e->os;
+    Str  pdf  = cuttail(f.name, 4);
+    Str  own  = cut(cuthead(pdf, 6), '-').tail;
+    Str  tpath = join(&scratch, s->dir, f.name);
+    Read t    = os_read(os, &scratch, tpath, ATTACH_FILE);
+    Str  ppath = join(&scratch, s->dir, pdf);
+    Read d    = os_read(os, &scratch, ppath, ATTACH_FILE);
+    if (t.err!=READ_OK || d.err!=READ_OK || !validfile(pdf)) {
+        return imgs;
+    }
+    Str     head = filehead(s, &scratch, f.name);
+    ReadWin w    = readwin(&scratch, t.data, head, 1, READ_LINES);
+    if (find(w.text, "\t[image ") < 0) {
+        return imgs;  // the window shows none: no need to parse it again
+    }
+    Region *reg  = os_reserve(os, PDF_REGION);
+    if (!reg) {
+        return imgs;
+    }
+    Arena  mem = newarena(reg);
+    PdfOut o   = pdfread(&scratch, mem, d.data, 0);
+    if ((o.status!=PDFR_OK && o.status!=PDFR_PARTIAL) || !(o.text==t.data)) {
+        os_release(os, reg);  // not the text kept beside it
+        return imgs;
+    }
+    DeskLimits l = desklimits(s);
+    PdfPick    k = pdfpick(scratch, o.places, 1, w.last, l.edge, l.pixels, ATTACH_BYTES);
+    for (i32 i = 0; i<k.n && room>0; i++) {
+        PdfPlace *pl = o.places.data + k.at[i];
+        PdfShown  sh = pdfimage(&scratch, mem, d.data, pl, k.edge, k.pixels, k.maxb64);
+        b32       jpeg = sh.mime == "image/jpeg";
+        Str       name = {};
+        if (sh.data.data) {
+            name = keepimage(os, &scratch, s->dir, sh.data, jpeg ? Str("jpg") : Str("png"));
+        }
+        if (!name.data) {
+            continue;
+        }
+        Buf lab(&scratch, 64 + own.len);
+        print(&lab, "image ");
+        print(&lab, (i64)pl->id);
+        print(&lab, " (page ");
+        print(&lab, (i64)pl->page);
+        print(&lab, ") of ");
+        print(&lab, own);
+        Str label = finish(&lab);
+        MsgImage g = {};
+        g.name  = clone(perm, name);
+        g.mime  = jpeg ? Str("image/jpeg") : Str("image/png");
+        g.w     = sh.w;
+        g.h     = sh.h;
+        g.label = clone(perm, label);
+        imgs = push(perm, imgs, g);
+        room--;
+    }
+    os_release(os, reg);
+    return imgs;
 }
 
 // read on an image, a file that begins as one does: for a model that
@@ -19010,11 +21486,388 @@ static b32 readimage(Session *s, Arena scratch, Str path)
     return 1;
 }
 
+// read on a PDF. One encrypted is refused, whatever the model. For a
+// model that takes them (pdfon), the file itself when it may go as a
+// document (PDF_BYTES, pdfpagesmax) and loads without repair, as the API
+// may refuse one damaged (pdfdamaged): kept among the session's output
+// files and sent in the tool result, where Anthropic gives the model its
+// text and an image of each page; leaving requests as a read image does
+// (deskimages), and only while one has room for it (deskkeepset).
+// Otherwise its text, extracted here (pdfread) and shown as read shows
+// a text file's lines, a window of them, without a hashline tag; and to
+// a model that takes images, those the window shows (pdfpick, at most
+// PDF_IMAGES), each kept as out/CALL-N.png or .jpg and sent after the
+// result (callimages), the window cut before one past them. When the
+// window is short of the whole text, the text is kept as out/CALL.txt
+// and remembered (pdfmemo), so that reading on parses the PDF again
+// only to decode the images it shows. Returns 0 if the file is not a
+// PDF, for read to go on.
+
+// Pages of a PDF's text (pdfread) with no text but images, and with
+// neither, by the notes that say so.
+static void pdfnotext(Str text, i32 *imgonly, i32 *blank)
+{
+    for (Str rest = text; rest.len;) {
+        Cut c = cut(rest, '\n');
+        rest = c.tail;
+        *imgonly += c.head == "[no text on this page, only images]";
+        *blank   += c.head == "[no text on this page]";
+    }
+}
+
+// Of session perm, what pdfmemo may take in all: at most an eighth of
+// what perm has left with what it took, and at most so much.
+enum : iz {
+    PDF_MEMOBYTES = sizeof(iz)==4 ? (iz)4<<20 : (iz)64<<20,
+};
+
+// A PDF's text and places kept in perm with the file holding the text,
+// for reading on (pdfmemo); left out, before anything is allocated, if
+// they would take more than pdfmemo may (PDF_MEMOBYTES), as perm frees
+// nothing, an entry replaced included: read on then parses it again.
+static void pdfremember(Session *s, Str path, Stat st, PdfMemo m, Str txt, i64 txtlen)
+{
+    // Each allocation's size, with room for its alignment, and the entry
+    iz need = 256 + (iz)sizeof(Map<PdfMemo>) + path.len;
+    need += 16 + m.pageline.len*(iz)sizeof(iz);
+    need += 16 + m.places.len*(iz)sizeof(PdfPlace);
+    for (iz i = 0; i < m.places.len; i++) {
+        need += m.places.data[i].label.len;
+    }
+    iz cap = (pdfroom(&s->perm) + s->pdfmemobytes) / 8;
+    cap = cap<PDF_MEMOBYTES ? cap : PDF_MEMOBYTES;
+    if (need > cap-s->pdfmemobytes) {
+        return;
+    }
+    s->pdfmemobytes += need;
+
+    m.size     = st.size;
+    m.mtime    = st.mtime;
+    m.txt      = txt;  // in perm (spillfile)
+    m.txtlen   = txtlen;
+    m.pageline = pdfkeep(&s->perm, m.pageline);
+    m.places   = pdfkeep(&s->perm, m.places);
+    for (iz i = 0; i < m.places.len; i++) {
+        m.places.data[i].label = clone(&s->perm, m.places.data[i].label);
+    }
+    PdfMemo *slot = upsert(&s->pdfmemo, path, (Arena *)0);
+    if (!slot) {
+        Str key = clone(&s->perm, path);
+        slot = upsert(&s->pdfmemo, key, &s->perm);
+    }
+    *slot = m;
+}
+
+// readpdf in mem, the reader's own region.
+static b32 readpdfin(Session *s, Arena scratch, Arena mem, Str path, Args *args)
+{
+    Engine *e    = s->e;
+    Str     show = showpath(s->guard.cwd, path);
+    Str     id   = s->calls[s->callidx].id;
+    Str     tool = "The shell may extract its text instead (pdftotext, or Python's pypdf).";
+    Stat    st   = os_stat(e->os, scratch, path);
+
+    // Read before, unchanged: its text from the file that keeps it
+    PdfMemo *memo = upsert(&s->pdfmemo, path, (Arena *)0);
+    Str      text = {};
+    if (memo && memo->size==st.size && memo->mtime==st.mtime) {
+        Read t = os_read(e->os, &scratch, memo->txt, (iz)PDF_TEXTMAX);
+        text = t.err==READ_OK && t.data.len==memo->txtlen ? t.data : Str{};
+    }
+    b32 hit = text.data != 0;
+
+    Str data = {};
+    Str why  = {};  // why it is not sent as a document, if pdfon
+    Buf b(&scratch, 512);
+    print(&b, show);
+    if (pdfon(s) || !hit) {
+        Read rd = os_read(e->os, &mem, path, PDF_READMAX);
+        if (rd.err == READ_TOOBIG) {
+            print(&b, ": a PDF over ");
+            print(&b, (i64)(PDF_READMAX >> 20));
+            print(&b, " MiB, too large to read. ");
+            print(&b, tool);
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        } else if (rd.err != READ_OK) {
+            return 0;  // read says why
+        }
+        data = rd.data;
+        if (pdflocked(mem, data)) {
+            print(&b, ": a PDF, encrypted, which cannot be read here. The shell may "
+                      "extract its text instead, with its password if it needs one "
+                      "(pdftotext -upw, qpdf --decrypt, or Python's pypdf).");
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        }
+    }
+
+    if (pdfon(s)) {
+        i64     max  = pdfpagesmax(s);
+        PdfInfo info = data.len<=PDF_BYTES ? pdfinfo(mem, data) : PdfInfo{};
+        Buf     w(&scratch, 128);
+        if (data.len > PDF_BYTES) {
+            print(&w, ", as it is over the 16 MiB that can be sent as a document");
+        } else if (!info.pages) {
+            print(&w, ", as its pages cannot be counted to send it as a document");
+        } else if (info.pages > max) {
+            print(&w, ", as more than the ");
+            print(&w, max);
+            print(&w, max==1 ? Str(" page") : Str(" pages"));
+            print(&w, " that can be sent as a document");
+        } else if (pdfdamaged(mem, data)) {
+            print(&w, ", as it is damaged, and may be refused as a document");
+        } else {
+            Str rel = {};
+            Str out = spillfile(s, scratch, id, &rel, ".pdf");
+            print(&b, ": a PDF, ");
+            print(&b, (i64)info.pages);
+            print(&b, info.pages==1 ? Str(" page, ") : Str(" pages, "));
+            print(&b, (i64)((data.len + 1023) / 1024));
+            print(&b, " KiB");
+            if (!os_write(e->os, scratch, out, data)) {
+                print(&b, ". It could not be saved to show you: ");
+                print(&b, os_lasterr(e->os, &scratch));
+                toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+                return 1;
+            }
+            print(&b, ", shown to you as a document: its text and an image of each page.");
+            s->callimage = rel;
+            s->callpages = info.pages;
+            toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+            return 1;
+        }
+        why = finish(&w);
+    }
+
+    // Its text, extracted
+    PdfMemo m = hit ? *memo : PdfMemo{};
+    if (!hit) {
+        PdfOut r = pdfread(&scratch, mem, data, 0);
+        b32    notpdf = r.status==PDFR_NOTPDF || r.status==PDFR_NOPAGES;
+        if (notpdf && !pdflikely(data)) {
+            return 0;  // a text file that mentions "%PDF-": read shows it
+        } else if (r.status!=PDFR_OK && r.status!=PDFR_PARTIAL) {
+            print(&b, ": a PDF whose text cannot be read (");
+            print(&b, r.why);
+            print(&b, "): it may be damaged. ");
+            print(&b, tool);
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        } else if (!r.text.len) {
+            print(&b, ": a PDF whose text cannot be read now (");
+            print(&b, r.why.data ? r.why : Str("none was found"));
+            print(&b, "). ");
+            print(&b, tool);
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        }
+        text        = r.text;
+        m.pages     = r.pages;
+        m.read      = (i32)r.pageline.len;
+        m.status    = r.status;
+        m.recovered = r.recovered;
+        m.pageline  = r.pageline;
+        m.places    = r.places;
+        pdfnotext(text, &m.imgonly, &m.blank);
+    }
+
+    // The window, and the images it shows, cut before one past them
+    b32     vision = !s->mc.novision;
+    iz      first  = args->offset>1 ? (iz)args->offset : 1;
+    iz      limit  = args->limit>0 && args->limit<READ_LINES ? (iz)args->limit : (iz)READ_LINES;
+    ReadWin w      = readwin(&scratch, text, {}, first, limit);
+    PdfPick k      = {};
+    if (vision && w.last>=first && m.places.len) {
+        DeskLimits l = desklimits(s);
+        k = pdfpick(scratch, m.places, first, w.last, l.edge, l.pixels, ATTACH_BYTES);
+        if (k.cut) {
+            w = readwin(&scratch, text, {}, first, k.last-first+1);
+        }
+    }
+    if (k.n && !data.data) {
+        Read rd = os_read(e->os, &mem, path, PDF_READMAX);
+        data = rd.err==READ_OK && rd.data.len==m.size ? rd.data : Str{};
+    }
+    Buf notes(&scratch, 256);
+    Slice<MsgImage> imgs = {};
+    if (k.n) {
+        imgs.data = alloc<MsgImage>(&s->perm, k.n);
+        imgs.cap  = k.n;
+    }
+    for (i32 i = 0; i < k.n; i++) {
+        PdfPlace *pl = m.places.data + k.at[i];
+        PdfShown  sh = {};
+        if (data.data) {
+            sh = pdfimage(&scratch, mem, data, pl, k.edge, k.pixels, k.maxb64);
+        } else {
+            sh.err = "the file could not be read again";
+        }
+        b32 jpeg = sh.mime == "image/jpeg";
+        Str rel  = {};
+        if (sh.data.data) {
+            Buf x(&scratch, 32);
+            putbyte(&x, '-');
+            print(&x, (i64)i + 1);
+            print(&x, jpeg ? Str(".jpg") : Str(".png"));
+            Str ext = finish(&x);
+            Str out = spillfile(s, scratch, id, &rel, ext);
+            if (!os_write(e->os, scratch, out, sh.data)) {
+                sh.data = {};
+                sh.err  = "it could not be saved to show you";
+            }
+        }
+        Buf lab(&scratch, 64);
+        print(&lab, "image ");
+        print(&lab, (i64)pl->id);
+        print(&lab, " (page ");
+        print(&lab, (i64)pl->page);
+        putbyte(&lab, ')');
+        Str label = finish(&lab);
+        if (!sh.data.data) {
+            print(&notes, "[");
+            print(&notes, label);
+            print(&notes, " is not shown: ");
+            print(&notes, sh.err);
+            print(&notes, ".]\n");
+            continue;
+        }
+        MsgImage g = {};
+        g.name  = rel;
+        g.mime  = jpeg ? Str("image/jpeg") : Str("image/png");
+        g.w     = sh.w;
+        g.h     = sh.h;
+        g.label = clone(&s->perm, label);
+        imgs.data[imgs.len++] = g;
+    }
+
+    // Notes after the window
+    b32 notext = m.read>0 && m.imgonly+m.blank==m.read;
+    if (!vision && notext && m.imgonly) {
+        print(&notes, "[Its pages hold no text, only images (a scan), which this "
+                      "model cannot see. The shell may OCR them: pdfimages or "
+                      "pdftoppm, then tesseract.]\n");
+    } else if (!vision && find(w.text, "\t[image ")>=0) {
+        print(&notes, "[This model takes no images: each [image ...] line stands "
+                      "for a picture that is not shown.]\n");
+    } else if (vision && find(w.text, ", not shown (")>=0) {
+        print(&notes, "[The images marked not shown are in a format that cannot be "
+                      "shown here. The shell may render their pages as images "
+                      "(pdftoppm -png -r 100), which read then shows you.]\n");
+    }
+    if (notext && !m.imgonly) {
+        print(&notes, "[No text could be extracted: its words may be drawn as "
+                      "shapes. The shell may render its pages as images (pdftoppm "
+                      "-png -r 100)");
+        print(&notes, vision ? Str(", which read then shows you.]\n")
+                             : Str(" and OCR them (tesseract).]\n"));
+    }
+    b32 whole = w.last >= w.total;  // past the end too (last = first-1)
+    Str kept  = {};
+    if (!whole && hit) {
+        kept = memo->txt;
+    } else if (!whole) {
+        Str rel = {};
+        Str out = spillfile(s, scratch, id, &rel, ".txt");
+        if (os_write(e->os, scratch, out, text)) {
+            kept = out;
+            pdfremember(s, path, st, m, out, text.len);
+        }
+    }
+    if (kept.len) {
+        print(&notes, "[The whole text is kept at ");
+        print(&notes, kept);
+        print(&notes, ".]\n");
+    }
+
+    // The head, then the window and its notes
+    print(&b, ": a PDF, ");
+    print(&b, (i64)m.pages);
+    print(&b, m.pages==1 ? Str(" page") : Str(" pages"));
+    if (m.recovered) {
+        print(&b, ", damaged but recovered");
+    }
+    if (m.status == PDFR_PARTIAL) {
+        print(&b, ", cut short, the text that could be read");
+    } else if (notext && m.imgonly) {
+        print(&b, ", with no text, only images of its pages (a scan)");
+    } else if (notext) {
+        print(&b, ", with no text to extract");
+    } else {
+        print(&b, ", its text extracted");
+    }
+    print(&b, why);
+    if (imgs.len == 1) {
+        print(&b, ", with the image on these pages after it");
+    } else if (imgs.len > 1) {
+        print(&b, ", with the ");
+        print(&b, imgs.len);
+        print(&b, " images on these pages after it");
+    }
+    print(&b, ":\n");
+    print(&b, w.text);
+    if (notes.len && !endswith(w.text, "\n")) {
+        putbyte(&b, '\n');
+    }
+    print(&b, finish(&notes));
+    s->callimages = imgs;
+    toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+    return 1;
+}
+
+static b32 readpdf(Session *s, Arena scratch, Str path, Args *args)
+{
+    Engine *e    = s->e;
+    Read    head = os_readat(e->os, &scratch, path, 0, PDF_HEAD);
+    if (head.err!=READ_OK || !pdfsniff(head.data)) {
+        return 0;
+    }
+    Region *reg = os_reserve(e->os, PDF_REGION);
+    if (!reg) {
+        Buf b(&scratch, 256);
+        print(&b, showpath(s->guard.cwd, path));
+        print(&b, ": a PDF, which cannot be read now: out of memory.");
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    }
+    b32 r = readpdfin(s, scratch, newarena(reg), path, args);
+    os_release(e->os, reg);
+    return r;
+}
+
 struct Attaching {
     Slice<MsgImage> images;
     Slice<MsgFile>  files;
+    Slice<MsgSess>  sessions;
     Str             err;
 };
+
+// The sessions a prompt or a steer mentions (sessions: their ids), in
+// perm, each with its title as it is now: those of this state directory,
+// once each, and not in the Trash, since send_message would refuse it.
+// One not found is left out rather than failing the message, whose
+// token still names it to the agent.
+static Slice<MsgSess> mentioned(Session *s, Arena *perm, Arena scratch, Json *list)
+{
+    Slice<MsgSess> r = {};
+    if (!list->child) {
+        return r;
+    }
+    SessScan sc = scansessions(s->e, &scratch);
+    for (Json *x = list->child; x && r.len<MENTION_SESSIONS; x = x->next) {
+        Str  sid  = jsonstr(x);
+        iz  *p    = sid.len ? upsert(&sc.bysid, sid, (Arena *)0) : 0;
+        b32  seen = 0;
+        for (iz i = 0; i < r.len; i++) {
+            seen |= r[i].sid == sid;
+        }
+        if (p && !seen && !(scanaside(&sc, *p) & ASIDE_TRASHED)) {
+            MsgSess m = {clone(perm, sid), clone(perm, sc.list[*p].title)};
+            r = push(perm, r, m);
+        }
+    }
+    return r;
+}
 
 // The images a prompt or a steer names (images), as attached to the
 // session, read for their kind and size, in perm, and only once all are
@@ -19064,6 +21917,122 @@ static Attaching attaching(Session *s, Arena *perm, Arena scratch, Json *list)
     return r;
 }
 
+// The images of the PDFs a prompt or a steer attaches (pdfattachimages),
+// after its own, in perm, within ATTACH_MAX in all: none for a model
+// that takes no images.
+static void pdfattaching(Session *s, Arena *perm, Arena scratch, Attaching *at)
+{
+    iz  room = ATTACH_MAX - at->images.len;
+    b32 any  = 0;
+    for (iz i = 0; i < at->files.len; i++) {
+        any |= filepdf(at->files[i].name);
+    }
+    if (s->mc.novision || room<=0 || !any) {
+        return;
+    }
+    Slice<MsgImage> imgs = {};  // room for all, so never moved
+    imgs.data = alloc<MsgImage>(perm, ATTACH_MAX);
+    imgs.cap  = ATTACH_MAX;
+    for (iz i = 0; i < at->images.len; i++) {
+        imgs.data[imgs.len++] = at->images[i];
+    }
+    iz own = imgs.len;
+    for (iz i = 0; i<at->files.len && imgs.len-own<room; i++) {
+        if (filepdf(at->files[i].name)) {
+            imgs = pdfattachimages(s, perm, scratch, imgs, at->files[i],
+                                   room - (imgs.len-own));
+        }
+    }
+    if (imgs.len > own) {
+        at->images = imgs;
+    }
+}
+
+// upload {kind:"file", sid, path}: a file in session sid's working
+// directory attached as if it were uploaded, read here by this engine,
+// for a frontend on another machine that cannot read it to send it (an
+// '@' mention). The path is relative to the working directory, '/' or
+// '\' separated, and must stay inside it, links resolved. An image, as
+// upload {kind:"image"} would take it; else a text file, as {kind:"file"}
+// would, named by the path's last part. The reply has kind, "image" or
+// "file", and what upload's last reply has for that kind.
+static void attachpath(Engine *e, Arena scratch, i64 id, Str sid, Str rel)
+{
+    Os      *os  = e->os;
+    Session *s   = validsid(sid) ? findsession(e, sid) : 0;
+    Str      cwd = s ? s->cwd : Str{};
+    if (!s) {
+        reply(e, scratch, id, 0, "no such session open", {});
+        return;
+    } else if (!cwd.len) {
+        reply(e, scratch, id, 0, "the session has no working directory", {});
+        return;
+    }
+    Str real = pathinside(os, &scratch, cwd, rel);
+    if (!real.data) {
+        reply(e, scratch, id, 0, "no such file in the session's working directory", {});
+        return;
+    }
+    Read rd = os_read(os, &scratch, real, ATTACH_UPLOAD);
+    if (rd.err == READ_TOOBIG) {
+        reply(e, scratch, id, 0, "too large to attach: an image is at most 64 MiB, "
+                                 "a text file 16 MiB", {});
+        return;
+    } else if (rd.err != READ_OK) {
+        reply(e, scratch, id, 0, rd.err==READ_NOTFOUND ? Str("no such file")
+                                                       : Str("cannot read the file"), {});
+        return;
+    }
+
+    // Staged as an upload is, so that attachstaged and attachfile keep it
+    // as they keep one, and remove the staged copy as they do
+    Buf tb(&scratch, 16);
+    printhex(&tb, os_random(os), 16);
+    Str token  = finish(&tb);
+    Str staged = uploadpath(&scratch, e, token, 0);
+    Str tmp    = join(&scratch, e->statedir, "tmp");  // not in the call: scratch is copied
+    b32 image  = imagekind(scratch, rd.data).mime.data != 0;
+    if (!image && rd.data.len>ATTACH_FILE) {
+        reply(e, scratch, id, 0, "too large to attach: a text file is at most 16 MiB", {});
+        return;
+    } else if (!os_mkdirs(os, scratch, tmp) || !os_write(os, scratch, staged, rd.data)) {
+        reply(e, scratch, id, 0, "cannot stage the file", {});
+        return;
+    }
+    Str          name = rel;  // filesafe keeps its last part
+    Attached     at   = {};
+    AttachedFile af   = {};
+    Str          err  = {};
+    if (image) {
+        at  = attachstaged(e, &scratch, sid, staged);
+        err = at.err;
+    } else {
+        af  = attachfile(e, &scratch, sid, staged, name);
+        err = af.err;
+    }
+    if (err.len) {
+        reply(e, scratch, id, 0, err, {});
+        return;
+    }
+    Buf   b(&scratch, 256);
+    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    if (image) {
+        putstrkey(&w.json, "kind", "image");
+        putstrkey(&w.json, "name", at.img.name);
+        putstrkey(&w.json, "mime", at.img.mime);
+        putintkey(&w.json, "w", at.img.w);
+        putintkey(&w.json, "h", at.img.h);
+    } else {
+        putstrkey(&w.json, "kind", "file");
+        putstrkey(&w.json, "name", af.file.name);
+        putintkey(&w.json, "bytes", af.file.bytes);
+        putintkey(&w.json, "lines", af.file.lines);
+    }
+    emit(e, evend(&w));
+}
+
 // upload {token?, data, off, done?, kind?, sid?}: a part of a raw log,
 // its bytes in base64 at offset off, which must be the bytes staged so
 // far, so that a part sent twice, or out of order, is refused. The first
@@ -19074,8 +22043,19 @@ static Attaching attaching(Session *s, Arena *perm, Arena scratch, Json *list)
 // last reply naming it, with its mime, w and h; with kind "file", a
 // text file so, its name its own (the last part's name), kept as
 // attachfile does, the last reply naming it, with its bytes and lines.
+// With kind "file" and a path in place of data, a file this machine holds
+// instead, in one go (attachpath).
 static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
 {
+    if (jsonget(j, "path")->type != JSON_MISSING) {
+        if (jsonstr(jsonget(j, "kind")) != "file") {
+            reply(e, scratch, id, 0, "a path is attached with kind \"file\"", {});
+        } else {
+            attachpath(e, scratch, id, jsonstr(jsonget(j, "sid")),
+                       jsonstr(jsonget(j, "path")));
+        }
+        return;
+    }
     Os      *os    = e->os;
     Str      token = jsonstr(jsonget(j, "token"));
     Json    *oj    = jsonget(j, "off");
@@ -19322,6 +22302,11 @@ static void listerreply(Engine *e, Arena scratch, Lister *l)
         Str      body = finish(&p->body);
         Str      err  = p->err;
         Json    *ms   = 0;
+        if (p->kind == "chatgpt") {
+            body = rslisting(&scratch, l->arena, body);
+        } else if (p->kind == "copilot") {
+            body = cplisting(&scratch, l->arena, body);
+        }
         if (!p->done) {
             err = "no answer in 5 s";
         } else if (!err.data) {
@@ -19335,6 +22320,23 @@ static void listerreply(Engine *e, Arena scratch, Lister *l)
         putstrkey(&w.json, "name", p->name);
         putstrkey(&w.json, "url", p->url);
         putstrkey(&w.json, "kind", p->kind);
+        if ((p->kind=="chatgpt" || p->kind=="copilot") && !relayurl(p->url).ok) {
+            // Who is signed in, for its page
+            Endpoint  ep = {};
+            ep.name      = p->name;
+            ep.url       = p->url;
+            McpTokens t  = mcptokens(e, &scratch, p->name, epauthurl(e, &scratch, &ep), 1);
+            putintkey(&w.json, "signedin", t.access.len > 0);
+            if (t.email.len) {
+                putstrkey(&w.json, "email", t.email);
+            }
+            if (t.login.len) {
+                putstrkey(&w.json, "login", t.login);
+            }
+            if (t.plan.len) {
+                putstrkey(&w.json, "plan", t.plan);
+            }
+        }
         putintkey(&w.json, "ok", !err.data);
         if (err.data) {
             putstrkey(&w.json, "err", err);
@@ -19405,7 +22407,7 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
             EpListing p = {};
             p.name = ep.name;
             p.url  = ep.url;
-            p.kind = ep.kind==EP_ANTHROPIC ? Str("anthropic") : Str("openai");
+            p.kind = epkindname(ep.kind);
             if (ep.relay.len) {
                 // What its offers listed, asking nobody
                 p.body   = Buf(&l->arena, 1<<12);
@@ -19432,9 +22434,19 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
         }
         HttpReq r = {};
         r.method    = "GET";
-        r.url       = apiurl(&t, ep.url, ep.kind==EP_ANTHROPIC ?
-                             Str("models?limit=1000") : Str("models"));
+        r.url       = epurl(&t, &ep, eplistpath(ep.kind));
         r.headers   = authheaders(&t, &ep, "application/json");
+        if (epsigned(ep.kind) && !ep.relay.len) {
+            Str why = {};
+            if (epauth(e, &t, &ep, 0, &why) == EPAUTH_NONE) {
+                p->err  = clone(&l->arena, why);
+                p->done = 1;
+                continue;
+            }
+            Str more  = ep.kind==EP_CHATGPT ? chatgptheaders(e, &t, &ep, {}, 0)
+                                            : copilotheaders(e, &t, &ep, {}, {});
+            r.headers = concat(&t, r.headers, more);
+        }
         r.connectms = ep.connectms;
         r.readms    = 5000;
         r.maxbytes  = 1 << 20;
@@ -19747,8 +22759,10 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_MCPCODE:
         case CMD_MCPRESTART:
         case CMD_APPROVE:
+        case CMD_EPAUTH:
         case CMD_SHELL:
         case CMD_GIT:
+        case CMD_TERMOPEN:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -19764,6 +22778,7 @@ static void command(Engine *e, Arena scratch, Str line)
         if (e->home.len) {
             putstrkey(&w.json, "home", e->home);  // where ~ is
         }
+        putintkey(&w.json, "pty", os_ptyable(e->os));  // whether term.open can work
         emit(e, evend(&w));
         reply(e, scratch, id, 1, {}, {});
     } return;
@@ -19793,6 +22808,7 @@ static void command(Engine *e, Arena scratch, Str line)
             stopjobs(t, scratch, 1);
         }
         farstop(e, scratch, 1);
+        termhangupall(e, -1, {});
         wtquit(e);  // a job under way is asked to stop, and waited for
         reply(e, scratch, id, 1, {}, {});
     } return;
@@ -19821,6 +22837,7 @@ static void command(Engine *e, Arena scratch, Str line)
         putintkey(&w.json, "parked", e->parked.len);
         putintkey(&w.json, "turns", turns);
         putintkey(&w.json, "jobs", jobs);
+        putintkey(&w.json, "terms", termcount(e, -1));
         emit(e, evend(&w));
     } return;
     case CMD_STOP:
@@ -19858,6 +22875,12 @@ static void command(Engine *e, Arena scratch, Str line)
         relaymore(e, j);
         return;
     case CMD_RELAYPEER:
+        if (jsonstr(jsonget(j, "state")) == "gone") {
+            termhangupall(e, jsonint(jsonget(j, "peer"), 0), {});
+        } else {
+            termaway(e, jsonint(jsonget(j, "peer"), 0),
+                     jsonstr(jsonget(j, "state")) == "away");
+        }
         relaypeernews(e, scratch, j);
         return;
     case CMD_RELAYCALL:
@@ -19900,7 +22923,7 @@ static void command(Engine *e, Arena scratch, Str line)
         cmdshellenv(e, scratch, id, j);
         return;
     case CMD_MCP:
-        cmdmcp(e, scratch, id);
+        cmdmcp(e, scratch, id, j);
         return;
     case CMD_MCPAUTH:
         cmdmcpauth(e, scratch, id, j);
@@ -19916,6 +22939,21 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_APPROVE:
         cmdapprove(e, scratch, id, j);
+        return;
+    case CMD_EPAUTH:
+        cmdepauth(e, scratch, id, j);
+        return;
+    case CMD_EPLOGOUT:
+        cmdeplogout(e, scratch, id, j);
+        return;
+    case CMD_TERMOPEN:
+        termopen(e, scratch, id, j);
+        return;
+    case CMD_TERMINPUT:
+    case CMD_TERMRESIZE:
+    case CMD_TERMACK:
+    case CMD_TERMCLOSE:
+        termcmd(e, scratch, cmd, j);  // no reply
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
@@ -19993,13 +23031,26 @@ static void command(Engine *e, Arena scratch, Str line)
         cmdmode(e, s, scratch, id, j);
         return;
     case CMD_ASKTOUCH: {
-        // The user works on the answers: the questions' clock starts over
+        // The user works on the answer: the ask's clock starts over
         Str req = jsonstr(jsonget(j, "req"));
         if (s->state!=S_ASK || req!=s->ask.req) {
             reply(e, scratch, id, 0, "no such request waits", sid);
         } else {
             reply(e, scratch, id, 1, {}, sid);
-            questionclock(s, scratch, 1);
+            askclock(s, scratch, 1);
+        }
+    } return;
+    case CMD_ASKHOLD: {
+        // The user will answer in their own time: no deadline from now on,
+        // which the frontends hear of as ask.deadline 0. Unattended, it is
+        // denied at once all the same (unattend).
+        Str req = jsonstr(jsonget(j, "req"));
+        if (s->state!=S_ASK || req!=s->ask.req) {
+            reply(e, scratch, id, 0, "no such request waits", sid);
+        } else {
+            reply(e, scratch, id, 1, {}, sid);
+            s->ask.held = 1;
+            askclock(s, scratch, 0);
         }
     } return;
     case CMD_PROMPT:
@@ -20013,6 +23064,8 @@ static void command(Engine *e, Arena scratch, Str line)
             reply(e, scratch, id, 0, at.err, sid);
             return;
         }
+        pdfattaching(s, &s->perm, scratch, &at);
+        at.sessions = mentioned(s, &s->perm, scratch, jsonget(j, "sessions"));
         Json *skill = jsonget(j, "skill");
         if (skill->type!=JSON_MISSING && skill->type!=JSON_NULL) {
             SkillUse u = skillinvoke(s, &scratch, jsonstr(skill), text);
@@ -20030,22 +23083,18 @@ static void command(Engine *e, Arena scratch, Str line)
         sidecarwrite(e, scratch, s->sid, "draft", {});  // sent, so no draft
         if (!busy(s)) {
             startturn(s, scratch, text, cmd==CMD_PROMPT ? Str("prompt") : Str("steer"), imgs,
-                      at.files);
+                      at.files, at.sessions);
         } else if (cmd == CMD_PROMPT) {
-            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files};
+            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files, at.sessions};
             s->queued = push(&s->perm, s->queued, q);
             sendqueue(s, scratch);
         } else {
-            // Read at the next step; a pending ask yields to it, as do
-            // any more asks before then (askcall), except the agent's
-            // questions, which the steer waits behind (askusercall)
-            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files};
+            // Read at the next step, after any ask pending or made before
+            // then is answered: a steer never answers an ask, which the
+            // user may not have seen when writing it
+            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files, at.sessions};
             s->steers = push(&s->perm, s->steers, q);
             sendqueue(s, scratch);
-            if (s->state==S_ASK && s->ask.tool!=TOOL_ASKUSER) {
-                resolve(s, scratch, 0, DENY_STEER, {});
-                nexttool(s, scratch);
-            }
         }
     } return;
     case CMD_UNQUEUE:
@@ -20149,7 +23198,7 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     } else if (onconfig(e, scratch, r) || onprobe(e, scratch, r) ||
                onctl(e, scratch, r) || onlister(e, scratch, r) ||
-               relayrecord(e, scratch, r)) {
+               relayrecord(e, scratch, r) || termrecord(e, scratch, r)) {
         return;
     }
 
@@ -20373,6 +23422,7 @@ static void enginethread(void *arg)
         next = e->wtdue.len || e->wtgone.len ? now : next;
         next = !e->quitting && e->trashat<next ? e->trashat : next;
         next = relaynext(e, now)<next ? relaynext(e, now) : next;
+        next = termnext(e, now)<next ? termnext(e, now) : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -20417,6 +23467,7 @@ static void enginethread(void *arg)
         }
         listertimeout(e, newarena(e->scratch), now);
         relaytick(e, newarena(e->scratch));
+        termtick(e, newarena(e->scratch));
         if (mcpnext(e) <= now) {
             mcptick(e, newarena(e->scratch), now);
         }
@@ -20500,6 +23551,7 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     }
     e->perm     = newarena(r);
     e->relay    = newrelay(os, &e->perm);
+    e->terms    = newterms(&e->perm);
     Str exe     = os_exepath(os, &e->perm);
     e->exedir   = parentdir(exe);
     e->env      = os_environ(os, &e->perm);
@@ -20526,6 +23578,11 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     // Tests shorten minutes of slow retries to milliseconds
     Int minute = parseint(os_getenv(os, &e->perm, "PROSPERO_TEST_MINUTE_MS"));
     e->minute  = minute.ok && minute.val>0 && minute.val<=60000 ? minute.val*MS : 60*SEC;
+    Str issuer = os_getenv(os, &e->perm, "PROSPERO_TEST_CHATGPT_AUTH");
+    e->chatgptauth = issuer.len ? issuer : chatgptissuer;
+    Str gh = os_getenv(os, &e->perm, "PROSPERO_TEST_COPILOT_AUTH");
+    e->ghauth = gh.len ? gh : copilotgithub;
+    e->ghapi  = gh.len ? gh : copilotghapi;
     // URL includes refresh in the background now, every ten minutes
     cfgattach(cfg, e->in, 10*e->minute);
     return e;

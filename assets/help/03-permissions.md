@@ -17,7 +17,11 @@ and, if it cannot finish, to ask you for it when it ends its turn.
 
 An ask shows as a card in the transcript, "Allow TOOL PATH?", with a
 countdown: it is denied unless you answer within `[guard] ask_timeout`
-seconds (30 by default). Its buttons:
+seconds (60 by default). **Keep waiting**, at the card's top right,
+drops the countdown for that one ask, which then waits until you answer
+it. Set to 0, every ask waits until you answer. Either way that holds
+while a window has the session open; with none, asks are denied at
+once. Its buttons:
 
 - **Allow** lets this one call go ahead.
 - **Always allow DIR (read)**, or **(write)**, set apart from Allow,
@@ -27,9 +31,10 @@ seconds (30 by default). Its buttons:
 - **Deny**: the agent reads why, and tries something else.
 - **Deny with note...** denies, telling the agent what to do instead.
 
-Sending a message while an ask waits denies it, and the agent reads
-your message. The agent's questions are the exception: a message waits
-for your answers (see [Plan mode](help:plan)).
+A message you send while an ask waits does not answer it: it waits
+below the card, marked "Next step", and the agent reads it once you
+answer, along with the outcome. To refuse and say what to do instead,
+use **Deny with note...**. **Stop** ends the turn, ask and all.
 
 A write or edit of Prospero's own configuration (its file, and the
 local files it includes) asks every time, even inside the working
@@ -62,7 +67,7 @@ separated by `;`, with `~` for the home directory:
 
 ## Bypass
 
-Bypass mode, picked in red from the mode list above the transcript, is for an
+Bypass mode, picked in red from the mode list on the Prompt's status line, is for an
 agent left to work alone somewhere it can do no harm. Nothing is
 asked, attended or not: the file tools read and write outside the
 working directory, the desktop tool acts, starting programs too, and

@@ -70,6 +70,68 @@ static void test_mcp(Test *t)
     expect(t, "mcp only null", mcponly({}, "x") ? Str("yes") : Str("no"), "yes");
     expect(t, "mcp only", mcponly("echo, image", "image") ? Str("yes") : Str("no"), "yes");
     expect(t, "mcp only not", mcponly("echo, image", "ima") ? Str("yes") : Str("no"), "no");
+    {
+        // Left to right: a first exclusion starts from all, "-" alone
+        // is a name, and a value of no words keeps everything
+        static struct { Str only, tool; b32 want; } const cases[] = {
+            {"-echo", "echo", 0}, {"-echo", "image", 1},
+            {"-echo -image", "image", 0}, {"-echo, -image", "where", 1},
+            {"echo -echo", "echo", 0}, {"-echo echo", "echo", 1},
+            {"echo", "where", 0}, {"echo -image", "image", 0},
+            {"-", "-", 1}, {"-", "echo", 0}, {",", "echo", 1}, {" , ", "x", 1},
+            {"", "x", 1}, {"-e-x", "e-x", 0}, {"-e-x", "-e-x", 1},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Str what = concat(&a, concat(&a, "mcp only \"", cases[i].only),
+                              concat(&a, "\" ", cases[i].tool));
+            expect(t, what, mcponly(cases[i].only, cases[i].tool) ? Str("yes") : Str("no"),
+                   cases[i].want ? Str("yes") : Str("no"));
+        }
+    }
+
+    {
+        // Settings' checkbox: the value written, "<drop>" for none,
+        // "<incl>" for "" (an include sets it), or the error's start
+        static struct { Str cur, tool; b32 on, incl; Str want; } const cases[] = {
+            {"", "echo", 0, 0, "-echo"},
+            {"", "echo", 1, 0, "<drop>"},
+            {"-echo", "echo", 1, 0, "<drop>"},
+            {"-echo", "echo", 1, 1, "<incl>"},
+            {"-echo", "image", 0, 0, "-echo -image"},
+            {"-echo, -image", "echo", 1, 0, "-image"},
+            {"-echo echo -x", "image", 0, 0, "-x -image"},
+            {"-x a", "x", 1, 0, "<drop>"},
+            {"echo, image", "image", 0, 0, "echo"},
+            {"echo, image", "where", 1, 0, "echo image where"},
+            {"echo gone", "echo", 0, 0, "gone"},
+            {"echo", "echo", 0, 0, "it is the last"},
+            {"echo -echo image", "echo", 1, 0, "image echo"},
+            {"echo image", "echo", 1, 0, "image echo"},
+            {",", "echo", 0, 0, "-echo"},
+            {"-", "-", 0, 0, "it is the last"},
+            {"", "-", 0, 0, "--"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Str what = concat(&a, concat(&a, "mcp toggle \"", cases[i].cur),
+                              concat(&a, "\" ", cases[i].tool));
+            McpToggle r = mcptoggle(&a, cases[i].cur, cases[i].tool, cases[i].on,
+                                    cases[i].incl);
+            Str got = r.err.len ? takehead(r.err, cases[i].want.len) :
+                      r.drop ? Str("<drop>") : !r.value.len ? Str("<incl>") : r.value;
+            expect(t, what, got, cases[i].want);
+            if (!r.err.len && !r.drop && r.value.len) {
+                // The meaning holds but for the tool
+                Str names[] = {"echo", "image", "where", "x", "a", "gone", "-"};
+                for (iz k = 0; k < countof(names); k++) {
+                    b32 want = names[k]==cases[i].tool ? cases[i].on
+                                                        : mcponly(cases[i].cur, names[k]);
+                    expect(t, concat(&a, what, concat(&a, " keeps ", names[k])),
+                           mcponly(r.value, names[k]) ? Str("yes") : Str("no"),
+                           want ? Str("yes") : Str("no"));
+                }
+            }
+        }
+    }
 
     // Command words
     expect(t, "mcp words", mcpwordsshow(&a, "  npx -y  @scope/server "), "npx|-y|@scope/server");
@@ -252,7 +314,10 @@ static void test_mcp(Test *t)
             "token = file:~/t.key\n"
             "trust = yes\n"
             "[web]\n"
-            "key = file:~/w.key\n");          // 15
+            "key = file:~/w.key\n"            // 15
+            "[mcp proj]\n"
+            "tools = -x\n"
+            "token = env:HOME\n");
         os_write(v.os, b, "/home/u/t.key", "tk\n");
         os_write(v.os, b, "/home/u/w.key", "wk\n");
         os_write(v.os, b, "/c/team.ini",
@@ -277,10 +342,14 @@ static void test_mcp(Test *t)
         expect(t, "mcp sections", inidiags(&b, c->ini),
             "/c/prospero.ini:2:2: warning: mcp both has both a command and a url: "
             "set one of them\n"
-            "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url\n"
+            "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url, "
+            "so it only adjusts projects' servers of that name, with tools, enabled, "
+            "timeout or startup_timeout\n"
             "/c/prospero.ini:10:9: warning: a plaintext secret: write env:NAME and "
             "set the variable, or file:PATH, so that this file can be shared\n"
-            "/c/team.ini:1:2: warning: mcp shared has neither a command nor a url\n"
+            "/c/team.ini:1:2: warning: mcp shared has neither a command nor a url, "
+            "so it only adjusts projects' servers of that name, with tools, enabled, "
+            "timeout or startup_timeout\n"
             "/c/team.ini:2:11: error: [mcp] command in an included file is ignored, "
             "since it chooses what runs: set it in your own file (an included file "
             "may give a server by its url)\n"
@@ -299,7 +368,10 @@ static void test_mcp(Test *t)
             "by its url or command, which an included file cannot change\n"
             "/c/team.ini:16:7: error: [web] ask = false in an included file is "
             "ignored, since it lets the agent search and read unasked: set it in "
-            "your own file");
+            "your own file\n"
+            "/c/prospero.ini:18:1: warning: [mcp proj] has no command or url, so it "
+            "only adjusts projects' servers of that name, which never get token: a "
+            "project chooses where they run");
         expect(t, "mcp shared command", cfgget(c, "mcp", "shared", "command", 0), "");
         expect(t, "mcp remote url", cfgget(c, "mcp", "remote", "url", 0), "https://team/mcp");
         expect(t, "mcp remote trust", cfgget(c, "mcp", "remote", "trust", 0), "yes");  // ours

@@ -32,6 +32,12 @@ told.
   the session starts a turn by itself to report it, at most this many
   times an hour (5 by default; 0 for never).
 
+While it may resume, the agent is told so, and that it may end its turn
+to wait for a job rather than check on it. One that reads a running
+job's output again with nothing new, or runs only `sleep` while a job
+runs, is told plainly to stop and end its turn. A turn that ends saying
+it will wait for a job it started isn't pushed to go on.
+
 Closing a session stops its jobs, and so does quitting.
 
 ## Subagents
@@ -51,8 +57,17 @@ those a role has when it names none (every tool but desktop), and
 tool, and `tools = * -shell` gives every tool but the shell. The New
 session dialog's Role starts a session in a role, too.
 
+A role's `prompt` is added to the system prompt. A longer one can go
+in a file, `prompt_file = roles/writer.md`, relative to the
+configuration file that sets it (or absolute, or under `~`), added
+after `prompt`. It is read as each session starts, so an edit counts
+from the next session on. An include by URL cannot set it.
+
 A subagent shows under its parent in the sidebar, folded away by its
-arrow. In the parent's transcript, its task row has Open subagent (or
+arrow. A subagent cannot be resumed, so once three or more under one
+parent are finished, they gather in a "finished" row of their own
+after the rest, folded until you open it. Those still at work, asking
+something, or in view stay listed. In the parent's transcript, its task row has Open subagent (or
 Answer the subagent, when it asks something), and the up arrow above
 the subagent's own transcript goes back to its parent. That bar also
 shows the subagent's model. A subagent has its parent's mode and

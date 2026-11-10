@@ -34,8 +34,13 @@ host is, with Connect and Deploy engine, as the Hosts pane does.
 Connect, in the Hosts pane or the host's menu in the sidebar, runs
 `ssh` and `prospero attach` there, which starts a host that outlives
 the connection. ssh runs in batch mode, so it cannot ask for a
-password: use a key, or an ssh agent. A connection that breaks is
-taken up again, and the host keeps your place for three hours.
+password: use a key, or an ssh agent. A connect that fails says why
+in a toast, at the foot of the Sessions or Hosts pane, where it began,
+with Deploy engine when the machine has no engine. A connection that
+breaks is taken up again, and the host keeps your place for three
+hours. Meanwhile its line says when it tries again; hover over it, or
+over the host's heading in the sidebar, for why it went down, or why a
+connect not begun by a click (as at launch) failed.
 
 ## WSL distros
 
@@ -100,6 +105,12 @@ Delete container..., also in the Hosts pane's Containers, removes it
 and its sessions for good, as emptying the Trash or the Trash's purge
 after `trash_days` does. A mounted folder is never removed.
 
+A session's Open working folder opens the mounted folder here, where
+its folder is in it; with a copy or an empty workspace its files are
+only in the container. Open in external terminal, and a Terminal pane
+tab (the terminal button beside the prompt box), open a shell inside
+the container, in the session's folder, while it runs.
+
 Whatever user the image names, the engine and the agent run as root in
 the container, which is you, not root, on this computer with Docker
 Desktop, Podman, or rootless Docker. A rootful Docker on Linux would
@@ -140,6 +151,16 @@ configuration, or this computer's when it has none (below). With
 `list = connected` in its section, a remote is left out of the sidebar
 until connected.
 
+A Terminal pane tab for a session on another host, a remote, a
+container or a background host, runs its shell there, by that host's
+engine, in the session's folder. While the connection is broken the
+tab says Reconnecting, keeps its shell, and shows what it printed
+meanwhile once the connection is back; typing meanwhile is lost. A
+host that was disconnected, or that started over, ends its tabs. A
+host whose engine is older than this window says so: deploy an engine
+(below) to have terminal tabs there. Closing the window to run in the
+background hangs up this window's terminal tabs.
+
 ## A remote with no models of its own
 
 A remote needs no configuration. One whose configuration has no
@@ -151,7 +172,7 @@ responses back. The Hosts pane says so under the remote, and the model
 picker of its sessions lists this computer's models. Each request
 travels as its difference from the session's last one, compressed.
 
-While a call runs this way, the session bar says "via this computer",
+While a call runs this way, the Prompt's status line says "via this computer",
 or the name of the computer relaying it. With no computer connected
 that offers the session's endpoint, its turn pauses ("paused: no relay",
 in amber) and goes on once one connects, for at most that endpoint's
@@ -193,7 +214,7 @@ when the machine has none, or one of another protocol (`deploy = auto`,
 the default), as for a WSL distro the first time. A deploy that fails
 says why in a toast, at the foot of the Sessions or Hosts pane, where it
 began. With `deploy = ask` in the remote's section, the connection fails
-instead, saying why.
+instead, saying why, and its toast offers Deploy engine.
 
 Deploy engine, in the Hosts pane under a remote that is not connected
 and in its menu in the sidebar, deploys this version's engine there and

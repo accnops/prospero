@@ -719,6 +719,11 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 //   prospero mcp list            the servers the configuration names
 //   prospero mcp auth NAME       sign in, through a browser
 //   prospero mcp logout NAME     forget its tokens
+//   prospero endpoint auth NAME  sign in to ChatGPT for an endpoint of
+//                                kind chatgpt, through a browser, or to
+//                                GitHub Copilot for one of kind copilot,
+//                                with a code entered in any browser
+//   prospero endpoint logout NAME  forget its tokens
 //   prospero approve             what waits for approval: credentials for
 //                                urls of web includes (see "Approvals")
 //   prospero approve URL         approve what waits for that url
@@ -728,12 +733,16 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 // Approving takes the url typed back, so that it is one the user saw,
 // and only while the configuration still gives it. The sign-in
 // prints the URL to visit and takes the browser's return at a loopback
-// listener of its own, waiting 10 minutes at most.
+// listener of its own, waiting 10 minutes at most; Copilot's prints
+// GitHub's page and a code, and waits for GitHub to say it was entered.
 
 static Str mcpusage =
 "usage: prospero mcp list [options]\n"
+"       prospero mcp tools NAME [options]\n"
 "       prospero mcp auth NAME [options]\n"
 "       prospero mcp logout NAME [options]\n"
+"       prospero endpoint auth NAME [options]\n"
+"       prospero endpoint logout NAME [options]\n"
 "       prospero approve [URL] [options]\n"
 "options:\n"
 "  -c FILE       configuration file\n"
@@ -743,13 +752,24 @@ enum : u32 { MCPCLI_LOOP = 200 };
 
 // Send a command and wait for its reply, or for the loopback's record
 // when loop is given: the reply's object, or null with *target set.
-static Json *mcpcliwait(Cli *c, Arena *a, Str line, i64 id, Str *target)
+static Json *mcpcliwait(Cli *c, Arena *a, Str line, i64 id, Str *target, i32 ms = -1)
 {
     if (line.len) {
         enginecmd(c->e, line);
     }
+    i64 end = ms<0 ? 0 : os_ticks(c->os) + ms*MS;
     for (;;) {
-        mailwait(c->out, -1);
+        i32 left = -1;
+        if (ms >= 0) {
+            i64 l = (end - os_ticks(c->os)) / MS;
+            if (l <= 0) {
+                return 0;  // timed out
+            }
+            left = (i32)l;
+        }
+        if (!mailwait(c->out, left)) {
+            continue;
+        }
         Mail m = mailtake(c->out);
         for (Record r; (r = mailnext(&m)).ok;) {
             if (r.type == MCPCLI_LOOP && target) {
@@ -782,11 +802,140 @@ static Str mcpcmdline(Arena *a, i32 cmd, i64 id, Str name, Json *more = 0)
     return cuttail(evend(&w), 1);
 }
 
+// A server's text, for a terminal: its first line, no control
+// characters (a server may send escapes), cut.
+static Str mcpcliline(Arena *a, Str s, iz max)
+{
+    Buf b(a, max + 4);
+    for (iz i = 0; i<s.len && s[i]!='\n' && b.len<max; i++) {
+        u8 c = s[i];
+        if (c<0x20 || c==0x7f) {
+            putbyte(&b, ' ');
+        } else if (c==0xc2 && i+1<s.len && s[i+1]>=0x80 && s[i+1]<0xa0) {
+            i++;  // C1, as UTF-8
+            putbyte(&b, ' ');
+        } else {
+            putbyte(&b, c);
+        }
+    }
+    Str r = trim(finish(&b));
+    return utf8head(r, max);
+}
+
+// prospero mcp tools NAME: a server of the configuration, started to
+// list its tools, waiting as long as it may take to start, then each
+// tool and whether sessions get it.
+static i32 mcpclitools(Cli *c, Arena scratch, Config *cfg, Str name)
+{
+    i32  wait  = (i32)(cfgms(cfg, "mcp", name, "startup_timeout", 0) + 5000);
+    i64  until = os_ticks(c->os) + wait*(i64)MS;
+    Json *srv  = 0;
+    Str   why  = {};
+    for (i64 id = 1;; id++) {
+        Arena a = scratch;
+        Buf   b(&a, 256);
+        EvOut w = cmdbegin(&b, CMD_MCP, id);
+        putstrkey(&w.json, "name", name);
+        putintkey(&w.json, "tools", 1);
+        putintkey(&w.json, "start", id==1);
+        Json *r = mcpcliwait(c, &a, cuttail(evend(&w), 1), id, 0, wait);
+        why = jsonstr(jsonget(r, "why"));
+        srv = 0;
+        for (Json *x = jsonget(r, "servers")->child; x; x = x->next) {
+            srv = srv ? srv : x;
+        }
+        Str st = jsonstr(jsonget(srv, "state"));
+        if (!r || why.len || !srv || st!="starting" || os_ticks(c->os)>=until) {
+            // Its reply stays in this arena from here
+            scratch = a;
+            if (!r) {
+                srv = 0;
+                why = "it did not answer";
+            } else if (st=="starting" && !jsonget(srv, "toollist")->child) {
+                Buf t(&scratch, 64);
+                print(&t, "it did not list its tools in ");
+                print(&t, (i64)(wait/1000));
+                print(&t, " seconds");
+                why = finish(&t);
+            }
+            break;
+        }
+        mailwait(c->out, 200);
+    }
+
+    Buf  out(&scratch, 1<<12);
+    Str  src = jsonstr(jsonget(srv, "source"));
+    Json *ts = jsonget(srv, "toollist");
+    if (src == "overlay") {
+        print(&out, name);
+        print(&out, ": settings for projects' servers of that name, whose tools "
+                    "show in Settings while a session runs one\n");
+        os_print(c->os, 1, finish(&out));
+        return 0;
+    } else if (!srv) {
+        print(&out, "prospero: no MCP server is named ");
+        print(&out, name);
+        print(&out, why.len ? Str(": ") : Str(""));
+        print(&out, why);
+        putbyte(&out, '\n');
+        os_print(c->os, 2, finish(&out));
+        return 1;
+    } else if (!ts->child) {
+        Str err = jsonstr(jsonget(srv, "err"));
+        print(&out, "prospero: ");
+        print(&out, name);
+        print(&out, ": ");
+        print(&out, why.len ? why : err.len ? err : Str("it lists no tools"));
+        putbyte(&out, '\n');
+        os_print(c->os, 2, finish(&out));
+        return why.len || err.len ? 1 : 0;
+    }
+
+    iz width = 0;
+    for (Json *t = ts->child; t; t = t->next) {
+        iz n = mcpcliline(&scratch, jsonstr(jsonget(t, "tool")), 32).len;
+        width = n>width ? n : width;
+    }
+    print(&out, name);
+    print(&out, ": ");
+    print(&out, jsonint(jsonget(srv, "kept"), 0));
+    print(&out, " of ");
+    print(&out, jsonint(jsonget(srv, "listed"), 0));
+    print(&out, " tools offered");
+    print(&out, jsonint(jsonget(srv, "aslisted"), 0) ? Str(", as last listed") : Str(""));
+    print(&out, jsonint(jsonget(srv, "truncated"), 0) ? Str(", the list cut short") : Str(""));
+    print(&out, jsonint(jsonget(srv, "enabled"), 1) ? Str("") : Str(", turned off"));
+    putbyte(&out, '\n');
+    for (Json *t = ts->child; t; t = t->next) {
+        Str tool = mcpcliline(&scratch, jsonstr(jsonget(t, "tool")), 32);
+        b32 kept = jsonint(jsonget(t, "kept"), 0) != 0;
+        b32 off  = kept && !jsonint(jsonget(t, "offered"), 0);
+        print(&out, !kept ? Str("  [ ] ") : off ? Str("  [!] ") : Str("  [x] "));
+        print(&out, tool);
+        for (iz i = tool.len; i < width; i++) {
+            putbyte(&out, ' ');
+        }
+        print(&out, jsonint(jsonget(t, "ro"), 0) ? Str("  read-only  ") : Str("             "));
+        Str desc = off ? jsonstr(jsonget(t, "why")) : jsonstr(jsonget(t, "desc"));
+        print(&out, mcpcliline(&scratch, desc, 100));
+        putbyte(&out, '\n');
+    }
+    i64 more = jsonint(jsonget(srv, "toolsmore"), 0);
+    if (more) {
+        print(&out, "  and ");
+        print(&out, more);
+        print(&out, " more\n");
+    }
+    os_print(c->os, 1, finish(&out));
+    return 0;
+}
+
 static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     Cli c = {};
     c.os = os;
     b32 top  = args[1] == "approve";  // prospero approve, not under mcp
+    b32 ep   = args[1] == "endpoint";  // an endpoint's ChatGPT sign-in
     Str verb = top ? Str("approve") : nargs>2 ? args[2] : Str{};
     Str name = {}, url = {}, config = {}, state = {};
     for (i32 i = top ? 2 : 3; i < nargs; i++) {
@@ -804,8 +953,10 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             return 2;
         }
     }
-    if ((verb!="list" && verb!="auth" && verb!="logout" && verb!="approve") ||
-            ((verb=="auth" || verb=="logout") && !name.len)) {
+    if ((verb!="list" && verb!="tools" && verb!="auth" && verb!="logout" &&
+         verb!="approve") ||
+            ((verb=="auth" || verb=="logout" || verb=="tools") && !name.len) ||
+            (ep && (verb=="list" || verb=="tools"))) {
         os_print(os, 2, mcpusage);
         return 2;
     }
@@ -829,6 +980,13 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCP, 1, {}), 1, 0);
         for (Json *s = jsonget(r, "servers")->child; s; s = s->next) {
             Str url = jsonstr(jsonget(s, "url"));
+            if (jsonstr(jsonget(s, "source")) == "overlay") {
+                print(&out, jsonstr(jsonget(s, "name")));
+                print(&out, ": settings for projects' servers of that name");
+                print(&out, jsonint(jsonget(s, "enabled"), 1) ? Str("") : Str(", turned off"));
+                putbyte(&out, '\n');
+                continue;
+            }
             print(&out, jsonstr(jsonget(s, "name")));
             print(&out, url.len ? Str(": ") : Str(": a program"));
             print(&out, url);
@@ -841,6 +999,8 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             putbyte(&out, '\n');
         }
         os_print(os, 1, finish(&out));
+    } else if (verb == "tools") {
+        code = mcpclitools(&c, scratch, cfg, name);
     } else if (verb=="approve" && !url.len) {
         Arena a = scratch;
         Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_APPROVE, 1, {}), 1, 0);
@@ -913,7 +1073,8 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         }
     } else if (verb == "logout") {
         Arena a = scratch;
-        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPLOGOUT, 1, name), 1, 0);
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, ep ? CMD_EPLOGOUT : CMD_MCPLOGOUT,
+                                                1, name), 1, 0);
         if (!jsonint(jsonget(r, "ok"), 0)) {
             print(&out, "prospero: ");
             print(&out, jsonstr(jsonget(r, "err")));
@@ -926,12 +1087,66 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             print(&out, ".\n");
             os_print(os, 1, finish(&out));
         }
+    } else if (ep && trim(cfgget(cfg, "endpoint", name, "kind", 0))=="copilot") {
+        // GitHub's device flow: a code to enter at its page, from any
+        // browser, while the engine waits for it to be
+        Arena a = scratch;
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_EPAUTH, 1, name), 1, 0);
+        Str   url  = jsonstr(jsonget(r, "url"));
+        Str   uc   = jsonstr(jsonget(r, "code"));
+        if (!jsonint(jsonget(r, "ok"), 0) || !url.len || !uc.len) {
+            print(&out, "prospero: ");
+            print(&out, jsonstr(jsonget(r, "err")));
+            putbyte(&out, '\n');
+            os_print(os, 2, finish(&out));
+            code = 1;
+        } else {
+            print(&out, "To sign in to GitHub Copilot for endpoint ");
+            print(&out, name);
+            print(&out, ", visit this in any browser:\n\n  ");
+            print(&out, url);
+            print(&out, "\n\nand enter the code:\n\n  ");
+            print(&out, uc);
+            print(&out, "\n\n");
+            os_print(os, 1, finish(&out));
+            out.len = 0;
+            Buf     cb(&a, 64);
+            JsonOut cw = {&cb};
+            putobject(&cw);
+            putintkey(&cw, "endpoint", 1);
+            putend(&cw);
+            Json *more = jsonparse(&a, finish(&cb)).root;
+            r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPCODE, 2, name, more), 2, 0);
+            if (!jsonint(jsonget(r, "ok"), 0)) {
+                print(&out, "prospero: ");
+                print(&out, jsonstr(jsonget(r, "err")));
+                putbyte(&out, '\n');
+                os_print(os, 2, finish(&out));
+                code = 1;
+            } else {
+                print(&out, "Signed in to ");
+                print(&out, name);
+                print(&out, ".\n");
+                os_print(os, 1, finish(&out));
+            }
+        }
     } else {
         Arena a    = scratch;
-        Str   uri  = trim(cfgget(cfg, "mcp", name, "redirect_uri", 0));
+        // A section's redirect_uri only for a server it defines by url,
+        // not a project's of the same name
+        b32   own  = trim(cfgget(cfg, "mcp", name, "url", 0)).len > 0;
+        Str   uri  = ep || !own ? Str{} : trim(cfgget(cfg, "mcp", name, "redirect_uri", 0));
         Url   at   = loopbackuri(uri);
         i32   port = at.ok ? at.port : 0;
-        if (uri.len && !at.ok) {
+        Str   back = ep ? chatgptloopback(os, &a, c.out, MCPCLI_LOOP, 0) : Str{};
+        if (ep && !back.len) {
+            os_print(os, 2, "prospero: cannot listen on the loopback at port 1455 or 1457, "
+                            "where ChatGPT's sign-in comes back: is another sign-in "
+                            "waiting there?\n");
+            return 1;
+        } else if (ep) {
+            // Listening already
+        } else if (uri.len && !at.ok) {
             os_print(os, 2, "prospero: its redirect_uri is not http://127.0.0.1:PORT/PATH "
                             "or http://localhost:PORT/PATH\n");
             return 1;
@@ -943,8 +1158,10 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             os_print(os, 2, finish(&out));
             return 1;
         }
-        Buf rb(&a, 64 + uri.len);
-        if (at.ok) {
+        Buf rb(&a, 64 + uri.len + back.len);
+        if (ep) {
+            print(&rb, back);
+        } else if (at.ok) {
             print(&rb, uri);
         } else {
             print(&rb, "http://127.0.0.1:");
@@ -957,7 +1174,8 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         putstrkey(&w, "redirect", finish(&rb));
         putend(&w);
         Json *more = jsonparse(&a, finish(&mb)).root;
-        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPAUTH, 1, name, more), 1, 0);
+        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, ep ? CMD_EPAUTH : CMD_MCPAUTH,
+                                                   1, name, more), 1, 0);
         Str   url  = jsonstr(jsonget(r, "url"));
         if (!jsonint(jsonget(r, "ok"), 0) || !url.len) {
             print(&out, "prospero: ");
@@ -966,7 +1184,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             os_print(os, 2, finish(&out));
             code = 1;
         } else {
-            print(&out, "To sign in to ");
+            print(&out, ep ? Str("To sign in to ChatGPT for endpoint ") : Str("To sign in to "));
             print(&out, name);
             print(&out, ", visit this in a browser on this machine:\n\n  ");
             print(&out, url);
@@ -979,6 +1197,9 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             Buf cb(&a, 256 + q.len);
             JsonOut cw = {&cb};
             putobject(&cw);
+            if (ep) {
+                putintkey(&cw, "endpoint", 1);
+            }
             Str keys[] = {"code", "state", "error", "error_description"};
             for (iz i = 0; i < countof(keys); i++) {
                 Str v = mcpquery(&a, q, keys[i]);

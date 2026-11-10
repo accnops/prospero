@@ -23,10 +23,11 @@ it streams (`[ui] count = characters` counts those instead), which a
 click opens; `[ui] thinking = open` shows it whole, and `hide` leaves it
 out of the transcript (the session log keeps it, and the model still
 gets it back). Tool rows fold by kind and outcome, or all of
-them with `[ui] tools = fold` or `open`, and a session's Tool output and
-Reasoning buttons (a wrench and screwdriver, a light bulb, above the
-transcript) open everything for that session alone. Cmd/Ctrl+F finds text
-in what the transcript shows, not in folded rows, and a code block's Copy button
+them with `[ui] tools = fold` or `open`. Above the transcript, a session's
+Shell output button (the Bash logo) folds every shell command's output,
+short ones too, and its Tool output and Reasoning buttons (a wrench and
+screwdriver, a light bulb) open everything, each for that session alone. Cmd/Ctrl+F finds text
+in what the transcript shows, as shown rather than its Markdown, not in folded rows, and a code block's Copy button
 copies its code exactly. A bar above the transcript shows how full the
 context is. A file tool that goes outside the session's working directory,
 or the roots the configuration adds, asks first, and an answer not given
@@ -87,7 +88,20 @@ icon) does the same. A folder dropped on the window fills the New
 session dialog with it.
 
 The sidebar is a tree: groups, then hosts, then sessions with their
-subagents, and archived sessions folded away at the end. A session's
+subagents, and archived sessions folded away at the end. Three or more
+finished subagents under one parent fold into a "finished" row of
+their own, after those still at work, asking, or in view. Sessions
+come by recent activity, the latest message sent or turn begun or
+ended first, a session's subagents counting as its own; the sort
+button at its top switches to date created, and the window keeps the
+choice. Rows hold still while the pointer is over the sidebar.
+Ctrl+K (Cmd+K on macOS), or Go to... in the Session and View menus,
+opens a palette over the window, in any layout: type words from a
+session's title, group, folder or host, and Enter shows it; layouts,
+panes, settings and Help's sections are listed too, under their own
+headings. With
+nothing typed it lists the sessions viewed before, latest first, so
+Ctrl+K then Enter goes back to the previous one. A session's
 context menu, and the Session menu, rename it, move it to a group,
 fork it, compact it now, switch its model, export it (Markdown or the
 raw log), archive it, or move it to the Trash (with its subagents),
@@ -96,7 +110,12 @@ deleted permanently or emptied first. Dragging a session onto a group,
 onto Archived, or below the list moves it there too, on its own host,
 and onto the strip at the sidebar's foot, to the Trash. The transcript's
 context menu forks at a message: before a prompt, which then waits in
-the fork's prompt box, or after a turn. A side chat, from that menu,
+the fork's prompt box, or after a turn. Fork into another folder
+copies the conversation into a new session that works in another
+folder of the same host. Its agent is told it moved, and paths it saw
+before then meant the old folder. The new folder's instructions and
+memory apply. The old folder's file snapshots, and "always allow"
+answers for paths there, stay behind. A side chat, from that menu,
 the Session menu or `/side`, is a fork made even while the agent
 works, nested under its session, the selection quoted in its box; its
 agent is told to leave files alone. A worktree session, from the New
@@ -154,12 +173,102 @@ request, so it needs no vision. A file with a NUL byte in its first
 8 KiB is binary, and is refused, as `read` refuses it. The transcript
 notes the files under their message, folded.
 
+A PDF attached so goes as its text, extracted by the engine as `read`
+extracts it (a `--- page N ---` line starting each page). The session
+keeps the PDF as `files/N-NAME.pdf` and its text beside it as
+`files/N-NAME.pdf.txt`, and the request names both, so the agent reads on
+from the text or reads the PDF itself. To a model that takes images,
+the pictures on the pages the request shows go too, as the message's own
+images (kept as `img/N`, each captioned with its number, page and PDF),
+at most eight from a PDF and ten to a message with those attached by
+hand. These count with the images `read` shows from PDFs, at most 40 of
+them and 8 MiB in a request: past that, the oldest PDF's images leave
+requests, a note in their place. A PDF named `.PDF` is kept as `.pdf`,
+and a text file named as a PDF's text (`NAME.pdf.txt`) as
+`NAME_pdf.txt`. An encrypted PDF, or one with no text to read, is
+refused, but a text file that only mentions `%PDF-` near its start is
+attached as text. With an engine too old to read PDFs, the window says
+so instead of attaching one.
+
+A file or folder may be mentioned in the prompt: type `@` at the start of
+a word (the text's start, or after a space or `(`), and a picker of the
+session's files and folders opens, ranked as you type, a subsequence of
+the path matching and the file's own name counting for more. Up and Down
+move the pick, and Tab or a plain Enter puts `@path` in the message
+without sending it; Shift+Enter and Ctrl+Enter still start a new line,
+and Esc closes the picker and leaves the message alone, a second Esc then
+cancelling the turn as it always did. A path holding a space is quoted,
+`@"my file.txt" `, and a folder's pick puts `@src/ui/` in the message
+and keeps the picker open inside it. `@` is already how an instruction
+file imports another, `@docs/a.md`, so the two read alike. `[ui]
+mentions = false` turns the picker off, and `@` is then plain text.
+
+Picking a file also attaches its text to the next message, as the Attach
+button does, so the agent has the contents as well as the path. A file
+that cannot be attached (binary, over 16 MiB, a PDF an older engine
+cannot read) still gets its token, with
+a dimmed chip that says why, and the mention still works: the agent reads
+the file itself. With ten files already attached the box has no room for
+another chip: the token goes in, no chip is added, and a note says ten
+files are already attached, the mention still working.
+
+An `@path` the message no longer holds when it is sent takes what it
+attached with it: the check is made when the message is sent, not as the
+text changes. A path typed by hand and dismissed with Esc stays a plain
+pointer, with no contents. A session on another machine lists one folder
+at a time, through its engine, and its engine reads a picked file there
+as the message goes; an engine too old for that gives the pick a dimmed,
+path-only chip. A path that cannot be written as a token, one holding `"`
+or `@`, is refused with a note.
+
+The picker lists other sessions too, once a word is typed: those on the
+session's host that are neither archived, in the Trash, nor subagents,
+matched by title or id and ranked with the files, each marked with a
+discussion icon and its id. A pick puts the title in the message,
+`@"Fix the parser" ` (the id where no token can hold the title, or
+another session has it too), and attaches nothing: when the message is
+sent, each session it mentions goes with it by id, and the agent is told
+that id before the message, so `send_message` reaches the session even
+after a rename. A token typed by hand counts as a pick does. The
+transcript shows a folded "Mentioned:" line under the message.
+
 The agent can look at image files on its own, too: `read` shows a PNG,
 JPEG, GIF, WebP or BMP file to a model that takes images, as an image,
 scaled down to the model's limits as a screenshot is ([Desktop control](desktop.md)). Images
 read leave the conversation along with screenshots (`[desktop]
 images`), each replaced by a line that says to read the file again. A
 model with `vision = false` is told only the image's kind and size.
+
+On an endpoint of kind `anthropic`, `read` sends a PDF to the model
+whole, as a document: Anthropic gives the model its text and an image
+of each page, so it sees figures, tables and scans too. A page costs
+somewhere near 2000 tokens, so a PDF may have at most as many pages as
+half the model's window holds (50 in 200K tokens, 100 at most, the
+API's limit), and 16 MiB. PDFs leave the conversation as images read
+do, and an older one also leaves when a newer one needs its room.
+
+Every other model, and one too long or too large to send as a
+document, or damaged, gets the PDF's text instead, extracted by
+Prospero's own reader. Damaged means it loads only by repair: junk
+before its header, its xref missing or wrong, or its page tree
+counting pages it lacks. Anthropic refuses many such PDFs as invalid,
+and the reader recovers them: a `--- page N ---` line starts each page, and each image drawn
+shows as a line such as `[image 2: 480x96 JPEG]` where it was drawn.
+The text is read as a text file's lines are, 2000 at a time, so the
+agent reads on with `offset`; when a read shows only part of it, the
+whole text is kept in the session's `out/` folder, where `grep` can
+search it. A model that takes images also gets the images in the lines
+it reads, up to 8 at a time, shrunk to the model's limits, and these
+leave the conversation together, as one read image does (at most 40
+of them and 8 MiB in a request, with attached PDFs' images, and 20 MiB
+with the PDFs sent as documents). A scan comes through as its page
+images; a model that takes none is pointed to OCR in the shell
+(`tesseract`), and a PDF whose words are drawn as shapes, or whose
+images are in JPEG 2000 or JBIG2, which are not shown, to rendering
+its pages (`pdftoppm`). An encrypted PDF is refused on every endpoint.
+`[model] pdf = false` makes a model on kind `anthropic` extract too.
+A GitHub Copilot endpoint (kind `copilot`) extracts even for Claude
+models on the Messages API.
 
 The New session dialog's working directory may be picked with Browse,
 in the platform's folder dialog, for a directory on this computer. A
@@ -195,7 +304,7 @@ the next prompt), and its Withdraw button puts it back in the draft.
 
 Plan mode has the agent explore and write a plan before it changes
 anything: the New session dialog's Plan mode box, `/plan` (and `/plan
-off`) or the mode list above the transcript (Build, Plan or Bypass) turns it on, and the agent may ask to
+off`) or the mode list on the Prompt's status line (Build, Plan or Bypass) turns it on, and the agent may ask to
 turn it on itself. The mode may change at any time, mid-turn too: the
 turn goes on, each call after the change held to the new mode, and the
 agent told at its next step; running subagents follow. While planning, its file tools may write only the
@@ -220,8 +329,8 @@ with a few options, the recommended one marked and picked, and a field
 for an answer in your own words, then a note, Submit answers and Skip.
 A skip, or nobody there to answer, has the agent go with its
 recommendations. In Plan mode the questions wait with no countdown;
-otherwise they are skipped after `[guard] question_timeout` (300 s),
-a countdown that starts over whenever you work on the card. A
+otherwise they are skipped after `[guard] question_timeout` (300 s;
+0 for no limit), a countdown that starts over whenever you work on the card. A
 notification tells of them (`[ui] notify` `allow`). Only the sessions
 you start yourself, attended, get the tool: never subagents, roles, a
 `tools` list or command-line runs. Over the protocol, an ask of kind
@@ -229,7 +338,9 @@ you start yourself, attended, get the tool: never subagents, roles, a
 answers:[{pick:[...], text?}, ...]}` answers it, one entry per question
 (cap `question`). `ask.touch {sid, req}` starts its countdown over, and
 an `ask.deadline {req, deadline}` record gives a changed deadline, 0
-for none (cap `question.deadline`).
+for none (cap `question.deadline`). It starts any other ask's countdown
+over too, from its own timeout, as you write a note to deny it with
+(cap `ask.deadline`).
 
 Bypass mode, in red in the same mode list, is for an agent left to
 work alone somewhere it can do no harm: nothing is asked, attended or

@@ -131,6 +131,10 @@ static void test_view(Test *t)
                "{\"query\":\"zlib 1.3 release\"}", "/w"), "\"zlib 1.3 release\"");
         expect(t, "view.web_fetch summary", toolsummary(&a, tmp, "web_fetch",
                "{\"url\":\"https://zlib.net/\",\"offset\":10}", "/w"), "https://zlib.net/");
+        expect(t, "view.todo changes summary", toolsummary(&a, tmp, "todo_write",
+               "{\"done\":[\"Read it\",\"Fix it\"],\"start\":\"Test it\",\"add\":\"Ship\","
+               "\"remove\":\"[\\\"Old\\\"]\"}", "/w"),
+               "done 2 items; start Test it; add Ship; remove Old");
         expect(t, "view.patch diff", tooldiff(&a, "edit", patch, "ok"),
                "```diff\n--- a.c\n+++ a.c\n@@ f\n-x\n+y\n--- b.c\n+++ /dev/null\n```\n");
         Str lines = "{\"path\":\"a.c\",\"tag\":\"AB12\",\"edits\":[{\"op\":\"replace\",\"line\":2,"
@@ -139,6 +143,21 @@ static void test_view(Test *t)
         expect(t, "view.hashline diff", tooldiff(&a, "edit", lines, "ok"),
                "```diff\n--- a.c\n+++ a.c\n@@ replace lines 2-3 @@\n+z\n@@ insert after line 0 @@\n"
                "+t\n@@ delete lines 9 @@\n```\n");
+
+        // replace_all: the first place, then how many more there were
+        Str all = "{\"path\":\"f.lua\",\"old_string\":\"\\n\",\"new_string\":\"\\nT = {}\\n\","
+                  "\"replace_all\":true}";
+        expect(t, "view.replace_all diff", tooldiff(&a, "edit", all,
+               "Edited f.lua: replaced 600 matches, the first at line 1."),
+               "```diff\n--- f.lua\n+++ f.lua\n@@ -1,1 +1,2 @@\n-\n+\n+T = {}\n"
+               "\\ the same change in 599 more places\n```\n");
+        expect(t, "view.replace_all two", tooldiff(&a, "edit", all,
+               "Edited f.lua: replaced 2 matches, the first at line 7."),
+               "```diff\n--- f.lua\n+++ f.lua\n@@ -7,1 +7,2 @@\n-\n+\n+T = {}\n"
+               "\\ the same change in 1 more place\n```\n");
+        expect(t, "view.replace one", tooldiff(&a, "edit", all,
+               "Edited f.lua: replaced 1 match at line 3 (matched ignoring indentation)."),
+               "```diff\n--- f.lua\n+++ f.lua\n@@ -3,1 +3,2 @@\n-\n+\n+T = {}\n```\n");
     }
 
     // A turn: deltas grow provisional messages, which the committed
@@ -339,6 +358,7 @@ static void test_view(Test *t)
         expect(t, "view.mdall", copysel(v, &a, COPY_MARKDOWN),
                "# Head\n\nSome **bold** text.\n\n```sh\necho hi\n```\n\n> quoted");
     }
+
     // Tool rows: arguments streaming, the committed calls, a running
     // command's output, its end with the output file, and an edit's diff
     {
@@ -1304,6 +1324,11 @@ static void test_viewpanels(Test *t)
                "Attached: a.txt, b_c.md1");
         apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","via":"prompt","text":"none"})");
         expect(t, "panels.nofiles", istr(&a, v->msgs.len), "3");
+        // A PDF's text is named as the PDF; a name too short is no crash
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"user","via":"prompt","text":"pdf",)"
+                    R"("files":[{"name":"files/3-r.pdf.txt","bytes":9,"lines":2},)"
+                    R"({"name":"f","bytes":1,"lines":1}]})");
+        expect(t, "panels.pdfnote", v->msgs[v->msgs.len-1].label, "Attached: r.pdf, ");
     }
 
     // Instruction files, each once as last told; a task's report as
@@ -1608,6 +1633,64 @@ static void test_viewwords(Test *t)
     }
 }
 
+// The work's numbers, and each agent message's turn work
+static Str workshow(Arena *a, View *v)
+{
+    ViewWork *w = &v->work;
+    i64 n[] = {w->model, w->first, w->genms, w->genout, w->tools, w->tasks,
+               w->compact, w->in, w->out, w->cached, w->requests};
+    Buf b(a, 256);
+    for (iz i = 0; i < countof(n); i++) {
+        print(&b, i ? Str("/") : Str(""));
+        print(&b, n[i]);
+    }
+    for (iz i = 0; i < v->msgs.len; i++) {
+        if (v->msgs[i].role == VIEW_ASSISTANT) {
+            print(&b, " A");
+            print(&b, v->msgs[i].worked);
+        }
+    }
+    return finish(&b);
+}
+
+static void test_viewwork(Test *t)
+{
+    Arena perm = t->perm;
+    // Two subagents at once, then a read after a 100 s ask: the calls
+    // that overlap count once, the ask not at all; the requests by their
+    // ms, before and after the first token
+    Str recs[] = {
+        R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"go"})",
+        R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})",
+        R"({"sid":"s","seq":3,"ts":3000,"ev":"assistant","turn":1,"attempt":1,)"
+        R"("blocks":[{"t":"text","text":"On it."},)"
+        R"({"t":"call","id":"c1","name":"task","args":"{}"},)"
+        R"({"t":"call","id":"c2","name":"task","args":"{}"},)"
+        R"({"t":"call","id":"c3","name":"read","args":"{}"}],)"
+        R"("usage":{"in":1000,"out":100,"cached":800},"ms":3000,"first_ms":1000})",
+        R"({"sid":"s","seq":4,"ts":13000,"ev":"tool.end","call":"c2","status":"ok","text":"b","ms":10000})",
+        R"({"sid":"s","seq":5,"ts":23000,"ev":"tool.end","call":"c1","status":"ok","text":"a","ms":20000})",
+        R"({"sid":"s","seq":6,"ts":125000,"ev":"tool.end","call":"c3","status":"ok","text":"r","ms":2000})",
+        R"({"sid":"s","seq":7,"ts":130000,"ev":"assistant","turn":1,"attempt":1,)"
+        R"("blocks":[{"t":"text","text":"Done."}],)"
+        R"("usage":{"in":2000,"out":300,"cached":1500},"ms":5000,"first_ms":2000})",
+        R"({"sid":"s","seq":8,"ts":130000,"ev":"turn.end","turn":1,"why":"done"})",
+        // A second turn, logged before first_ms: no split, no rate
+        R"({"sid":"s","seq":9,"ts":200000,"ev":"user","text":"again"})",
+        R"({"sid":"s","seq":10,"ts":200000,"ev":"turn","n":2})",
+        R"({"sid":"s","seq":11,"ts":204000,"ev":"assistant","turn":2,"attempt":1,)"
+        R"("blocks":[{"t":"text","text":"Again."}],"usage":{"in":10,"out":5,"cached":0},"ms":4000})",
+        R"({"sid":"s","seq":12,"ts":204000,"ev":"turn.end","turn":2,"why":"done"})",
+    };
+    Arena a = perm;
+    View *v = testview(&a);
+    for (Str r : recs) {
+        apply(v, a, r);
+    }
+    expect(t, "work", workshow(&a, v),
+           "12000/3000/5000/400/22000/20000/0/3010/405/2300/3 A0 A30000 A4000");
+}
+
 static void test_viewthinking(Test *t)
 {
     Arena perm = t->perm;
@@ -1879,36 +1962,67 @@ static void test_viewtranscript(Test *t)
         ViewSearch *s = testsearch(&a);
         for (iz i = 0; i < countof(recs); i++) apply(v, a, recs[i]);
         searchreset(s, v, "needle");
-        expect(t, "find.done", istr(&a, searchstep(s, 1<<20)), "1");
+        expect(t, "find.done", istr(&a, searchstep(s, a, 1<<20)), "1");
         expect(t, "find.folded", hitshow(&a, s), "");
         apply(v, a, end2);
         apply(v, a, end3);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.more", hitshow(&a, s), "4:4;");
         togglemsg(v, 2);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.opened", hitshow(&a, s), "2:2;4:4;");
         viewshowthink(v, 1);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.toggled", hitshow(&a, s), "1:0;2:2;4:4;");
         viewthink(v, THINK_HIDE);
         viewshowthink(v, 0);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.hidden", hitshow(&a, s), "2:2;4:4;");
         viewthink(v, THINK_FOLD);
         viewshowthink(v, 1);
         searchreset(s, v, "NEEDLE");
-        expect(t, "find.budget", istr(&a, searchstep(s, 10)), "0");
+        expect(t, "find.budget", istr(&a, searchstep(s, a, 10)), "0");
         expect(t, "find.partial", hitshow(&a, s), "1:0;");
-        while (!searchstep(s, 10)) {}
+        while (!searchstep(s, a, 10)) {}
         expect(t, "find.rest", hitshow(&a, s), "1:0;2:2;4:4;");
         expect(t, "find.from", istr(&a, searchfrom(s, 3, 0)), "2");
         togglemsg(v, 2);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.refolded", hitshow(&a, s), "1:0;4:4;");
         searchreset(s, v, "");
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.empty", istr(&a, s->hits.len), "0");
+    }
+
+    // Find: in what messages show, as copied text has it, whatever the
+    // markdown, case and spacing; hits are the source they cover
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        addmsg(v, VIEW_ASSISTANT,
+               "Use **`foo`** and [the docs](http://x) &amp; more.\n\n- one\n- two\n");
+        addmsg(v, VIEW_USER, "Line A\nline  B");
+        ViewSearch *s = testsearch(&a);
+        auto hits = [&](Str q) {
+            searchreset(s, v, q);
+            searchstep(s, a, 1<<20);
+            Buf b(&a, 256);
+            for (iz i = 0; i < s->hits.len; i++) {
+                FindHit *h = &s->hits[i];
+                Str      t = v->msgs[h->msg].text;
+                print(&b, (i64)h->msg);
+                putbyte(&b, ':');
+                print(&b, span(t.data+h->off, t.data+h->off+h->len));
+                putbyte(&b, ';');
+            }
+            return finish(&b);
+        };
+        expect(t, "view.findmd", hits("foo and the DOCS & more"),
+               "0:foo`** and [the docs](http://x) &amp; more;");
+        expect(t, "view.findlist", hits("more. - one - two"), "0:more.\n\n- one\n- two;");
+        expect(t, "view.findspace", hits("line a line b"), "1:Line A\nline  B;");
+        expect(t, "view.findmarkup", hits("**"), "");
+        expect(t, "view.findmany", hits("O"), "0:o;0:o;0:o;0:o;0:o;0:o;");
     }
 
     // The context gauge: usage, then the engine's own numbers

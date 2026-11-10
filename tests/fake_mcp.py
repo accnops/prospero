@@ -23,6 +23,7 @@ After notifications/initialized it sends the client a ping and a
 roots/list request, and logs the responses. Every message it reads, and
 those responses, is appended as a JSON line to the file FAKE_MCP_LOG
 names, if set. FAKE_MCP_VERSION sets the protocol version it answers.
+FAKE_MCP_EXTRA, a JSON list of tool definitions, adds them to its own.
 
 With --http it serves Streamable HTTP instead, on 127.0.0.1 at a port
 it picks and prints as its first line: a POST for each message, JSON
@@ -86,6 +87,9 @@ HTTP_TOOLS = [
     {"name": "flaky", "description": "Fail once.", "inputSchema": {}},
 ]
 PAGE = 2
+# More tools, as a JSON list, for scenarios of odd names and descriptions
+if os.environ.get("FAKE_MCP_EXTRA"):
+    TOOLS = TOOLS + json.loads(os.environ["FAKE_MCP_EXTRA"])
 
 
 def log(obj):
@@ -212,7 +216,8 @@ def main():
 
 SESSIONS = set()
 FLAKED = set()
-OAUTH = {"clients": {}, "codes": {}, "access": set(), "refresh": set(), "n": 0}
+PINGS = {}  # a stream's ping id: set once the client answers it
+OAUTH ={"clients": {}, "codes": {}, "access": set(), "refresh": set(), "n": 0}
 # A client registered beforehand, as FAKE_MCP_CLIENT's JSON object:
 # client_id, redirect_uris, and any client_secret the token requests
 # must then carry.
@@ -388,6 +393,11 @@ def serve_http():
                 return
             msg = json.loads(self.rfile.read(n))
             log({**msg, "_http": self.heads()})
+            if "result" in msg:
+                with LOCK:
+                    answered = PINGS.get(msg.get("id"))
+                if answered:
+                    answered.set()
             if not self.authorized():
                 return
             method, rid = msg.get("method"), msg.get("id")
@@ -452,7 +462,13 @@ def serve_http():
                     r = call(rid, name, params.get("arguments") or {})
                 except KeyError:
                     r = None
-            # A stream: a notification, a ping, then the result
+            # A stream: a notification, a ping, then the result once the
+            # ping is answered, so the answer can't lose a race with the
+            # client quitting after the result
+            pid = f"ping-{rid}"
+            answered = threading.Event()
+            with LOCK:
+                PINGS[pid] = answered
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -460,7 +476,7 @@ def serve_http():
             self.end_headers()
             events = [{"jsonrpc": "2.0", "method": "notifications/progress",
                        "params": {"progressToken": 1, "progress": 1}},
-                      {"jsonrpc": "2.0", "id": f"ping-{rid}", "method": "ping"}]
+                      {"jsonrpc": "2.0", "id": pid, "method": "ping"}]
             if r is not None:
                 events.append({"jsonrpc": "2.0", "id": rid, "result": r})
             elif name != "slow":  # a slow call is None when cancelled
@@ -468,6 +484,8 @@ def serve_http():
                     "code": -32000, "message": "no, thanks"}})
             try:
                 for ev in events:
+                    if ev.get("id") == rid:
+                        answered.wait(5)  # if never, the scenario counts it missing
                     self.wfile.write(b"event: message\ndata: " + json.dumps(ev).encode() +
                                      b"\n\n")
                     self.wfile.flush()

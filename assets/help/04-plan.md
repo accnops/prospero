@@ -2,8 +2,8 @@
 
 In Plan mode the agent explores and writes a plan before it changes
 anything, and you approve it first. Turn it on with the New session
-dialog's Plan mode box, with Plan in the mode list above the
-transcript, or with
+dialog's Plan mode box, with Plan in the mode list on the Prompt's
+status line, or with
 `/plan` (`/plan off` turns it off). The agent may also ask to plan
 first: Plan first agrees, and Go ahead without lets it work as before.
 In Bypass mode it cannot: the agent is told to go on instead, so it
@@ -17,14 +17,17 @@ told of the change at its next step. Subagents running then follow.
 ## While planning
 
 - The file tools may write only the session's plan file, `plan.md` in
-  the session's folder in the state directory, which they do without
-  asking.
+  the session's folder in the state directory, and scratch files in
+  the session's own temporary folder (notes, test inputs), both
+  without asking. Your project's files and the system's shared
+  temporary folders stay unchanged.
 - The agent is told to run only commands that change nothing.
 - The desktop tool may only look.
 - Subagents plan too.
 
-The session bar shows an amber Plan mode button, which opens the Plan
-pane.
+The mode list shows Plan in amber, and lists Show the plan, which opens
+the Plan pane. A subagent's mode is its parent's: its Prompt shows an
+amber Plan mode button instead, which opens the Plan pane.
 
 ## Approving
 
@@ -41,7 +44,7 @@ shows it:
   this computer.
 
 A plan approval has no countdown: it waits for you. The model may be
-switched from the session bar while it waits.
+switched from the Prompt's status line while it waits.
 
 ## Questions from the agent
 
@@ -64,9 +67,10 @@ it with your answers. To skip the questions in favor of a message,
 write it in the note and click **Skip**. A notification tells of the questions while you look elsewhere (`[ui]
 notify`). In Plan mode they wait for you with no countdown, as you
 mean to review a plan soon. Otherwise they are skipped after `[guard]
-question_timeout` (300 seconds), with the agent going with its
-recommendations, and the countdown starts over whenever you pick an
-option or type in the card. While they wait, the model, the shell and
+question_timeout` (300 seconds, or no limit at 0), with the agent
+going with its recommendations, and the countdown starts over whenever
+you pick an option or type in the card. **Keep waiting**, at the card's
+top right, drops the countdown for those questions. While they wait, the model, the shell and
 the mode may change, and Bypass mode leaves them for you. Only the
 sessions you start yourself get questions: never subagents, roles, or
 runs from the command line, where the agent decides for itself and

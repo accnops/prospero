@@ -276,6 +276,45 @@ static void testholder(ProcTest *p, Arena scratch)
     report(os, scratch, "background child: returned after", millis(dt), 0, " ms");
 }
 
+// POSIX: a tool's reaper outlives it until let go, then ends, and what
+// the tool left running goes on (deployrun's conmon). Nothing is
+// signaled here; the sleep left behind ends by itself.
+static void testletgo(ProcTest *p, Arena scratch)
+{
+    Selftest *t  = p->t;
+    Os       *os = p->os;
+    if (HOST_WINDOWS) {
+        return;  // the job closes with os_procfree
+    }
+    Str   out = join(&scratch, p->dir, "letgo.log");
+    Proc *pr  = spawnsh(p, scratch, "sleep 10 </dev/null >/dev/null 2>&1 & echo $! $PPID",
+                        out, 1<<10);
+    if (!check(t, pr!=0, "os_spawn leaving a child running")) return;
+    ProcWatch w = {};
+    check(t, procwatch(os, p->mb, p->id, &w, 5000), "the shell exits, its output closed");
+    Cut line   = cut(os_read(os, &scratch, out, 1<<10).data, '\n');
+    Cut pids   = cut(line.head, ' ');
+    Int child  = parseint(pids.head);
+    Int reaper = parseint(pids.tail);
+    if (!check(t, line.ok && child.ok && reaper.ok && child.val>1 && reaper.val>1,
+               "the shell tells its child's pid and its reaper's")) {
+        os_kill(os, pr, 1);
+        os_procfree(os, pr);
+        return;
+    }
+    check(t, os_pidalive(os, (i32)reaper.val), "the reaper outlives its tool");
+    os_letgo(os, pr);
+    b32 gone = 0;
+    for (i64 deadline = os_ticks(os)+2000000; !gone && os_ticks(os)<deadline;) {
+        gone = !os_pidalive(os, (i32)reaper.val);
+        mailwait(p->mb, 10);
+        mailtake(p->mb);  // else the wait returns at once
+    }
+    check(t, gone, "os_letgo ends the reaper");
+    check(t, os_pidalive(os, (i32)child.val), "what the tool left runs on");
+    os_procfree(os, pr);
+}
+
 static void testladder(ProcTest *p, Arena scratch)
 {
     Selftest *t  = p->t;
@@ -742,6 +781,562 @@ static void testtrees(ProcTest *p, Arena scratch)
     say(os, "trees done");
 }
 
+// Terminals (os_ptyspawn): records as procwatch, with
+// the ring drained as it fills, at most take bytes every 5 ms when take
+// is set, as a slow consumer. Stops early once keep holds until.
+struct PtyWatch {
+    i32 code;
+    i32 signal;
+    i64 total;    // PROC_EOF's count
+    i64 exitat;
+    i64 eofat;
+    i32 readies;  // PROC_READY records
+    i64 got;      // bytes taken from the ring, and their hash in order
+    u64 hash;
+    iz  most;     // the longest peek
+    iz  take;
+    Buf keep;     // output, as long as it fits
+};
+
+static b32 ptywatch(Os *os, Mailbox *mb, Proc *pr, u64 id, PtyWatch *w, i32 ms, Str until)
+{
+    i64 deadline = os_ticks(os) + (i64)ms*1000;
+    b32 more     = 1;  // the ring may hold output
+    for (;;) {
+        if (until.len && find({w->keep.data, w->keep.len}, until)>=0) {
+            return 1;
+        } else if (!until.len && w->exitat && w->eofat && !more) {
+            return 1;
+        }
+        i64 left = deadline - os_ticks(os);
+        if (left <= 0) {
+            return 0;
+        }
+        mailwait(mb, more ? 5 : (i32)(left/1000 + 1));
+        Mail m = mailtake(mb);
+        for (Record r; (r = mailnext(&m)).ok;) {
+            if (r.id != id) continue;
+            i64 now = os_ticks(os);
+            switch (r.type) {
+            case PROC_READY: w->readies++;
+                             more = 1;                                       break;
+            case PROC_EXIT:  w->exitat = now;
+                             w->code   = get32(r.data);
+                             w->signal = get32(cuthead(r.data, 4));          break;
+            case PROC_EOF:   w->eofat = now;
+                             w->total = get64(r.data);
+                             more     = 1;                                   break;
+            }
+        }
+        iz budget = w->take ? w->take : (iz)((uz)-1 >> 1);
+        for (;;) {
+            Str s = os_ptypeek(os, pr, 0);
+            if (!s.len) {
+                more = 0;
+                break;
+            } else if (!budget) {
+                break;
+            }
+            s = s.len<budget ? s : takehead(s, budget);
+            budget -= s.len;
+            w->most = s.len>w->most ? s.len : w->most;
+            w->got += s.len;
+            w->hash = hashmore(w->hash, s);
+            if (w->keep.a && w->keep.len+s.len<=w->keep.cap) {
+                print(&w->keep, s);
+            }
+            os_ptytake(os, pr, s.len);
+        }
+    }
+}
+
+static Proc *ptysh(ProcTest *p, Arena scratch, Str command, PtySize z, iz ring)
+{
+    ShellCmd sc = shellcmd(&scratch, &p->te.shell, p->te.windows, command);
+    Spawn    sp = {};
+    sp.argv     = sc.argv;
+    sp.cmdline  = sc.cmdline;
+    sp.cwd      = p->dir;
+    sp.env      = p->env;
+    sp.mbox     = p->mb;
+    sp.id       = ++p->id;
+    return os_ptyspawn(p->os, &sp, z, ring, scratch);
+}
+
+// The first two numbers in s after a marker, as "N M"
+static Int ptynum(Str s, Str marker, i32 which)
+{
+    iz at = find(s, marker);
+    if (at < 0) {
+        return {};
+    }
+    Cut c = cut(trimleft(cuthead(s, at+marker.len)), ' ');
+    c = which ? cut(c.tail, '\r') : c;
+    return parseint(trim(which ? cut(c.head, '\n').head : c.head));
+}
+
+// ConPTY renders what its client writes anew, as escapes over a screen,
+// so output compares as text: s without escape sequences or CR.
+static Str vtplain(Arena *a, Str s)
+{
+    Buf b(a, s.len);
+    for (iz i = 0; i < s.len;) {
+        u8 c = s[i++];
+        if (c == '\r') {
+            continue;
+        } else if (c != 0x1b) {
+            print(&b, Str{&c, 1});
+        } else if (i<s.len && s[i]=='[') {  // CSI: to its final byte
+            for (i++; i<s.len && (s[i]<0x40 || s[i]>0x7e); i++) {}
+            i += i < s.len;
+        } else if (i<s.len && s[i]==']') {  // OSC: to BEL or ST
+            for (i++; i<s.len && s[i]!=7 && s[i]!=0x1b; i++) {}
+            i += i<s.len && s[i]==7;
+            i += 2*(i<s.len && s[i]==0x1b);
+        } else {
+            i += i < s.len;
+        }
+    }
+    return finish(&b);
+}
+
+// A copy of this program in dir that runs as a console program, which
+// ConPTY attaches, as a GUI program it never does: the same image with
+// its PE header's subsystem changed from GUI (2) to console (3).
+static Str consolecopy(Os *os, Arena *perm, Str dir)
+{
+    Str   path    = join(perm, dir, "probe.exe");
+    Arena scratch = *perm;  // after the result, so as not to overlap it
+    Str   exe     = os_exepath(os, &scratch);
+    Str   img     = os_read(os, &scratch, exe, (iz)1<<30).data;
+    u32   pe      = img.len>=64 ? (u32)get32(cuthead(img, 0x3c)) : 0;
+    iz    at      = (iz)pe + 24 + 68;  // the optional header's Subsystem
+    if (!pe || pe>(u32)img.len || at+2>img.len || img[pe]!='P' || img[pe+1]!='E' || img[pe+2] || img[pe+3]) {
+        return {};
+    } else if (img[at]==2 && !img[at+1]) {
+        img.data[at] = 3;
+    }
+    return os_write(os, scratch, path, img) ? path : Str{};
+}
+
+static Proc *ptyprobe(ProcTest *p, Arena scratch, Str probe, PtySize z, iz ring)
+{
+    Slice<Str> argv = {};
+    argv = push(&scratch, argv, probe);
+    argv = push(&scratch, argv, Str("--tty-probe"));
+    Spawn sp = {};
+    sp.argv  = argv;
+    sp.cwd   = p->dir;
+    sp.env   = p->env;
+    sp.mbox  = p->mb;
+    sp.id    = ++p->id;
+    return os_ptyspawn(p->os, &sp, z, ring, scratch);
+}
+
+// Whether the text of w's output so far has until, waiting for it.
+static b32 ptysees(ProcTest *p, Proc *pr, PtyWatch *w, Arena scratch, Str until, i32 ms)
+{
+    i64 deadline = os_ticks(p->os) + (i64)ms*1000;
+    for (;;) {
+        Str raw = {w->keep.data, w->keep.len};
+        if (find(raw, until) >= 0) {
+            return 1;
+        } else if (raw.len<=256<<10 && find(vtplain(&scratch, raw), until)>=0) {
+            return 1;
+        } else if (os_ticks(p->os) >= deadline) {
+            return 0;
+        }
+        ptywatch(p->os, p->mb, pr, p->id, w, 20, "\x01");  // never found
+    }
+}
+
+// Terminals on Windows, through ConPTY and --tty-probe, which reads key
+// events and so sees a resize, and stands in for a shell's jobs.
+static void testconpty(ProcTest *p, Arena scratch)
+{
+    Selftest *t  = p->t;
+    Os       *os = p->os;
+    if (!os_ptyable(os)) {
+        say(os, "terminals skipped: no ConPTY before Windows 10 1809");
+        Proc *pr = ptysh(p, scratch, "exit 0", {80, 24, 0, 0}, 1<<16);
+        check(t, !pr, "os_ptyspawn refuses without ConPTY");
+        return;
+    }
+    PtySize z     = {80, 24, 640, 384};
+    iz      kb    = 1<<10;
+    Str     probe = consolecopy(os, &scratch, p->dir);
+    if (!check(t, probe.len>0, "a console copy of this program, for --tty-probe")) {
+        return;
+    }
+
+    // Its size, input, output, and exit status, all intact at the end
+    Proc *pr = ptyprobe(p, scratch, probe, z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn of the probe")) {
+        say(os, os_lasterr(os, &scratch));
+        return;
+    }
+    PtyWatch w = {};
+    w.keep = Buf(&scratch, 64*kb);
+    check(t, ptysees(p, pr, &w, scratch, "probe ready\n", 5000), "the probe starts");
+    check(t, os_procwrite(os, pr, "size\r"), "os_procwrite types");
+    check(t, ptysees(p, pr, &w, scratch, "size 80x24 ", 5000), "the size given");
+    os_procwrite(os, pr, "echo done\rexit 3\r");
+    check(t, ptywatch(os, p->mb, pr, p->id, &w, 5000, {}), "it exits, and the terminal reads EOF");
+    Str got = vtplain(&scratch, {w.keep.data, w.keep.len});
+    check(t, find(got, "\ndone\n")>=0, "output written just before exit");
+    check(t, w.code==3 && !w.signal, "its exit status arrives");
+    check(t, w.total==w.got && w.readies>0, "PROC_EOF counts the bytes the ring held");
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+
+    // The shell's last output arrives every time
+    i32 lost = 0;
+    for (i32 i = 0; i < 10; i++) {
+        pr = ptysh(p, scratch, "echo 0123456789abcdef", z, 64*kb);
+        if (!pr) {
+            lost++;
+            continue;
+        }
+        PtyWatch x = {};
+        x.keep = Buf(&scratch, 4*kb);
+        b32 ok = ptywatch(os, p->mb, pr, p->id, &x, 5000, {});
+        lost += !ok || find(vtplain(&scratch, {x.keep.data, x.keep.len}), "0123456789abcdef")<0;
+        os_letgo(os, pr);
+        os_procfree(os, pr);
+    }
+    check(t, !lost, "the shell's last output arrives, 10 times in 10");
+
+    // cmd, interactive, found on the PATH (as C:/.../cmd.exe, which it
+    // must not read as "/c md.exe"), and typed into
+    {
+        Spawn sp = {};
+        sp.argv  = push(&scratch, sp.argv, Str("cmd.exe"));
+        sp.argv  = push(&scratch, sp.argv, Str("/d"));
+        sp.cwd   = p->dir;
+        sp.env   = p->env;
+        sp.mbox  = p->mb;
+        sp.id    = ++p->id;
+        pr = os_ptyspawn(os, &sp, z, 64*kb, scratch);
+        PtyWatch x = {};
+        x.keep = Buf(&scratch, 16*kb);
+        b32 ok = pr && ptysees(p, pr, &x, scratch, ">", 5000);
+        ok = ok && os_procwrite(os, pr, "echo from %OS%& exit 4\r");
+        ok = ok && ptywatch(os, p->mb, pr, p->id, &x, 5000, {});
+        got = vtplain(&scratch, {x.keep.data, x.keep.len});
+        check(t, ok && find(got, "\nfrom Windows_NT")>=0 && x.code==4, "cmd.exe at its prompt, typed into");
+        if (pr) {
+            os_letgo(os, pr);
+            os_procfree(os, pr);
+        }
+    }
+
+    // A resize reaches the console as an event, busy while a child of
+    // its own runs, idle at the probe's own read
+    pr = ptyprobe(p, scratch, probe, z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn of the probe again")) return;
+    w = {};
+    w.keep = Buf(&scratch, 64*kb);
+    b32 ready = ptysees(p, pr, &w, scratch, "probe ready\n", 5000);
+    PtySize big = {100, 30, 1000, 480};
+    check(t, ready && os_ptyresize(os, pr, big), "os_ptyresize");
+    check(t, ptysees(p, pr, &w, scratch, "winch 100x30\n", 5000), "the program sees the new size");
+    check(t, !os_ptybusy(os, pr), "not busy at the probe's first read");
+    // Windows takes what starts within 200 ms as part of the shell (a
+    // launcher's), which nothing typed at a prompt is
+    ptywatch(os, p->mb, pr, p->id, &w, 300, "\x01");
+    os_procwrite(os, pr, "busy 1500\r");
+    b32 busy = 0;
+    for (i64 end = os_ticks(os)+1200000; !busy && os_ticks(os)<end;) {
+        busy = os_ptybusy(os, pr);
+        ptywatch(os, p->mb, pr, p->id, &w, 10, "\x01");
+    }
+    check(t, busy, "os_ptybusy while a child runs");
+    check(t, ptysees(p, pr, &w, scratch, "busy done\n", 5000), "the child ends");
+    b32 idle = 0;
+    for (i64 end = os_ticks(os)+1000000; !idle && os_ticks(os)<end;) {
+        idle = !os_ptybusy(os, pr);
+        ptywatch(os, p->mb, pr, p->id, &w, 10, "\x01");
+    }
+    check(t, idle, "not busy at the probe's own read");
+
+    // A flood through a small ring, taken slowly: every line arrives
+    iz n = 1<<20;
+    os_procwrite(os, pr, "flood 1048576\r");
+    PtyWatch f = {};
+    f.take = 16*kb;
+    f.keep = Buf(&scratch, 4*n);
+    i64 t0 = os_ticks(os);
+    b32 end = ptysees(p, pr, &f, scratch, "flood end", 60000);
+    check(t, end, "the flood ends");
+    got = vtplain(&scratch, {f.keep.data, f.keep.len});
+    iz at = find(got, "abcdefghijklmnopqrstuvwxyzabcdef");
+    u8 *want = alloc<u8>(&scratch, n);
+    for (iz i = 0; i < n; i++) {
+        want[i] = (u8)(i%64==63 ? '\n' : 'a' + (i/64 + i%64)%26);
+    }
+    b32 same = at>=0 && got.len-at>=n && Str{got.data+at, n}==Str{want, n};
+    check(t, same, "every line arrives, in order");
+    report(os, scratch, "terminal flood taken slowly in", millis(os_ticks(os)-t0), 0, " ms");
+    os_procwrite(os, pr, "exit 0\r");
+    check(t, ptywatch(os, p->mb, pr, p->id, &f, 5000, {}) && f.code==0, "the probe exits");
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+
+    // Closing hangs up: CTRL_CLOSE_EVENT to the console's clients, while
+    // a detached child goes on
+    Str hup = join(&scratch, p->dir, "hup.log");
+    pr = ptyprobe(p, scratch, probe, z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn of a probe to hang up")) return;
+    w = {};
+    w.keep = Buf(&scratch, 64*kb);
+    os_procwrite(os, pr, concat(&scratch, concat(&scratch, "hup ", hup), "\rnohup 3\r"));
+    ready = ptysees(p, pr, &w, scratch, "hup set\n", 5000) &&
+            ptysees(p, pr, &w, scratch, "nohup ", 5000) &&
+            ptysees(p, pr, &w, scratch, "\n", 5000);
+    Int child = ptynum(vtplain(&scratch, {w.keep.data, w.keep.len}), "nohup ", 0);
+    if (!check(t, ready && child.ok && child.val>0, "the probe tells its child's pid")) {
+        os_kill(os, pr, 1);
+        os_procfree(os, pr);
+        return;
+    }
+    u64 hupid = p->id;
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+    i32 code  = -1;
+    b32 ended = 0;
+    for (i64 stop = os_ticks(os)+5000000; !ended && os_ticks(os)<stop;) {
+        mailwait(p->mb, 10);
+        Mail m = mailtake(p->mb);
+        for (Record r; (r = mailnext(&m)).ok;) {
+            if (r.id==hupid && r.type==PROC_EXIT) {
+                code  = get32(r.data);
+                ended = 1;
+            }
+        }
+    }
+    check(t, ended && code==129, "the probe hears the hang-up and exits");
+    check(t, trim(os_read(os, &scratch, hup, 1<<10).data)=="hup", "its handler ran");
+    check(t, os_pidalive(os, (i32)child.val), "a detached child goes on");
+    // It runs from probe.exe in the test's folder, which can't be removed
+    // while it lives: let it finish its nap.
+    for (i64 stop = os_ticks(os)+6000000;
+         os_pidalive(os, (i32)child.val) && os_ticks(os)<stop;) {
+        mailwait(p->mb, 50);
+    }
+    check(t, !os_pidalive(os, (i32)child.val), "the detached child ends its nap");
+
+    // A hard kill ends the job, its children with it
+    pr = ptyprobe(p, scratch, probe, z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn of a probe to kill")) return;
+    w = {};
+    w.keep = Buf(&scratch, 64*kb);
+    os_procwrite(os, pr, "nohup 30\r");
+    ready = ptysees(p, pr, &w, scratch, "nohup ", 5000) &&
+            ptysees(p, pr, &w, scratch, "\n", 5000);
+    child = ptynum(vtplain(&scratch, {w.keep.data, w.keep.len}), "nohup ", 0);
+    check(t, ready && child.ok && child.val>0, "the probe tells its child's pid");
+    os_kill(os, pr, 1);
+    check(t, ptywatch(os, p->mb, pr, p->id, &w, 5000, {}), "a hard kill ends it");
+    check(t, w.code == 1, "it was terminated");
+    b32 gone = 0;
+    for (i64 stop = os_ticks(os)+2000000; child.ok && !gone && os_ticks(os)<stop;) {
+        gone = !os_pidalive(os, (i32)child.val);
+        mailwait(p->mb, 10);
+        mailtake(p->mb);
+    }
+    check(t, gone, "its child is swept too");
+    os_procfree(os, pr);
+}
+
+static void testpty(ProcTest *p, Arena scratch)
+{
+    Selftest *t  = p->t;
+    Os       *os = p->os;
+    if (HOST_WINDOWS) {
+        testconpty(p, scratch);
+        return;
+    }
+    PtySize z  = {80, 24, 640, 384};
+    iz      kb = 1<<10;
+
+    // Its size, its output, its exit status, all intact at the end
+    Proc *pr = ptysh(p, scratch, "stty size; printf done; exit 3", z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn of the shell")) {
+        say(os, os_lasterr(os, &scratch));
+        return;
+    }
+    PtyWatch w = {};
+    w.keep = Buf(&scratch, 4*kb);
+    check(t, ptywatch(os, p->mb, pr, p->id, &w, 5000, {}), "it exits, and the terminal reads EOF");
+    Str got = {w.keep.data, w.keep.len};
+    check(t, got=="24 80\r\ndone", "the size given, and output written just before exit");
+    check(t, w.code==3 && !w.signal, "its exit status arrives");
+    check(t, w.total==w.got && w.readies>0, "PROC_EOF counts the bytes the ring held");
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+
+    // Output written just before the last close of the terminal arrives
+    // every time (macOS may drop it)
+    i32 lost = 0;
+    for (i32 i = 0; i < 20; i++) {
+        pr = ptysh(p, scratch, "printf 0123456789abcdef", z, 64*kb);
+        if (!pr) {
+            lost++;
+            continue;
+        }
+        PtyWatch x = {};
+        x.keep = Buf(&scratch, kb);
+        b32 ok = ptywatch(os, p->mb, pr, p->id, &x, 5000, {});
+        lost += !ok || Str{x.keep.data, x.keep.len}!="0123456789abcdef";
+        os_letgo(os, pr);
+        os_procfree(os, pr);
+    }
+    check(t, !lost, "the last output arrives intact, 20 times in 20");
+
+    // A resize tells the foreground (SIGWINCH), and input reaches it
+    pr = ptysh(p, scratch,
+               "trap 'stty size; exit 0' WINCH; echo ready; "
+               "while :; do sleep 0.05; done", z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn waiting for SIGWINCH")) return;
+    w = {};
+    w.keep = Buf(&scratch, 4*kb);
+    b32 ready = ptywatch(os, p->mb, pr, p->id, &w, 5000, "ready\r\n");
+    PtySize big = {100, 30, 1000, 480};
+    check(t, ready && os_ptyresize(os, pr, big), "os_ptyresize");
+    check(t, ptywatch(os, p->mb, pr, p->id, &w, 5000, {}), "SIGWINCH ends it");
+    got = {w.keep.data, w.keep.len};
+    check(t, find(got, "30 100\r\n")>=0 && w.code==0, "the program sees the new size");
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+
+    // Busy while a job of its own has the foreground, idle reading input
+    pr = ptysh(p, scratch,
+               "set -m; echo ready; sleep 1; echo back; read x; echo \"[$x]\"",
+               z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn with job control")) return;
+    w = {};
+    w.keep = Buf(&scratch, 4*kb);
+    ready = ptywatch(os, p->mb, pr, p->id, &w, 5000, "ready\r\n");
+    b32 busy = 0;
+    for (i64 end = os_ticks(os)+800000; ready && !busy && os_ticks(os)<end;) {
+        busy = os_ptybusy(os, pr);
+        mailwait(p->mb, 10);
+    }
+    check(t, busy, "os_ptybusy while a job runs");
+    ready = ptywatch(os, p->mb, pr, p->id, &w, 5000, "back\r\n");
+    b32 idle = 0;
+    for (i64 end = os_ticks(os)+1000000; ready && !idle && os_ticks(os)<end;) {
+        idle = !os_ptybusy(os, pr);
+        mailwait(p->mb, 10);
+    }
+    check(t, idle, "not busy at the shell's own read");
+    check(t, os_procwrite(os, pr, "typed\r"), "os_procwrite types");
+    check(t, ptywatch(os, p->mb, pr, p->id, &w, 5000, {}), "the shell reads it and exits");
+    got = {w.keep.data, w.keep.len};
+    check(t, find(got, "typed\r\n[typed]\r\n")>=0, "input echoes, and arrives");
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+
+    // A flood through a small ring, taken slowly: the reader stops while
+    // the ring is full, the child with it, and every byte arrives
+    i32 lines = 100000;
+    u64 want  = 0;
+    i64 bytes = 0;
+    for (i32 i = 0; i < lines; i++) {
+        u8  num[16];
+        Buf b = {};
+        b.data = num;
+        b.cap  = countof(num);
+        print(&b, (i64)i);
+        print(&b, "\n");
+        want   = hashmore(want, {b.data, b.len});
+        bytes += b.len;
+    }
+    Buf cmd(&scratch, 256);
+    print(&cmd, "stty -opost; i=0; awk 'BEGIN { for (i = 0; i < ");
+    print(&cmd, (i64)lines);
+    print(&cmd, "; i++) print i }'");
+    pr = ptysh(p, scratch, finish(&cmd), z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn of a flood")) return;
+    w = {};
+    w.take = 16*kb;
+    i64 t0 = os_ticks(os);
+    check(t, ptywatch(os, p->mb, pr, p->id, &w, 60000, {}), "the flood ends");
+    check(t, w.got==bytes && w.hash==want, "every byte arrives, in order");
+    check(t, w.code == 0, "the flood exits cleanly");
+    report(os, scratch, "terminal flood taken slowly in", millis(os_ticks(os)-t0), 0, " ms");
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+
+    // Closing hangs up: SIGHUP to the shell, which a trap sees, while
+    // what ignores it (nohup) goes on, and the reaper, let go, ends
+    Str hup = join(&scratch, p->dir, "hup.log");
+    Buf hc(&scratch, 512);
+    print(&hc, "trap 'echo hup >\"");
+    print(&hc, hup);
+    print(&hc, "\"; exit 7' HUP; nohup sleep 5 >/dev/null 2>&1 & "
+               "echo ready $! $PPID; while :; do sleep 0.05; done");
+    pr = ptysh(p, scratch, finish(&hc), z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn trapping SIGHUP")) return;
+    w = {};
+    w.keep = Buf(&scratch, 4*kb);
+    ready = ptywatch(os, p->mb, pr, p->id, &w, 5000, "\r\n");
+    got = {w.keep.data, w.keep.len};
+    Int child  = ptynum(got, "ready ", 0);
+    Int reaper = ptynum(got, "ready ", 1);
+    if (!check(t, ready && child.ok && reaper.ok && child.val>1 && reaper.val>1,
+               "the shell tells its child's pid and its reaper's")) {
+        os_kill(os, pr, 1);
+        os_procfree(os, pr);
+        return;
+    }
+    u64 hupid = p->id;
+    os_letgo(os, pr);
+    os_procfree(os, pr);
+    PtyWatch h = {};
+    b32 ended = 0;
+    for (i64 end = os_ticks(os)+5000000; !ended && os_ticks(os)<end;) {
+        mailwait(p->mb, 10);
+        Mail m = mailtake(p->mb);
+        for (Record r; (r = mailnext(&m)).ok;) {
+            if (r.id==hupid && r.type==PROC_EXIT) {
+                h.code = get32(r.data);
+                ended  = 1;
+            }
+        }
+    }
+    check(t, ended && h.code==7, "the shell traps SIGHUP and exits");
+    check(t, trim(os_read(os, &scratch, hup, 1<<10).data)=="hup", "its trap ran");
+    b32 gone = 0;
+    for (i64 end = os_ticks(os)+2000000; !gone && os_ticks(os)<end;) {
+        gone = !os_pidalive(os, (i32)reaper.val);
+        mailwait(p->mb, 10);
+        mailtake(p->mb);
+    }
+    check(t, gone, "its reaper, let go, ends");
+    check(t, os_pidalive(os, (i32)child.val), "what nohup started goes on");
+
+    // A hard kill sweeps the shell's session, its jobs with it
+    pr = ptysh(p, scratch, "sleep 30 & echo ready $!; wait", z, 64*kb);
+    if (!check(t, pr!=0, "os_ptyspawn with a job")) return;
+    w = {};
+    w.keep = Buf(&scratch, 4*kb);
+    ready = ptywatch(os, p->mb, pr, p->id, &w, 5000, "\r\n");
+    child = ptynum({w.keep.data, w.keep.len}, "ready ", 0);
+    check(t, ready && child.ok && child.val>1, "the shell tells its job's pid");
+    os_kill(os, pr, 1);
+    check(t, ptywatch(os, p->mb, pr, p->id, &w, 5000, {}), "a hard kill ends it");
+    check(t, w.signal==9 || w.code==-1, "it died of KILL");
+    gone = 0;
+    for (i64 end = os_ticks(os)+2000000; child.ok && !gone && os_ticks(os)<end;) {
+        gone = !os_pidalive(os, (i32)child.val);
+        mailwait(p->mb, 10);
+        mailtake(p->mb);
+    }
+    check(t, gone, "its job is swept too");
+    os_procfree(os, pr);
+}
+
 static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
 {
     Os       *os = t->os;
@@ -769,6 +1364,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testspawn(p, scratch);
     testbulk(p, scratch);
     testholder(p, scratch);
+    testletgo(p, scratch);
     testlaunch(p, scratch);
     testladder(p, scratch);
     testoverhead(p, scratch);
@@ -776,6 +1372,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testspawnio(p, scratch);
     testrealpaths(p, scratch);
     testtrees(p, scratch);
+    testpty(p, scratch);
 }
 
 

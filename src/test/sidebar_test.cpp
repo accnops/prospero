@@ -32,6 +32,9 @@ static Str siderows(Arena *a, SideIn *in, Slice<SideRow> rows)
         case SROW_TRASH:
             print(&b, "T");
             break;
+        case SROW_DONE:
+            print(&b, "D");
+            break;
         }
         if (r->kind != SROW_SESSION) {
             putbyte(&b, ' ');
@@ -100,6 +103,43 @@ static void test_sidebar(Test *t)
     expect(t, "sidebar.selfactive", siderows(&a, &in, sidetree(&a, &in)),
            "S s3\nS s2+\nS s1\n");
     in.sess[3].active = 0;
+
+    // Three or more finished subagents fold into a row of their own,
+    // folded unless opened, after those at work, asking or in view; a
+    // finished one's own subagents go with it
+    {
+        SideIn d = {};
+        d.hosts = push(&a, d.hosts, SideHost{"this", 1, 0});
+        d.sess  = push(&a, d.sess, sidesess(0, "k5", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k4", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k3x", "k3", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k3", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k2", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k1", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "p", {}, {}, 0));
+        d.sess[1].active = 1;  // k4
+        d.sess[4].active = 1;  // k2
+        d.sess[5].asks   = 1;  // k1
+        expect(t, "sidebar.donefew", siderows(&a, &d, sidetree(&a, &d)),
+               "S p!\n S k1\n S k2\n S k3\n  S k3x\n S k4\n S k5\n");
+        d.sess[1].active = 0;
+        d.sess[4].active = 0;
+        Slice<SideRow> rows = sidetree(&a, &d);
+        expect(t, "sidebar.done", siderows(&a, &d, rows), "S p!\n S k1\n D 5+\n");
+        expect(t, "sidebar.donekey", rows[2].key, "d:this:p");
+        d.sess[4].shown = 1;  // k2, in view, stays out
+        expect(t, "sidebar.doneshown", siderows(&a, &d, sidetree(&a, &d)),
+               "S p!\n S k1\n S k2\n D 4+\n");
+        d.sess[4].shown = 0;
+        d.sess[2].active = 1;  // k3x keeps k3 out
+        expect(t, "sidebar.donedeep", siderows(&a, &d, sidetree(&a, &d)),
+               "S p!\n S k1\n S k3!\n  S k3x\n D 3+\n");
+        d.sess[2].active = 0;
+        d.sess[5].asks   = 0;
+        *upsert(&d.folds, "d:this:p", &a) = 0;
+        expect(t, "sidebar.doneopen", siderows(&a, &d, sidetree(&a, &d)),
+               "S p\n D 6\n  S k1\n  S k2\n  S k3\n   S k3x\n  S k4\n  S k5\n");
+    }
 
     // Two hosts: headings, every host listed always even if empty, a
     // group merged across hosts, its subagents following their root,
@@ -331,6 +371,70 @@ static void test_sidebar(Test *t)
     *upsert(&ctr.folds, "h:ctr", &a) = 1;
     expect(t, "sidebar.underfolded", siderows(&a, &ctr, sidetree(&a, &ctr)),
            "H this 1\n S s1\nH ctr 1+\n");
+
+    // By activity (byat): roots by the latest time in their subtrees,
+    // subagents still oldest first under them; ties as given
+    {
+        SideIn r = {};
+        r.hosts = push(&a, r.hosts, SideHost{"this", 1, 0});
+        r.sess  = push(&a, r.sess, sidesess(0, "s3", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "s2b", "s2", {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "s2a", "s2", {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "s2", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "s1", {}, {}, 0));
+        r.byat  = 1;
+        expect(t, "sidebar.attie", siderows(&a, &r, sidetree(&a, &r)),
+               "S s3\nS s2\n S s2a\n S s2b\nS s1\n");
+        i64 at[] = {30, 5, 50, 10, 40};
+        for (iz i = 0; i < countof(at); i++) {
+            r.sess[i].at = at[i];
+        }
+        expect(t, "sidebar.at", siderows(&a, &r, sidetree(&a, &r)),
+               "S s2\n S s2a\n S s2b\nS s1\nS s3\n");
+        r.byat = 0;
+        expect(t, "sidebar.atoff", siderows(&a, &r, sidetree(&a, &r)),
+               "S s3\nS s2\n S s2a\n S s2b\nS s1\n");
+    }
+
+    // A subagent on another host, under a parent here, is on another
+    // clock: its time is not its parent's
+    {
+        SideIn r = {};
+        r.hosts = push(&a, r.hosts, SideHost{"this", 1, 0});
+        r.hosts = push(&a, r.hosts, SideHost{"remote:vm", 1, 0});
+        r.sess  = push(&a, r.sess, sidesess(0, "q", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "p", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(1, "k", "p", {}, 0));
+        r.sess[0].at    = 20;
+        r.sess[1].at    = 10;
+        r.sess[2].at    = 99;
+        r.sess[2].phost = 1;
+        r.byat = 1;
+        expect(t, "sidebar.atremote", siderows(&a, &r, sidetree(&a, &r)),
+               "S q\nS p\n S k@\n");
+    }
+
+    // Each section by activity: a group's sessions, the rest, Archived;
+    // the groups the roots name keep the order they are named in
+    {
+        SideIn r = {};
+        r.hosts = push(&a, r.hosts, SideHost{"this", 1, 0});
+        r.sess  = push(&a, r.sess, sidesess(0, "g2", {}, "B", 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "g1", {}, "A", 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "b2", {}, "B", 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "n2", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "n1", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "x2", {}, {}, 1));
+        r.sess  = push(&a, r.sess, sidesess(0, "x1", {}, {}, 1));
+        i64 at[] = {1, 9, 2, 3, 4, 5, 6};
+        for (iz i = 0; i < countof(at); i++) {
+            r.sess[i].at = at[i];
+        }
+        *upsert(&r.folds, "a", &a) = 0;
+        r.byat = 1;
+        expect(t, "sidebar.atsections", siderows(&a, &r, sidetree(&a, &r)),
+               "G B 2\n S b2\n S g2\nG A 1\n S g1\nS n1\nS n2\nA 2\n S x1\n S x2\n");
+    }
 }
 
 // An export as Markdown: the title and what the session is, messages

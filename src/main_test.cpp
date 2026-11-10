@@ -83,8 +83,11 @@ static void os_arenafault(Str msg)
 }
 
 // Reservations come from the C heap, with commits only bookkeeping.
+static i64 g_reserves;  // os_reserve calls, for tests that count them
+
 static Region *os_reserve(Os *, iz cap)
 {
+    g_reserves++;
     byte *p = (byte *)malloc((uz)cap);
     if (!p) {
         return 0;
@@ -231,8 +234,17 @@ static Listing os_listall(Os *os, Arena *a, Str path, b32 dirs, iz max)
     return r;
 }
 
-static Stat os_stat(Os *os, Arena, Str path)
+// Like the platforms' (cstr, widepath), it first writes
+// the path out in scratch, wide as on Windows, so that a path in the
+// scratch's own free space, from a copy of an arena taken before the
+// path went in it, comes out mangled, as it would there.
+static Stat os_stat(Os *os, Arena scratch, Str path)
 {
+    u8 *wide = alloc<u8>(&scratch, 2*path.len+2);
+    for (iz i = 0; i < path.len; i++) {
+        wide[2*i+0] = path[i];
+        wide[2*i+1] = 0;
+    }
     Stat   s = {};
     VFile *f = vfind(os, path, 0);
     if (f && f->exists) {
@@ -477,13 +489,21 @@ static b32 os_lockheld(Os *os, Arena, Str path)
 // No processes or standard input: the engine is tested end to end by
 // tests/scenarios.py against the real platforms.
 static Slice<Str> os_environ(Os *, Arena *) { return {}; }
+static Slice<Str> os_launchenv(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
 static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
 static b32 os_launch(Os *, Arena, Slice<Str>, Str, Slice<Str>) { return 0; }
 static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
+static void  os_letgo(Os *, Proc *) {}
 static void  os_procfree(Os *, Proc *) {}
+static Proc *os_ptyspawn(Os *, Spawn *, PtySize, iz, Arena) { return 0; }
+static Str   os_ptypeek(Os *, Proc *, iz) { return {}; }
+static void  os_ptytake(Os *, Proc *, iz) {}
+static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
+static b32   os_ptybusy(Os *, Proc *) { return 0; }
+static b32   os_ptyable(Os *) { return 0; }
 static void  os_httpcancel(Os *, Http *) {}
 static void  os_httpfree(Os *, Http *) {}
 static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
@@ -614,6 +634,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/frame_test.cpp"
 #include "test/provider_test.cpp"
 #include "test/anthropic_test.cpp"
+#include "test/responses_test.cpp"  // after anthropic_test.cpp: anblocks
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
@@ -636,8 +657,13 @@ static Str istr(Arena *a, i64 v)
 #include "test/desktop_test.cpp"
 #include "test/image_test.cpp"  // after deskhelp.cpp: dkpng
 #include "test/zip_test.cpp"
+#include "test/pdf_test.cpp"
+#include "test/pdfenc_test.cpp"
+#include "test/pdfimage_test.cpp"  // after image_test.cpp: fxbaseline, imgdiff
+#include "test/pdftext_test.cpp"   // after pdf_test.cpp: pdfbuild
 #include "test/delta_test.cpp"
 #include "test/relay_test.cpp"  // after config's test platform
+#include "test/term_test.cpp"
 #include "dbus.cpp"
 #include "test/dbus_test.cpp"
 #include "test/door_test.cpp"
@@ -651,9 +677,12 @@ static Str istr(Arena *a, i64 v)
 #  include "fonts.cpp"
 #  include "place.cpp"
 #  include "compose.cpp"
+#  include "filewalk.cpp"
 #  include "pathpick.cpp"
 #  include "sidebar.cpp"
 #  include "dock.cpp"
+#  include "termset.cpp"
+#  include "palette.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
 #  include "test/doc_test.cpp"
@@ -665,9 +694,12 @@ static Str istr(Arena *a, i64 v)
 #  include "test/help_test.cpp"
 #  include "test/place_test.cpp"
 #  include "test/compose_test.cpp"
+#  include "test/filewalk_test.cpp"
 #  include "test/pathpick_test.cpp"
 #  include "test/sidebar_test.cpp"
 #  include "test/dock_test.cpp"
+#  include "test/termset_test.cpp"
+#  include "test/palette_test.cpp"
 #endif
 
 int main()
@@ -693,6 +725,7 @@ int main()
     test_remotehello(&t);
     test_provider(&t);
     test_anthropic(&t);
+    test_responses(&t);
     test_edit(&t);
     test_tools(&t);
     test_guard(&t);
@@ -717,8 +750,21 @@ int main()
     test_desktop(&t);
     test_image(&t);
     test_zip(&t);
+    test_pdf(&t);
+    test_pdfreader(&t);
+    test_pdffilters(&t);
+    test_pdfdocument(&t);
+    test_pdfenc(&t);
+    test_pdfimage(&t);
+    test_pdftext(&t);
+    test_pdftextsweep(&t);
+    test_pdflayout(&t);
+    test_pdfbudget(&t);
+    test_pdfshow(&t);
+    test_pdfshowbig(&t);
     test_delta(&t);
     test_relay(&t);
+    test_term(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI
@@ -729,6 +775,7 @@ int main()
     test_view(&t);
     test_viewpanels(&t);
     test_viewcuts(&t);
+    test_viewwork(&t);
     test_viewthinking(&t);
     test_viewwords(&t);
     test_viewtranscript(&t);
@@ -739,9 +786,12 @@ int main()
     test_place(&t);
     test_firstgeom(&t);
     test_compose(&t);
+    test_filewalk(&t);
     test_pathpick(&t);
     test_sidebar(&t);
     test_dock(&t);
+    test_termset(&t);
+    test_palette(&t);
     test_viewexport(&t);
     #endif
 

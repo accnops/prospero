@@ -358,7 +358,8 @@ static void testlogimport(Test *t)
         "\"snap\":\"snap/1\"}\n"
         "{\"sid\":\"A\",\"seq\":9,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
         "\"spill\":\"../../x\",\"bytes\":3,\"image\":\"../../x\",\"width\":1,\"height\":1,"
-        "\"shot\":\"s\",\"child\":\"K\",\"job\":2,\"to\":\"K2\",\"to_title\":\"T\","
+        "\"shot\":\"s\",\"images\":[{\"name\":\"../x\",\"mime\":\"image/png\"}],"
+        "\"pdf\":\"../y\",\"pages\":2,\"child\":\"K\",\"job\":2,\"to\":\"K2\",\"to_title\":\"T\","
         "\"ms\":4}\n"
         "{\"sid\":\"B\",\"seq\":10,\"ts\":8,\"ev\":\"user\",\"text\":\"other\"}\n"
         "{\"sid\":\"A\",\"seq\":11,\"ts\":8,\"ev\":\"rewind\",\"undone\":[\"snap/1\"]}\n"
@@ -667,16 +668,18 @@ static void test_events(Test *t)
                "\"import\",\"skills\",\"mode\",\"unqueue\",\"dir\",\"background\",\"models\","
                "\"mcp\",\"mcp.auth\",\"mcp.code\",\"mcp.logout\",\"mcp.restart\",\"shell\",\"shells\","
                "\"git\",\"trash\",\"trash.empty\",\"relay.offer\",\"relay.data\","
-               "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"shell.env\",\"call.stop\","
-               "\"cut\",\"uncut\",\"approve\"],"
+               "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"ask.hold\",\"shell.env\",\"call.stop\","
+               "\"cut\",\"uncut\",\"approve\",\"endpoint.auth\",\"endpoint.logout\","
+               "\"term.open\",\"term.input\",\"term.resize\",\"term.ack\",\"term.close\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
                "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\",\"background\",\"mcp\",\"models\",\"mcp.auth\",\"task.remote\",\"task.host\",\"memory\",\"shell\","
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
-               "\"trash\",\"relay\",\"question.deadline\",\"shell.env\",\"call.stop\","
-               "\"cut\",\"approve\"]}");
+               "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"ask.hold\",\"shell.env\",\"call.stop\","
+               "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\","
+               "\"term\",\"term.host\",\"pdf\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -711,6 +714,50 @@ static void test_events(Test *t)
         for (iz i = 0; i < countof(sids); i++) {
             expect(t, concat(a, "validsid ", sids[i].sid),
                    istr(a, validsid(sids[i].sid)), istr(a, sids[i].ok));
+        }
+    }
+
+    // A session's making, as its id says, to the second; 0 for an id
+    // that holds no such time
+    {
+        struct { Str sid; i64 ms; } sids[] = {
+            {"20261020-153012-7f3a", 1792510212000},
+            {"20260101-000000-aaaa", 1767225600000},
+            {"20000229-235959", 951868799000},
+            {"", 0},
+            {"a", 0},
+            {"20261020-15301", 0},
+            {"20261020_153012-7f3a", 0},
+            {"2026x020-153012-7f3a", 0},
+            {"20261320-153012-7f3a", 0},
+            {"20261000-153012-7f3a", 0},
+            {"20261020-243012-7f3a", 0},
+            {"20261020-156012-7f3a", 0},
+        };
+        for (iz i = 0; i < countof(sids); i++) {
+            expect(t, concat(a, "sidms ", sids[i].sid),
+                   istr(a, sidms(sids[i].sid)), istr(a, sids[i].ms));
+        }
+    }
+
+    // What counts as a session's activity: not a crash's turn.end, which
+    // an open writes later, nor any record but these three
+    {
+        struct { i32 ev; Str why; b32 want; } recs[] = {
+            {EV_USER,      {},            1},
+            {EV_TURN,      {},            1},
+            {EV_TURNEND,   "done",        1},
+            {EV_TURNEND,   "cancel",      1},
+            {EV_TURNEND,   "interrupted", 0},
+            {EV_SESSION,   {},            0},
+            {EV_TITLE,     {},            0},
+            {EV_ASSISTANT, {},            0},
+            {EV_TOOLEND,   {},            0},
+            {EV_NOTE,      {},            0},
+        };
+        for (iz i = 0; i < countof(recs); i++) {
+            Str name = concat(a, concat(a, "evactivity ", evinfo[recs[i].ev].name), recs[i].why);
+            expect(t, name, istr(a, evactivity(recs[i].ev, recs[i].why)), istr(a, recs[i].want));
         }
     }
 

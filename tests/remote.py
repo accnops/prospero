@@ -49,6 +49,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.request
 import zlib
 
 sys.dont_write_bytecode = True
@@ -105,6 +106,7 @@ fake_provider.SCENARIOS["remote_slow"] = sc_remote_slow
 fake_provider.SCENARIOS["remote_search"] = sc_remote_search
 fake_provider.SCENARIOS["remote_tool"] = sc_remote_tool
 fake_provider.SCENARIOS["remote_big"] = sc_remote_big
+fake_provider.SCENARIOS["remote_an"] = fake_provider.sc_an_plain
 
 
 # Frames
@@ -368,6 +370,7 @@ class T:
         self.env = dict(os.environ)
         self.env.update({"TMP": tmp, "TEMP": tmp} if os.name == "nt" else {"TMPDIR": tmp})
         self.procs = []
+        self.url = args.url
         self.write_config(args.url)
 
     def write_config(self, url, extra=""):
@@ -2471,7 +2474,10 @@ elif args[:1] == ["create"]:
     binds = {}
     for i, a in enumerate(args):
         if a == "-v" and ":" in args[i + 1]:
-            here, there = args[i + 1].rsplit(":", 1)
+            spec = args[i + 1]
+            if spec.endswith((":z", ":Z")):  # SELinux's labels
+                spec = spec[:-2]
+            here, there = spec.rsplit(":", 1)
             binds[there] = here
     labels = [args[i + 1] for i, a in enumerate(args) if a == "--label"]
     with open(rec(name), "w") as f:
@@ -2605,7 +2611,7 @@ class Box:
         os.makedirs(self.cwork)
         arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "amd64"
         ver = subprocess.run([t.prospero, "--version"], capture_output=True,
-                             text=True).stdout.split()[-1]
+                             text=True).stdout.split()[1]
         xdg = os.path.join(t.root, "config")
         engines = os.path.join(xdg, "prospero", "engines")
         os.makedirs(engines)
@@ -3081,8 +3087,9 @@ def thinconfig(t, extra=""):
         f.write("[host]\n" + extra)
 
 
-def offer(t, model, machine="testbox", budget=None, name="fake", search=0, listed=()):
-    ep = {"name": name, "kind": "openai", "first_byte_timeout": "5",
+def offer(t, model, machine="testbox", budget=None, name="fake", search=0, listed=(),
+          kind="openai"):
+    ep = {"name": name, "kind": kind, "first_byte_timeout": "5",
           "idle_timeout": "5", "progress_timeout": "10", "models": list(listed)}
     if budget:
         ep["slow_retry_budget"] = str(budget)
@@ -3225,6 +3232,34 @@ def relay_turn(t):
         live = [x for x in c.all() if x.get("ev") == "live" and x.get("sid") == sid
                 and x.get("relay")]
         t.check(live and live[0]["relay"] == "testbox", "live names the relay")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_responses(t):
+    """A thin host's turn at an endpoint of kind responses: the calls go to
+    v1/responses, the records name the kind, and the second body is a
+    delta, as for Chat Completions."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model, kind="responses")
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        t.check(finaltext(c.all(), sid).startswith("w0 w1"), "the answer")
+        posts = [(h, b) for h, b in rl.calls if h["method"] == "POST"]
+        t.check(len(posts) == 2 and all(h["path"] == "v1/responses" and
+                                        h.get("kind") == "responses" for h, b in posts),
+                f"calls: {[(h['path'], h.get('kind')) for h, b in posts]}")
+        t.check(posts[1][0].get("base"), "the second a delta")
+        body = json.loads(posts[1][1])
+        t.check(body["store"] is False and body["input"][0]["role"] == "user",
+                f"a Responses body: {str(body)[:200]}")
     finally:
         rl.stop = True
 
@@ -3466,7 +3501,8 @@ class Served:
         self.next = 0
 
     def call(self, body, path="v1/chat/completions", base=None, keep=1,
-             endpoint="fake", model=None, session="s1", deflate=False, parts=1):
+             endpoint="fake", model=None, session="s1", deflate=False, parts=1,
+             kind=None, hint=None):
         self.next += 1
         cid = self.next
         data = body if base is None else simpledelta(base, body)
@@ -3485,6 +3521,9 @@ class Served:
                 obj.update(session=session, endpoint=endpoint, anthropic=0, path=path,
                            method="POST", accept="text/event-stream", model=model or "",
                            readms=0, keep=keep, len=len(body), size=size)
+                if kind:
+                    obj["kind"] = kind
+                obj.update(hint or {})
                 if z is not None:
                     obj["zlen"] = len(z)
                 if base is not None:
@@ -3558,6 +3597,161 @@ def relay_serve(t):
     c.stream.command({"cmd": "relay.call", "cid": e, "origin": "thin", "cancel": 1})
     d = sv.done(e)
     t.check(d["err"] == "cancel", f"cancel: {d}")
+
+
+@scenario
+def relay_serve_chatgpt(t):
+    """A relayed call to an endpoint of kind chatgpt goes with this
+    engine's own sign-in: its expired token refreshed first, the call
+    then made with the new one, the account's id and the thin session's
+    id."""
+    t.write_config(t.url, f"[endpoint cg]\nkind = chatgpt\n"
+                          f"url = {t.url}/chatgpt/backend-api/codex/responses\n")
+    t.env["PROSPERO_TEST_CHATGPT_AUTH"] = t.url + "/chatgpt"
+    p = subprocess.Popen([t.prospero, "endpoint", "auth", "cg", "--state", t.state,
+                          "-c", t.config], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=t.env)
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        for line in p.stdout:
+            m = re.search(r"(https?://\S+/oauth/authorize\?\S+)", line)
+            if m:
+                urllib.request.urlopen(m.group(1), timeout=10).read()
+                break
+        out, err = p.communicate()
+    finally:
+        killer.cancel()
+    t.check(p.returncode == 0 and "Signed in to cg." in out, f"signed in: {out} {err}")
+    d = os.path.join(t.state, "endpoints", "auth")
+    path = os.path.join(d, os.listdir(d)[0])
+    keep = json.loads(open(path).read())
+    keep["expires_at"] = int(time.time()) - 10
+    with open(path, "w") as f:
+        f.write(json.dumps(keep))
+
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    sv = Served(t, c)
+    model = t.model("remote_slow")
+    body = json.dumps({"model": model, "instructions": "Be brief.", "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "store": False, "stream": True, "include": ["reasoning.encrypted_content"]}).encode()
+    a = sv.call(body, path="v1/responses", endpoint="cg", model=model, kind="chatgpt",
+                session="thin-s1")
+    dn = sv.done(a)
+    t.check(dn["err"] == "ok", f"done: {dn}")
+    t.check("w39" in sv.text(a), f"the response {sv.text(a)[-200:]}")
+    now = json.loads(open(path).read())
+    t.check(now["access_token"] != keep["access_token"], "refreshed")
+    with fake_provider.STATE.lock:
+        grants = [e for e in fake_provider.STATE.cg["log"]
+                  if e.get("refresh_token") == keep["refresh_token"]]
+    t.check(len(grants) == 1, f"one refresh {grants}")
+    h = fake_provider.STATE.log(model)[-1]["headers"]
+    t.check(h.get("authorization") == "Bearer " + now["access_token"] and
+            h.get("chatgpt-account-id") == "acct-fake" and h.get("session_id") == "thin-s1",
+            f"headers {h}")
+
+
+@scenario
+def relay_copilot(t):
+    """A thin host's turn at an endpoint of kind copilot: listed and called
+    through the relay, each call saying who began it (the user, then the
+    agent for the tool's follow-up) and what it is, for Copilot's
+    billing."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model, kind="copilot")
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        t.check(any(h["method"] == "GET" and h["path"].startswith("v1/models")
+                    for h, b in rl.calls), "a listing relayed")
+        posts = [h for h, b in rl.calls if h["method"] == "POST"]
+        t.check([(h["path"], h.get("kind"), h.get("initiator"), h.get("interaction"))
+                 for h in posts] ==
+                [("v1/chat/completions", "copilot", "user", "conversation-agent"),
+                 ("v1/chat/completions", "copilot", "agent", "conversation-agent")],
+                f"calls: {posts}")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_serve_copilot(t):
+    """A relayed call to an endpoint of kind copilot goes with this
+    engine's own GitHub sign-in, to the path its format takes under the
+    API's root, with who began it and what it is as the thin engine
+    said, and the integration this engine's configuration names; words
+    not Copilot's are dropped."""
+    t.write_config(t.url, f"[endpoint cop]\nkind = copilot\nurl = {t.url}/copilot\n"
+                          "integration_id = some-chat\n")
+    t.env["PROSPERO_TEST_COPILOT_AUTH"] = t.url + "/copilot-gh"
+    p = subprocess.Popen([t.prospero, "endpoint", "auth", "cop", "--state", t.state,
+                          "-c", t.config], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=t.env)
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        url = None
+        for line in p.stdout:
+            m = re.search(r"(https?://\S+/login/device)\s*$", line)
+            url = m.group(1) if m else url
+            m = re.search(r"^\s+(FAKE-\d+)\s*$", line)
+            if m and url:
+                urllib.request.urlopen(f"{url}?user_code={m.group(1)}", timeout=10).read()
+                break
+        out, err = p.communicate()
+    finally:
+        killer.cancel()
+    t.check(p.returncode == 0 and "Signed in to cop." in out, f"signed in: {out} {err}")
+    d = os.path.join(t.state, "endpoints", "auth")
+    keep = json.loads(open(os.path.join(d, os.listdir(d)[0])).read())
+
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    sv = Served(t, c)
+
+    def calls():
+        with fake_provider.STATE.lock:
+            return [e for e in fake_provider.STATE.cp["log"] if "_call" in e]
+
+    model = t.model("remote_slow")
+    a = sv.call(chatbody(model, "hi"), endpoint="cop", model=model, kind="copilot",
+                session="thin-s1", hint={"initiator": "agent",
+                                         "interaction": "conversation-subagent",
+                                         "vision": 1})
+    dn = sv.done(a)
+    t.check(dn["err"] == "ok", f"done: {dn}")
+    t.check("w39" in sv.text(a), f"the response {sv.text(a)[-200:]}")
+    e = calls()[-1]
+    h = e["headers"]
+    t.check(e["_call"] == "/chat/completions" and
+            h.get("authorization") == "Bearer " + keep["access_token"] and
+            h.get("x-initiator") == "agent" and
+            h.get("x-interaction-type") == "conversation-subagent" and
+            h.get("x-interaction-id") == "thin-s1" and
+            h.get("copilot-vision-request") == "true" and
+            h.get("copilot-integration-id") == "some-chat" and
+            h.get("x-github-api-version"), f"call {e}")
+
+    an = t.model("remote_an")
+    body = json.dumps({"model": an, "max_tokens": 100, "stream": True,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    a = sv.call(body, path="v1/messages", endpoint="cop", model=an, kind="copilot",
+                session="thin-s1", hint={"initiator": "boss", "interaction": "conversation-x"})
+    dn = sv.done(a)
+    e = calls()[-1]
+    h = e["headers"]
+    t.check(dn["err"] == "ok" and e["_call"] == "/v1/messages" and
+            h.get("anthropic-version") and "x-initiator" not in h, f"messages {dn} {e}")
 
 
 @scenario

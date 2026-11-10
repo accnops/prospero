@@ -114,6 +114,7 @@ enum : i64 {
     MEM_TEXTMAX    = 32 << 10,        // its text
     WEB_QUERYMAX   = 1 << 10,         // longest search query
     WEB_PAGEMAX    = 5 << 20,         // bytes of a page read, then cut
+    WEB_PDFMAX     = sizeof(iz)==4 ? 8<<20 : 32<<20,  // of a PDF read
     WEB_SHOW       = 50 << 10,        // bytes of a page's text shown at once
     WEB_REDIRECTS  = 5,               // to the same host, followed
     WEB_SEARCHES   = 200,             // a session tree's, by default
@@ -164,6 +165,7 @@ struct ToolEnv {
     Str exe;         // this executable, for the built-in search
     i64 jobtimeout;  // seconds a job may run, unless asked otherwise
     i64 jobmax;      // seconds a job may be asked to run
+    b32 resume;      // a job's end starts a turn: [tools] auto_resume
     u32 deny;        // tools not offered (a role's), as bits 1<<TOOL_*
     Str roles;       // the roles task may give, a line for each
     Str roleenum;    // their names, as a JSON schema's enum member
@@ -173,6 +175,7 @@ struct ToolEnv {
     i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
     i32 coords;      // COORDS_*: how the desktop tool takes points
     b32 vision;      // the model takes images, which read then shows
+    b32 pdf;         // and PDFs, which read sends as documents
     i32 year;        // when the prefix was built, for web_search
 };
 
@@ -466,8 +469,13 @@ static Str shelldesc(Arena *a, ToolEnv *te)
     printduration(&b, job);
     print(&b, ", or with background after its timeout (at most ");
     printduration(&b, max);
-    print(&b, "). You are told when a job ends: do not poll, check on, or "
-              "sleep for it. Processes a command leaves running are killed "
+    print(&b, te->resume
+              ? Str("). You are told when a job ends, and a new turn starts "
+                    "for it if yours has ended: do not poll, check on, or "
+                    "sleep for it.")
+              : Str("). You are told when a job ends: do not poll, check on, "
+                    "or sleep for it."));
+    print(&b, " Processes a command leaves running are killed "
               "when it ends, unless it is a job. The user cannot undo what "
               "commands change.");
     if (te->shells.len) {
@@ -700,11 +708,20 @@ static Str tooljson(Arena *a, ToolEnv *te)
         },
         {
             "todo_write",
-            "Keep a todo list for a task of three or more steps, giving the "
-            "whole list each time. Keep one item in_progress, mark each done "
-            "as soon as it is, and remove those that no longer apply.",
+            "Keep a todo list for a task of three or more steps. Give todos, "
+            "the whole list, to begin one or to replace it. After that, change "
+            "it with done, start, add and remove, naming items by their text, "
+            "and don't send the whole list again. One item is in progress at "
+            "a time: when none is, the first pending one starts. Never call "
+            "it on its own: put it in the same response as your other tool "
+            "calls, such as the list with the first call of the task, or an "
+            "item marked done with the first call of the next.",
             {
-                {"todos", "array", "", 1, todoitem},
+                {"todos", "array", "The whole list, replacing any before", 0, todoitem},
+                {"done", "array", "Items now done", 0, "\"items\":{\"type\":\"string\"}"},
+                {"start", "string", "The item now in progress", 0, {}},
+                {"add", "array", "New items, at the end", 0, "\"items\":{\"type\":\"string\"}"},
+                {"remove", "array", "Items that no longer apply", 0, "\"items\":{\"type\":\"string\"}"},
             },
         },
         {
@@ -853,7 +870,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
         {
             "web_fetch",
             "Read a web page as text: HTML as Markdown with absolute links, "
-            "and plain text, Markdown or JSON as they are. Only https, and "
+            "plain text, Markdown or JSON as they are, and a PDF as its "
+            "text, a '--- page N ---' line starting each page. Only https, and "
             "only a URL that appeared earlier in the conversation (from the "
             "user, a search result, a page read, a file or a command's "
             "output), never one you composed; no local or private "
@@ -956,12 +974,29 @@ static Str tooljson(Arena *a, ToolEnv *te)
     if (te->edit>=0 && te->edit<EDIT_COUNT) {
         defs[TOOL_EDIT] = editdefs[te->edit];
     }
-    if (te->vision) {
-        defs[TOOL_READ].desc =
-            "Read a text file, each line shown with its number and a tab, "
+    // A PDF shows as its text, extracted here (readpdf), unless the
+    // endpoint takes it as a document (te->pdf)
+    defs[TOOL_READ].desc = te->vision ?
+        Str("Read a text file, each line shown with its number and a tab, "
             "2000 lines at a time (continue with offset). A directory lists "
-            "its entries, and an image (PNG, JPEG, GIF, WebP, BMP) is shown "
-            "as an image.";
+            "its entries, an image (PNG, JPEG, GIF, WebP, BMP) is shown as "
+            "an image, and a PDF as its text, a '--- page N ---' line "
+            "starting each page, with the images on its pages shown.") :
+        Str("Read a text file, each line shown with its number and a tab, "
+            "2000 lines at a time (continue with offset). A directory lists "
+            "its entries, and a PDF shows as its text, a '--- page N ---' "
+            "line starting each page.");
+    if (te->pdf) {
+        defs[TOOL_READ].desc = te->vision ?
+            Str("Read a text file, each line shown with its number and a tab, "
+                "2000 lines at a time (continue with offset). A directory lists "
+                "its entries, an image (PNG, JPEG, GIF, WebP, BMP) is shown as "
+                "an image, and a PDF as a document, its text and its pages' "
+                "images.") :
+            Str("Read a text file, each line shown with its number and a tab, "
+                "2000 lines at a time (continue with offset). A directory lists "
+                "its entries, and a PDF is shown as a document, its text and "
+                "its pages' images.");
     }
 
     putarray(&w);
@@ -1157,7 +1192,12 @@ struct Args {
     b32             background;
     b32             ignorecase;
     b32             literal;
-    Slice<TodoItem> todos;
+    Slice<TodoItem> todos;      // todo_write: the whole list, if given
+    b32             haslist;    // todo_write: todos was given
+    Slice<Str>      tdone;      // todo_write: items to mark done, by text
+    Slice<Str>      tadd;       // todo_write: items to append
+    Slice<Str>      tremove;    // todo_write: items to remove
+    Str             tstart;     // todo_write: the item to start, null if none
     Str             tag;        // edit as hashline: the file's tag as read
     Slice<HashEdit> hedits;
     Patch           patch;      // edit as patch
@@ -1377,23 +1417,88 @@ static i32 todostatus(Str s)
     return -1;
 }
 
-// The todo list: an array of {content, status}, or such an array
-// encoded as a string, which some models send.
-static Slice<TodoItem> argtodos(Arena *a, Args *r, Json *root)
+// A todo item named in an argument: a non-empty string of at most
+// TODO_TEXTMAX bytes. Returns null after an issue.
+static Str argtodoname(Arena *a, Args *r, Str where, Json *e)
 {
-    Slice<TodoItem> items = {};
+    Str c = e->type==JSON_STRING ? e->str :
+            e->type==JSON_OBJECT ? jsonstr(jsonget(e, "content")) : Str{};
+    c = trim(c);
+    if (!c.len) {
+        issue(a, r, where, "must name an item by its text");
+        return {};
+    } else if (c.len > TODO_TEXTMAX) {
+        issue(a, r, where, "is too long: at most 500 bytes");
+        return {};
+    }
+    return c;
+}
+
+// Items named by text: an array of strings, one string, or an array
+// encoded as a string, which some models send.
+static Slice<Str> argtodonames(Arena *a, Args *r, Json *root, Str key)
+{
+    Slice<Str> names = {};
+    Json *v = jsonget(root, key);
+    if (v->type == JSON_STRING) {
+        Str t = trim(v->str);
+        JsonDoc d = t.len && t[0]=='[' ? jsonparse(a, t) : JsonDoc{};
+        v = d.ok ? d.root : v;
+    }
+    if (v->type==JSON_MISSING || v->type==JSON_NULL) {
+        return names;
+    } else if (v->type != JSON_ARRAY) {
+        Str n = argtodoname(a, r, key, v);
+        return n.data ? push(a, names, n) : names;
+    }
+    iz n = 0;
+    for (Json *e = v->child; e; e = e->next, n++) {
+        Buf at(a, 32);
+        print(&at, key);
+        putbyte(&at, '[');
+        print(&at, (i64)n);
+        putbyte(&at, ']');
+        Str c = argtodoname(a, r, finish(&at), e);
+        if (c.data) {
+            names = push(a, names, c);
+        }
+    }
+    if (n > TODO_ITEMS) {
+        issue(a, r, key, "too many items: at most 50");
+    }
+    return names;
+}
+
+// todo_write's arguments: the whole list as todos, an array of {content,
+// status} or such an array encoded as a string, and the changes to it,
+// done, start, add and remove, each naming items by their text.
+static void argtodos(Arena *a, Args *r, Json *root)
+{
+    r->tdone   = argtodonames(a, r, root, "done");
+    r->tadd    = argtodonames(a, r, root, "add");
+    r->tremove = argtodonames(a, r, root, "remove");
+    Json *sv = jsonget(root, "start");
+    if (sv->type!=JSON_MISSING && sv->type!=JSON_NULL) {
+        r->tstart = argtodoname(a, r, "start", sv);
+    }
+
     Json *v = jsonget(root, "todos");
     if (v->type == JSON_STRING) {
         JsonDoc d = jsonparse(a, trim(v->str));
         v = d.ok ? d.root : v;
     }
     if (v->type==JSON_MISSING || v->type==JSON_NULL) {
-        issue(a, r, "todos", "required array is missing");
-        return items;
+        if (!r->tdone.len && !r->tadd.len && !r->tremove.len &&
+            !r->tstart.data && !r->issues.len) {
+            issue(a, r, "todos", "give todos, the whole list, or the changes "
+                  "to it: done, start, add or remove");
+        }
+        return;
     } else if (v->type != JSON_ARRAY) {
         issue(a, r, "todos", "must be an array of {content, status} objects");
-        return items;
+        return;
     }
+    r->haslist = 1;
     iz n = 0;
     for (Json *e = v->child; e; e = e->next, n++) {
         Buf at(a, 32);
@@ -1415,13 +1520,12 @@ static Slice<TodoItem> argtodos(Arena *a, Args *r, Json *root)
             issue(a, r, where, "status must be pending, in_progress or done");
         } else {
             TodoItem t = {c, st};
-            items = push(a, items, t);
+            r->todos = push(a, r->todos, t);
         }
     }
     if (n > TODO_ITEMS) {
         issue(a, r, "todos", "too many items: at most 50");
     }
-    return items;
 }
 
 // A hashline edit's op by name, forgiving the usual synonyms; -1 if
@@ -2045,7 +2149,7 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         }
         break;
     case TOOL_TODO:
-        r.todos = argtodos(a, &r, j);
+        argtodos(a, &r, j);
         break;
     case TOOL_JOBS:
         break;
@@ -2438,19 +2542,43 @@ static b32 readbinary(Str data)
     return 0;
 }
 
-// A text file's lines from first, at most limit of them and READ_BYTES
-// in all, each numbered, after head, then a note of where to go on if
-// more are left: read's output, and an attached file's.
-static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
+// Whether data that pdfsniff takes for a PDF is one for all the reader
+// can tell, though the reader found no pages in it: binary by read's
+// measure, or beginning as a PDF does. A text file that only mentions
+// "%PDF-" in its first KiB is neither, and is read as text.
+static b32 pdflikely(Str data)
 {
+    return readbinary(data) || startswith(data, "%PDF-");
+}
+
+// A window of a text file's lines, as read shows it: its text, the
+// last line it shows, and how many lines the file has. One that shows
+// none (an empty file, or first past the end) has last = first-1, which
+// may be past total, so a caller tests last<first, never last<total.
+struct ReadWin {
+    Str text;
+    iz  last;
+    iz  total;
+};
+
+// A text file's lines from first, at most limit of them and READ_BYTES
+// in all, each numbered, after head (empty for none: a PDF's text has
+// no hashline tag), then a note of where to go on if more are left:
+// read's output, and an attached file's.
+static ReadWin readwin(Arena *a, Str data, Str head, iz first, iz limit)
+{
+    ReadWin r = {};
+    r.last = first - 1;
     if (startswith(data, "\xef\xbb\xbf")) {
         data = cuthead(data, 3);
     }
     if (!data.len) {
-        return concat(a, head, "(empty file)");
+        r.text = concat(a, head, "(empty file)");
+        return r;
     }
 
     iz total = countlines(data);
+    r.total  = total;
     if (first > total) {
         Buf b(a, 160);
         print(&b, "The file has only ");
@@ -2458,7 +2586,8 @@ static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
         print(&b, " lines, so offset ");
         print(&b, (i64)first);
         print(&b, " is past its end.");
-        return finish(&b);
+        r.text = finish(&b);
+        return r;
     }
 
     Buf b(a, 4096);
@@ -2508,7 +2637,14 @@ static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
         print(&b, (i64)last+1);
         print(&b, ".]\n");
     }
-    return finish(&b);
+    r.text = finish(&b);
+    r.last = last;
+    return r;
+}
+
+static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
+{
+    return readwin(a, data, head, first, limit).text;
 }
 
 // Read a file, under its [PATH#TAG] header if tagged (hashline edits).
@@ -3173,6 +3309,34 @@ static Slice<Str> envdel(Arena *a, Slice<Str> env, Str name, b32 windows)
     return r;
 }
 
+// The command that opens a session's shell by hand (Open in external terminal,
+// and a terminal tab), as its records give its kind (shellkinds) and
+// program: a POSIX sh as a login shell, so its profile sets it up; wsl
+// in its section's distro, if any. None for a POSIX system's bash or
+// /bin/sh, the defaults, where the terminal's own shell, the user's, is
+// better.
+static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win, Str distro = {})
+{
+    Slice<Str> r = {};
+    b32 dflt = !win && kind=="sh" && (path=="/bin/sh" || basename(path)=="bash");
+    if (!path.len || dflt) {
+        return r;
+    }
+    r = push(a, r, path);
+    if (kind == "sh") {
+        r = push(a, r, Str("-l"));
+    } else if (kind == "busybox") {
+        r = push(a, r, Str("sh"));
+        r = push(a, r, Str("-l"));
+    } else if (kind=="pwsh" || kind=="powershell") {
+        r = push(a, r, Str("-NoLogo"));
+    } else if (kind=="wsl" && distro.len) {
+        r = push(a, r, Str("-d"));
+        r = push(a, r, distro);
+    }
+    return r;
+}
+
 // A PATH of the directories pre, then path, then post, each joined by
 // the platform's separator, empty ones left out. On Windows the extra
 // directories take backslashes, which cmd.exe's own search wants.
@@ -3308,6 +3472,22 @@ static ShellCmd shellcmd(Arena *a, Shell *sh, b32 windows, Str command)
     return r;
 }
 
+// What the agent is told of waiting for a job, resume if its end starts
+// a turn by itself ([tools] auto_resume, unless spent).
+static void printjobwait(Buf *b, b32 resume)
+{
+    if (resume) {
+        print(b, "You will be told when it ends, and if your turn has ended "
+                 "by then, a new one starts for it: do not poll it, sleep, or "
+                 "wait for it, but go on with other work, or end your turn if "
+                 "there is nothing else to do.");
+    } else {
+        print(b, "You will be told when it ends, at your next request after "
+                 "that: do not poll it or wait for it, but go on with other "
+                 "work, or end your turn if there is nothing else to do.");
+    }
+}
+
 struct ShellEnd {
     i32  code;      // exit status
     i32  signal;    // terminating signal (POSIX), or 0
@@ -3319,6 +3499,7 @@ struct ShellEnd {
     i64  timeout;   // seconds
     i64  job;       // moved to the background as this job, or 0
     b32  moved;     // and moved there by the user, not at its timeout
+    b32  resume;    // and its end starts a turn (printjobwait)
     i64  ms;        // how long it ran, to its exit if it exited
     b32  nojob;     // timed out, but too many jobs ran to move it
     b32  stopped;   // the user stopped it, and the turn went on
@@ -3375,9 +3556,10 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
             print(&b, ", so it continues in the background as job ");
         }
         print(&b, e->job);
-        print(&b, ". You will be told when it ends: do not poll it or wait "
-                  "for it. Use job_output to read more of its output, and "
-                  "job_kill to stop it]");
+        print(&b, ". ");
+        printjobwait(&b, e->resume);
+        print(&b, " Use job_output to read more of its output, and job_kill "
+                  "to stop it]");
         r.ok = 1;
     } else if (e->timedout) {
         print(&b, "[timed out after ");
@@ -3417,6 +3599,31 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
 
 // todo_write
 
+// The whole list, done items too, as for a call that went wrong.
+static Str todolist(Arena *a, Slice<TodoItem> items)
+{
+    if (!items.len) {
+        return "The todo list is empty.\n";
+    }
+    Buf b(a, 256);
+    for (iz i = 0; i < items.len; i++) {
+        switch (items[i].status) {
+        case TODO_PENDING: print(&b, "[ ] "); break;
+        case TODO_ACTIVE:  print(&b, "[>] "); break;
+        case TODO_DONE:    print(&b, "[x] "); break;
+        }
+        print(&b, items[i].content);
+        if (items[i].status == TODO_ACTIVE) {
+            print(&b, " (in progress)");
+        }
+        putbyte(&b, '\n');
+    }
+    return finish(&b);
+}
+
+// A list after a change: the count done and the items left, but not
+// those done, which the agent knows already, so that the result stays
+// short as the work goes on.
 static Str todoshow(Arena *a, Slice<TodoItem> items)
 {
     if (!items.len) {
@@ -3431,13 +3638,16 @@ static Str todoshow(Arena *a, Slice<TodoItem> items)
     print(&b, (i64)done);
     print(&b, " of ");
     print(&b, (i64)items.len);
-    print(&b, " done:\n");
+    if (done == items.len) {
+        print(&b, " done.\n");
+        return finish(&b);
+    }
+    print(&b, " done, left:\n");
     for (iz i = 0; i < items.len; i++) {
-        switch (items[i].status) {
-        case TODO_PENDING: print(&b, "[ ] "); break;
-        case TODO_ACTIVE:  print(&b, "[>] "); break;
-        case TODO_DONE:    print(&b, "[x] "); break;
+        if (items[i].status == TODO_DONE) {
+            continue;
         }
+        print(&b, items[i].status==TODO_ACTIVE ? Str("[>] ") : Str("[ ] "));
         print(&b, items[i].content);
         if (items[i].status == TODO_ACTIVE) {
             print(&b, " (in progress)");
@@ -3445,6 +3655,173 @@ static Str todoshow(Arena *a, Slice<TodoItem> items)
         putbyte(&b, '\n');
     }
     return finish(&b);
+}
+
+// Text as todo items compare: ASCII lowercase, each whitespace run one
+// space, and no backslashes, which models double when an item quotes a
+// command (\\" for ").
+static Str todofold(Arena *a, Str s)
+{
+    Buf b(a, s.len);
+    b32 space = 0;
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (c==' ' || c=='\t' || c=='\n' || c=='\r') {
+            space = 1;
+            continue;
+        } else if (c == '\\') {
+            continue;
+        }
+        if (space && b.len) {
+            putbyte(&b, ' ');
+        }
+        space = 0;
+        putbyte(&b, c>='A' && c<='Z' ? (u8)(c + 32) : c);
+    }
+    return finish(&b);
+}
+
+// The item a name means: its exact text, else the same text but for
+// case and spacing, else the only item containing the name; -1 if none,
+// -2 if several contain it.
+static iz todofind(Arena scratch, Slice<TodoItem> items, Str name)
+{
+    for (iz i = 0; i < items.len; i++) {
+        if (items[i].content == name) {
+            return i;
+        }
+    }
+    Str f = todofold(&scratch, name);
+    for (iz i = 0; i < items.len; i++) {
+        if (todofold(&scratch, items[i].content) == f) {
+            return i;
+        }
+    }
+    iz found = -1;
+    for (iz i = 0; f.len>=3 && i<items.len; i++) {
+        if (find(todofold(&scratch, items[i].content), f) >= 0) {
+            if (found >= 0) {
+                return -2;
+            }
+            found = i;
+        }
+    }
+    return found;
+}
+
+static void todoerr(Buf *e, Str key, Str name, iz at)
+{
+    print(e, key);
+    print(e, ": ");
+    print(e, at==-2 ? Str("more than one item matches \"") : Str("no item \""));
+    print(e, name);
+    print(e, "\"\n");
+}
+
+// The list after a todo_write call: todos if given, else the list as it
+// was, then add, remove, done and start, in that order. One item is in
+// progress at a time: start demotes any other, and when none is, the
+// first pending one starts. On a name that matches no item, or too many
+// items, *err says why and the list is as it was.
+static Slice<TodoItem> todoapply(Arena *a, Slice<TodoItem> cur, Args *r, Str *err)
+{
+    Slice<TodoItem> items = {};
+    Slice<TodoItem> from  = r->haslist ? r->todos : cur;
+    for (iz i = 0; i < from.len; i++) {
+        items = push(a, items, from[i]);
+    }
+    Buf e(a, 256);
+    for (iz i = 0; i < r->tadd.len; i++) {
+        // Adding an item that is there already (but for case and
+        // spacing) adds nothing, so a call repeated does no harm
+        Arena t   = *a;
+        Str   f   = todofold(&t, r->tadd[i]);
+        b32   dup = 0;
+        for (iz k = 0; k<items.len && !dup; k++) {
+            dup = todofold(&t, items[k].content) == f;
+        }
+        if (!dup) {
+            TodoItem n = {r->tadd[i], TODO_PENDING};
+            items = push(a, items, n);
+        }
+    }
+    for (iz i = 0; i < r->tremove.len; i++) {
+        iz at = todofind(*a, items, r->tremove[i]);
+        if (at < 0) {
+            todoerr(&e, "remove", r->tremove[i], at);
+            continue;
+        }
+        for (iz k = at; k+1 < items.len; k++) {
+            items[k] = items[k+1];
+        }
+        items.len--;
+    }
+    for (iz i = 0; i < r->tdone.len; i++) {
+        iz at = todofind(*a, items, r->tdone[i]);
+        if (at < 0) {
+            todoerr(&e, "done", r->tdone[i], at);
+        } else {
+            items[at].status = TODO_DONE;
+        }
+    }
+    if (r->tstart.data) {
+        iz at = todofind(*a, items, r->tstart);
+        if (at < 0) {
+            todoerr(&e, "start", r->tstart, at);
+        } else {
+            for (iz i = 0; i < items.len; i++) {
+                if (items[i].status == TODO_ACTIVE) {
+                    items[i].status = TODO_PENDING;
+                }
+            }
+            items[at].status = TODO_ACTIVE;
+        }
+    }
+    if (items.len > TODO_ITEMS) {
+        print(&e, "too many items: at most 50\n");
+    }
+    if (e.len) {
+        print(&e, "The list is unchanged:\n");
+        print(&e, todolist(a, cur));
+        print(&e, "Name items by their text, as listed.");
+        *err = finish(&e);
+        return cur;
+    }
+
+    // One in progress: the first of several, else the first pending
+    iz active = -1;
+    for (iz i = 0; i < items.len; i++) {
+        if (items[i].status != TODO_ACTIVE) {
+            continue;
+        } else if (active >= 0) {
+            items[i].status = TODO_PENDING;
+        } else {
+            active = i;
+        }
+    }
+    for (iz i = 0; active<0 && i<items.len; i++) {
+        if (items[i].status == TODO_PENDING) {
+            items[i].status = TODO_ACTIVE;
+            active = i;
+        }
+    }
+    *err = {};
+    return items;
+}
+
+// Whether a call sent the whole list again, the same items in the same
+// order, where done and start would have said the same in a few words.
+static b32 todoresent(Slice<TodoItem> old, Args *r)
+{
+    if (!r->haslist || !old.len || r->todos.len!=old.len) {
+        return 0;
+    }
+    for (iz i = 0; i < old.len; i++) {
+        if (r->todos[i].content != old[i].content) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 // Items not done yet, as todoshow lists them, or null if none.

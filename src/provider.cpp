@@ -99,13 +99,123 @@ static Url parseurl(Str s)
     return r;
 }
 
+// The request format an endpoint takes ([endpoint] kind).
+enum : i32 {
+    EP_OPENAI,     // Chat Completions
+    EP_ANTHROPIC,  // Messages (anthropic.cpp)
+    EP_RESPONSES,  // Responses (responses.cpp)
+    EP_CHATGPT,    // Responses at ChatGPT's Codex backend, signed in
+    EP_COPILOT,    // GitHub Copilot, signed in: each model's own format
+};
+
+static Str const epkinds[] = {"openai", "anthropic", "responses", "chatgpt", "copilot"};
+
+// A kind by its name, openai if unknown.
+static i32 epkindof(Str name)
+{
+    for (i32 i = 0; i < (i32)countof(epkinds); i++) {
+        if (epkinds[i] == name) {
+            return i;
+        }
+    }
+    return EP_OPENAI;
+}
+
+static Str epkindname(i32 kind)
+{
+    return kind>=0 && kind<(i32)countof(epkinds) ? epkinds[kind] : epkinds[0];
+}
+
+// Whether a kind speaks the Responses API.
+static b32 epresponses(i32 kind)
+{
+    return kind==EP_RESPONSES || kind==EP_CHATGPT;
+}
+
+// Whether a kind's endpoint is signed in to, with no key.
+static b32 epsigned(i32 kind)
+{
+    return kind==EP_CHATGPT || kind==EP_COPILOT;
+}
+
+// The service a signed-in kind signs in to, for messages.
+static Str epservice(i32 kind)
+{
+    return kind==EP_COPILOT ? Str("GitHub Copilot") : Str("ChatGPT");
+}
+
+// A model call's path under the API root.
+static Str eppath(i32 kind)
+{
+    return kind==EP_ANTHROPIC ? Str("messages") :
+           epresponses(kind)  ? Str("responses") : Str("chat/completions");
+}
+
+// Its model listing's path: Anthropic's comes in pages, of at most 1000
+// models, and the Codex backend's lists what a client of that version
+// may use.
+static Str eplistpath(i32 kind)
+{
+    return kind==EP_ANTHROPIC ? Str("models?limit=1000") :
+           kind==EP_CHATGPT   ? Str("models?client_version=1.0.0") : Str("models");
+}
+
+// The URL of a kind's own service, which Settings fills in, or null for
+// a kind any server may speak.
+static Str epkindurl(i32 kind)
+{
+    switch (kind) {
+    case EP_ANTHROPIC: return "https://api.anthropic.com";
+    case EP_RESPONSES: return "https://api.openai.com/v1";
+    case EP_CHATGPT:   return "https://chatgpt.com/backend-api/codex/responses";
+    case EP_COPILOT:   return "https://api.githubcopilot.com";
+    }
+    return {};
+}
+
+// Whether two URLs are the same but for trailing slashes.
+static b32 sameurl(Str a, Str b)
+{
+    for (; a.len && a[a.len-1]=='/'; a.len--) {}
+    for (; b.len && b[b.len-1]=='/'; b.len--) {}
+    return a == b;
+}
+
+// The URL of name under Copilot's API root, which has no /v1/: given
+// "https://api.githubcopilot.com/", "https://api.githubcopilot.com/NAME".
+static Str copiloturl(Arena *a, Str base, Str name)
+{
+    for (; base.len && base[base.len-1]=='/'; base.len--) {}
+    Buf b(a, base.len + name.len + 2);
+    print(&b, base);
+    putbyte(&b, '/');
+    print(&b, name);
+    return finish(&b);
+}
+
+// Kind copilot signs in with GitHub's device flow, as Prospero's own
+// GitHub app unless [endpoint] client_id names another (engine.cpp,
+// "Signing in"). An app GitHub has not endorsed is given only its older
+// models, which take Chat Completions.
+static Str const copilotclient = "Ov23lion1hTLsXGBOJAZ";
+static Str const copilotgithub = "https://github.com";
+static Str const copilotghapi  = "https://api.github.com";
+static Str const copilotapiver = "2026-08-01";
+
+// A Copilot model call's path under its root, for a model of format
+// wire: its Messages are at v1/messages, beside the others' paths.
+static Str copilotpath(i32 wire)
+{
+    return wire==EP_ANTHROPIC ? Str("v1/messages") : eppath(wire);
+}
+
 // A thin engine's endpoint, whose model calls a connected computer makes
-// (relay.cpp): relay://NAME for kind openai, relay+anthropic://NAME for
-// anthropic, NAME being the [endpoint] section it offered. The URL is
-// the endpoint's identity, the kind included.
+// (relay.cpp): relay://NAME for kind openai, relay+KIND://NAME for the
+// others (relay+anthropic://NAME), NAME being the [endpoint] section it
+// offered. The URL is the endpoint's identity, the kind included.
 struct RelayUrl {
     Str name;
-    b32 anthropic;
+    i32 kind;
     b32 ok;
 };
 
@@ -125,12 +235,23 @@ static RelayUrl relayurl(Str s)
     RelayUrl r = {};
     if (startswith(s, "relay://")) {
         r.name = cuthead(s, 8);
-    } else if (startswith(s, "relay+anthropic://")) {
-        r.name      = cuthead(s, 18);
-        r.anthropic = 1;
+    } else if (startswith(s, "relay+")) {
+        Cut c = cut(cuthead(s, 6), ':');
+        r.kind = epkindof(c.head);
+        if (r.kind!=EP_OPENAI && startswith(c.tail, "//")) {
+            r.name = cuthead(c.tail, 2);
+        }
     }
     r.ok = relayname(r.name);
     return r;
+}
+
+// A relayed endpoint's URL, of its kind.
+static Str relayurlof(Arena *a, i32 kind, Str name)
+{
+    Str scheme = kind==EP_OPENAI ? Str("relay://")
+                                 : concat(a, concat(a, "relay+", epkindname(kind)), "://");
+    return concat(a, scheme, name);
 }
 
 // An endpoint's URL, real or relayed.
@@ -187,9 +308,10 @@ static b32 localhost(Str host)
 }
 
 // An endpoint URL less trailing slashes and any request path it names in
-// full. Given "http://h/x/chat/completions" (or "/messages"), the root is
-// "http://h/x" and full is set: that API takes requests as named, with no
-// /v1 added, for proxies and providers with no /v1 in their paths.
+// full. Given "http://h/x/chat/completions" (or "/messages", or
+// "/responses"), the root is "http://h/x" and full is set: that API
+// takes requests as named, with no /v1 added, for proxies and providers
+// with no /v1 in their paths.
 static Str apiroot(Str base, b32 *full)
 {
     for (; base.len && base[base.len-1]=='/'; base.len--) {}
@@ -198,6 +320,8 @@ static Str apiroot(Str base, b32 *full)
         base.len -= 17;
     } else if (endswith(base, "/messages")) {
         base.len -= 9;
+    } else if (endswith(base, "/responses")) {
+        base.len -= 10;
     } else {
         *full = 0;
     }
@@ -262,14 +386,18 @@ struct Block {
     Str args;  // the raw argument string, as the model produced it
 };
 
-// An image the user attached to a message.
+// An image the user attached to a message, or one of the images of a
+// tool result (a PDF's, read shows several at once).
 struct MsgImage {
-    Str name;  // relative to the session's directory: img/N.png
-    Str mime;  // image/png or image/jpeg
+    Str name;   // relative to the session's directory: img/N.png, or
+                // a tool result's out/NAME.png or out/NAME.jpg
+    Str mime;   // image/png or image/jpeg
     i32 w;
     i32 h;
-    Str b64;   // in a request's history: the image as base64, or null
-    Str alt;   // with this text in its place (its file is lost)
+    Str label;  // a tool result's: what its caption names, such as
+                // "image 3 (page 2)", empty if none
+    Str b64;    // in a request's history: the image as base64, or null
+    Str alt;    // with this text in its place (its file is lost)
 };
 
 // A text file the user attached to a message, kept in the session's
@@ -279,6 +407,14 @@ struct MsgFile {
     Str name;   // relative to the session's directory: files/N-NAME
     i64 bytes;
     i64 lines;
+};
+
+// A session the user mentioned in a message (an '@' token): a request has
+// a line for each, before the message's own text, so that the agent has
+// its id for send_message.
+struct MsgSess {
+    Str sid;
+    Str title;  // as it was when the message was sent
 };
 
 struct Msg {
@@ -294,12 +430,20 @@ struct Msg {
     i32          imgw;    // read (PNG), relative to the session's
     i32          imgh;    // directory, and its size
     b32          imgread;  // an image read, not a screenshot
+    i32          pages;   // an image read that is a PDF, of this many
+                          // pages: Anthropic's document, else imgalt
+    Str          pdfbad;  // why the API refused that PDF, which is
+                          // then not sent (this run only)
     Str          imgb64;  // in a request's history: the screenshot as
                           // base64, or null where it is left out,
     Str          imgalt;  // with this text in its place
+    Str          imgmime;  // and imgb64's type as its bytes say (image/png
+                           // if null)
     i32          floor;   // FLOOR_*: a cache breakpoint just before it
-    Slice<MsgImage> images;  // user messages: those attached
+    Slice<MsgImage> images;  // user messages: those attached; tool
+                             // messages: a result's several images
     Slice<MsgFile>  files;   // and the text files
+    Slice<MsgSess>  sessions;  // and the sessions mentioned
 };
 
 // Where a request's prefix stops matching the one before, at a step of
@@ -308,7 +452,8 @@ struct Msg {
 enum : i32 {
     FLOOR_NONE,
     FLOOR_WRITE,  // the oldest screenshot shown: the next step's change
-    FLOOR_READ,   // the oldest dropped at this step: its change
+    FLOOR_READ,   // the oldest dropped at this step, or PDF or set of
+                  // images crowded out since the last: its change
 };
 
 struct Usage {
@@ -465,12 +610,6 @@ struct Extra {
     Str json;
 };
 
-// The request format an endpoint takes ([endpoint] kind).
-enum : i32 {
-    EP_OPENAI,     // Chat Completions
-    EP_ANTHROPIC,  // Messages (anthropic.cpp)
-};
-
 // How an Anthropic model is asked to think ([model] thinking).
 enum : i32 {
     THINK_ADAPTIVE,  // the model decides how much
@@ -486,6 +625,10 @@ struct ModelConf {
     Slice<Extra> extras;     // sampling parameters, only if configured
     Str          kwargs;     // chat_template_kwargs, a JSON object, empty:
                              // not sent (OpenAI-compatible only)
+    Str          effkey;     // effort on OpenAI chat (effort_as): a field,
+    Str          effjson;    // and its value, or null (cfgeffort)
+    Str          chatkw;     // kwargs for OpenAI chat, effort in them where
+                             // effort_as is template.NAME
     b32          llamacpp;   // llama.cpp extras (return_progress,
                              // reasoning_control)
     i64          ctx;        // context limit in tokens, 0 if unknown
@@ -502,6 +645,7 @@ struct ModelConf {
     b32          novision;   // the model takes no images
     i64          imgedge;    // [model] image_edge, 0 if unset
     i64          imgpixels;  // [model] image_pixels, 0 if unset
+    b32          nopdf;      // [model] pdf off: read sends no PDFs
     b32          conf;       // from a [model NAME] section of its name
 };
 
@@ -513,6 +657,7 @@ struct ChatReq {
     i64        thinkfrom;  // reasoning of messages older than this seq
                            // is not sent back (Anthropic: compaction
                            // changed what it was bound to)
+    Str        cachekey;   // the Responses API's prompt_cache_key, if any
 };
 
 // Base64 data as a JSON string, put raw (base64 needs no escapes): as
@@ -537,6 +682,55 @@ static Str imagealt(MsgImage *g)
     return g->alt.len ? g->alt : Str("[image]");
 }
 
+// An image's label as a caption begins, capitalized.
+static void putlabel(Buf *b, Str label)
+{
+    u8 c = label[0];
+    putbyte(b, c>='a' && c<='z' ? (u8)(c - 'a' + 'A') : c);
+    print(b, cuthead(label, 1));
+}
+
+// The caption before an image the user attached that has a label, an
+// attached PDF's (pdfattachimages), in a: "Image 3 (page 2) of x.pdf:".
+// Null if it has none, or is not sent.
+static Str userimagecaption(Arena *a, MsgImage *g)
+{
+    if (!g->label.len || !g->b64.len) {
+        return {};
+    }
+    Buf b(a, 8 + g->label.len);
+    putlabel(&b, g->label);
+    putbyte(&b, ':');
+    return finish(&b);
+}
+
+// The caption before the image at index i of a tool result's several,
+// in a: "Image 3 (page 2) from tool call X:", from its label, else
+// numbered by its place.
+static Str toolimagecaption(Arena *a, Msg *m, iz i)
+{
+    MsgImage *g = &m->images[i];
+    Buf b(a, 64 + g->label.len + m->callid.len);
+    if (g->label.len) {
+        putlabel(&b, g->label);
+    } else {
+        print(&b, "Image ");
+        print(&b, (i64)i+1);
+    }
+    print(&b, " from tool call ");
+    print(&b, m->callid);
+    putbyte(&b, ':');
+    return finish(&b);
+}
+
+// Whether a tool result has images for a request to carry: its
+// screenshot or image, or the text in its place, or several.
+static b32 toolimages(Msg *m)
+{
+    return m->role==ROLE_TOOL &&
+           (m->imgb64.len || m->imgalt.len || m->images.len);
+}
+
 static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
 {
     putobject(w);
@@ -558,7 +752,15 @@ static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
             putend(w);
         }
         for (iz i = 0; i < m->images.len; i++) {
-            MsgImage *g = &m->images[i];
+            MsgImage *g   = &m->images[i];
+            Arena     t   = *a;
+            Str       cap = userimagecaption(&t, g);
+            if (cap.len) {
+                putobject(w);
+                putstrkey(w, "type", "text");
+                putstrkey(w, "text", cap);
+                putend(w);
+            }
             putobject(w);
             if (g->b64.len) {
                 putstrkey(w, "type", "image_url");
@@ -638,7 +840,7 @@ static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
 {
     b32 any = 0;
     for (iz i = beg; i < end; i++) {
-        any |= h[i].imgb64.len>0 || h[i].imgalt.len>0;
+        any |= toolimages(&h[i]);
     }
     if (!any) {
         return;
@@ -648,32 +850,48 @@ static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
     putkey(w, "content");
     putarray(w);
     for (iz i = beg; i < end; i++) {
-        Msg *m = &h[i];
-        if (!m->imgb64.len) {
-            if (m->imgalt.len) {
+        Msg  *m = &h[i];
+        Arena t = tmp;
+        if (m->imgb64.len) {
+            putobject(w);
+            putstrkey(w, "type", "text");
+            Str what = m->imgread ? Str("The image read by tool call ")
+                                  : Str("The screenshot of tool call ");
+            putstrkey(w, "text", concat(&t, concat(&t, what, m->callid), ":"));
+            putend(w);
+            putobject(w);
+            putstrkey(w, "type", "image_url");
+            putkey(w, "image_url");
+            putobject(w);
+            putkey(w, "url");
+            putb64(w, t, m->imgmime.len ? m->imgmime : Str("image/png"), m->imgb64);
+            putend(w);
+            putend(w);
+        } else if (m->imgalt.len) {
+            putobject(w);
+            putstrkey(w, "type", "text");
+            putstrkey(w, "text", m->imgalt);
+            putend(w);
+        }
+        for (iz k = 0; m->role==ROLE_TOOL && k<m->images.len; k++) {
+            // Each of several, after a caption naming it
+            MsgImage *g  = &m->images[k];
+            Arena     tk = t;
+            putobject(w);
+            putstrkey(w, "type", "text");
+            putstrkey(w, "text", g->b64.len ? toolimagecaption(&tk, m, k) : imagealt(g));
+            putend(w);
+            if (g->b64.len) {
                 putobject(w);
-                putstrkey(w, "type", "text");
-                putstrkey(w, "text", m->imgalt);
+                putstrkey(w, "type", "image_url");
+                putkey(w, "image_url");
+                putobject(w);
+                putkey(w, "url");
+                putb64(w, tk, g->mime, g->b64);
+                putend(w);
                 putend(w);
             }
-            continue;
         }
-        Arena t = tmp;
-        putobject(w);
-        putstrkey(w, "type", "text");
-        Str what = m->imgread ? Str("The image read by tool call ")
-                              : Str("The screenshot of tool call ");
-        putstrkey(w, "text", concat(&t, concat(&t, what, m->callid), ":"));
-        putend(w);
-        putobject(w);
-        putstrkey(w, "type", "image_url");
-        putkey(w, "image_url");
-        putobject(w);
-        putkey(w, "url");
-        Str url = concat(&t, "\"data:image/png;base64,", m->imgb64);
-        putraw(w, concat(&t, url, "\""));  // base64 needs no escapes
-        putend(w);
-        putend(w);
     }
     putend(w);
     putend(w);
@@ -735,9 +953,13 @@ static Str encodechat(Arena *a, Arena tmp, ChatReq *r)
         putkey(&w, r->mc->extras[i].key);
         putraw(&w, r->mc->extras[i].json);
     }
-    if (r->mc->kwargs.len) {
+    if (r->mc->effkey.len) {
+        putkey(&w, r->mc->effkey);
+        putraw(&w, r->mc->effjson);
+    }
+    if (r->mc->chatkw.len) {
         putkey(&w, "chat_template_kwargs");
-        putraw(&w, r->mc->kwargs);
+        putraw(&w, r->mc->chatkw);
     }
     putend(&w);
     return finish(&b);
@@ -780,6 +1002,10 @@ struct Partial {
     i32              nblocks;
     Slice<PartCall>  calls;
     Slice<PartBlock> parts;       // blocks numbered by the server
+    Slice<Str>       items;       // the Responses API's item keys, whose
+                                  // positions number its blocks
+    Slice<Str>       itemids;     // ids of items keyed by output_index,
+    Slice<i64>       itemidat;    // and those items' numbers
     b32              indexed;     // so numbered: parts, not think and text
     Str              finish;      // finish_reason, null until one arrives
     Str              id;          // the completion's, null until one arrives
@@ -1312,17 +1538,6 @@ static Str headervalue(Str headers, Str name)
     return {};
 }
 
-// Days since 1970-01-01 of a proleptic Gregorian date.
-static i64 epochdays(i64 y, i64 m, i64 d)
-{
-    y -= m <= 2;
-    i64 era = (y >= 0 ? y : y-399) / 400;
-    i64 yoe = y - era*400;
-    i64 doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d - 1;
-    i64 doe = yoe*365 + yoe/4 - yoe/100 + doy;
-    return era*146097 + doe - 719468;
-}
-
 // "Sun, 06 Nov 1994 08:49:37 GMT" as epoch milliseconds, or -1.
 static i64 httpdate(Str s)
 {
@@ -1415,6 +1630,7 @@ struct ModelInfo {
     i64 trained;   // n_ctx_train, scaled, 0 if unknown
     i32 slots;     // --parallel, the server's total_slots, 0 if unknown
     i64 maxout;    // most output tokens in a response, 0 if unknown
+    i32 wire;      // the format it takes, EP_*: Copilot's say (cplisting)
 };
 
 static Str argvalue(Json *args, Str name)
@@ -1446,6 +1662,7 @@ static ModelInfo modelinfo(Json *m, i64 trained)
         return r;
     }
     r.found = 1;
+    r.wire  = epkindof(jsonstr(jsonget(m, "wire")));
 
     i64 maxin  = jsonint(jsonget(m, "max_input_tokens"), 0);
     i64 maxout = jsonint(jsonget(m, "max_tokens"), 0);
@@ -1511,6 +1728,80 @@ static ModelInfo parsemodels(Arena scratch, Str body, Str model, i64 trained)
         }
     }
     return modelinfo(m, trained);
+}
+
+// The format Copilot serves a model in, by its name, for a listing that
+// does not say (as an app GitHub grants only its older models gets):
+// Responses for GPT-5 on (but gpt-5-mini), Grok and MAI-Code, else Chat
+// Completions, as OpenCode guesses.
+static i32 copilotguess(Str id)
+{
+    if (startswith(id, "gpt-") && !startswith(id, "gpt-5-mini")) {
+        Str n = cuthead(id, 4);
+        iz  i = 0;
+        for (; i<n.len && digit(n[i]); i++) {}
+        // Copilot writes gpt-4.1 as gpt-41: a 4x is a gpt-4
+        Int v = parseint(takehead(n, i));
+        if (v.ok && v.val>=5 && !(i==2 && n[0]=='4')) {
+            return EP_RESPONSES;
+        }
+    }
+    return startswith(id, "grok-") || startswith(id, "mai-code-") ? EP_RESPONSES
+                                                                    : EP_OPENAI;
+}
+
+// Copilot's model listing as parsemodels reads one: each model's prompt
+// and output limits (max_input_tokens, max_tokens), and the format it
+// takes (wire): Messages if it lists /v1/messages, else Responses if
+// /responses, else Chat Completions, or by its name (copilotguess) if
+// it lists none. Models its policy turned off are left out. The result
+// is in a, temporaries in tmp; the body as it was if it is no listing.
+static Str cplisting(Arena *a, Arena tmp, Str body)
+{
+    Json *d = jsonget(jsonparse(&tmp, body).root, "data");
+    if (d->type != JSON_ARRAY) {
+        return body;
+    }
+    Buf     b(a, 256 + body.len/4);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "object", "list");
+    putkey(&w, "data");
+    putarray(&w);
+    for (Json *m = d->child; m; m = m->next) {
+        Str id = jsonstr(jsonget(m, "id"));
+        if (!id.len || jsonstr(jsonget(jsonget(m, "policy"), "state"))=="disabled") {
+            continue;
+        }
+        Json *lim  = jsonget(jsonget(m, "capabilities"), "limits");
+        i64   in   = jsonint(jsonget(lim, "max_prompt_tokens"), 0);
+        in = in>0 ? in : jsonint(jsonget(lim, "max_context_window_tokens"), 0);
+        i64   out  = jsonint(jsonget(lim, "max_output_tokens"), 0);
+        b32   msgs = 0, rs = 0, chat = 0;
+        Json *eps  = jsonget(m, "supported_endpoints");
+        for (Json *k = eps->child; k; k = k->next) {
+            Str p = jsonstr(k);
+            msgs |= p=="/v1/messages";
+            rs   |= p=="/responses";
+            chat |= p=="/chat/completions";
+        }
+        i32 wire = msgs ? EP_ANTHROPIC : rs ? EP_RESPONSES : chat ? EP_OPENAI
+                                                                  : copilotguess(id);
+        putobject(&w);
+        putstrkey(&w, "id", id);
+        putstrkey(&w, "object", "model");
+        if (in > 0) {
+            putintkey(&w, "max_input_tokens", in);
+        }
+        if (out > 0) {
+            putintkey(&w, "max_tokens", out);
+        }
+        putstrkey(&w, "wire", epkindname(wire));
+        putend(&w);
+    }
+    putend(&w);
+    putend(&w);
+    return finish(&b);
 }
 
 

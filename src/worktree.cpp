@@ -1224,9 +1224,11 @@ static b32 wtgate(Session *s, Arena scratch, b32 turn)
     }
     Str err = wtask(s, scratch);
     if (err.len && turn) {
-        endturn(s, scratch, "error", concat(&scratch, "the worktree cannot be made: ", err));
+        Str msg = concat(&scratch, "the worktree cannot be made: ", err);
+        endturn(s, scratch, "error", msg);
     } else if (err.len) {
-        note(s, scratch, "warn", concat(&scratch, "the worktree cannot be made: ", err));
+        Str msg = concat(&scratch, "the worktree cannot be made: ", err);
+        note(s, scratch, "warn", msg);
     } else if (turn) {
         setstate(s, S_WORKTREE);
     }
@@ -1278,7 +1280,8 @@ static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
             turnready(s, a);  // through the gate again, as it may be gone
         } else {
             setstate(s, S_IDLE);
-            endturn(s, a, "error", concat(&a, "the worktree cannot be made: ", err));
+            Str why = concat(&a, "the worktree cannot be made: ", err);
+            endturn(s, a, "error", why);
         }
     }
 }

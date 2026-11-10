@@ -80,6 +80,12 @@ extern "C" long long w32gui_refresh(void *);
 extern "C" void      w32gui_raise(void *);
 extern "C" void      w32gui_flash(void *, int how);  // FLASH_*
 extern "C" int       w32gui_focused(void *);
+// A key's character under the window's keyboard layout, from its virtual
+// key or scan code (the other 0), with Shift, AltGr, both or neither;
+// a dead key's own character; 0 for none
+extern "C" unsigned  w32gui_keycp(void *, int vk, int scan, int shift, int altgr);
+extern "C" int       w32gui_altgr(void);       // AltGr held: Right Alt with Ctrl
+extern "C" void      w32gui_imereset(void *);  // drops a dead key or composition
 // A notification, as the tray icon's balloon (a toast since Windows 10),
 // replacing any other; 0 if none can show. Its click comes as toasted.
 extern "C" int       w32gui_toast(void *, int id, unsigned short const *title,
@@ -351,6 +357,8 @@ struct W32Gui {
     ID3D11DeviceContext    *context;
     IDXGISwapChain         *swapchain;
     ID3D11RenderTargetView *rtv;
+    int                     warp;        // the hardware device failed: WARP
+    int                     presented;   // this device has shown a frame
     LONG                    wakeflag;    // a wake message is queued
     int                     occluded;
     int                     inmodal;     // inside a move, size or menu loop
@@ -387,15 +395,18 @@ static int systemdark(W32Gui *w)
     return r==ERROR_SUCCESS && v==0;
 }
 
-static void makertv(W32Gui *w)
+static int makertv(W32Gui *w)
 {
     ID3D11Texture2D *back = 0;
-    w->swapchain->GetBuffer(0, IID_PPV_ARGS(&back));
-    if (back) {
-        w->device->CreateRenderTargetView(back, 0, &w->rtv);
-        back->Release();
+    if (FAILED(w->swapchain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
+        return 0;
     }
+    HRESULT r = w->device->CreateRenderTargetView(back, 0, &w->rtv);
+    back->Release();
+    return SUCCEEDED(r);
 }
+
+static void resetdevice(W32Gui *w);
 
 static void resize(W32Gui *w, int width, int height)
 {
@@ -409,10 +420,13 @@ static void resize(W32Gui *w, int width, int height)
         w->rtv->Release();
         w->rtv = 0;
     }
-    w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height, DXGI_FORMAT_UNKNOWN, 0);
-    makertv(w);
     w->width  = width;
     w->height = height;
+    HRESULT r = w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
+                                            DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(r) || !makertv(w)) {
+        resetdevice(w);
+    }
 }
 
 static int inputkind(UINT msg)
@@ -709,6 +723,69 @@ static int makedevice(W32Gui *w, D3D_DRIVER_TYPE type)
     return r == S_OK;
 }
 
+static void dropdevice(W32Gui *w)
+{
+    if (w->rtv)       w->rtv->Release();
+    if (w->swapchain) w->swapchain->Release();
+    if (w->context)   w->context->Release();
+    if (w->device)    w->device->Release();
+    w->rtv       = 0;
+    w->swapchain = 0;
+    w->context   = 0;
+    w->device    = 0;
+}
+
+// The device, swap chain and render target: hardware, else WARP, as a
+// VM or a remote session may have no GPU.
+static int makedevices(W32Gui *w)
+{
+    int ok = 0;
+    if (!w->warp) {
+        ok = makedevice(w, D3D_DRIVER_TYPE_HARDWARE) && makertv(w);
+        if (!ok) {
+            dropdevice(w);
+            w->warp = 1;
+        }
+    }
+    if (!ok) {
+        ok = makedevice(w, D3D_DRIVER_TYPE_WARP) && makertv(w);
+        if (!ok) {
+            dropdevice(w);
+            return 0;
+        }
+    }
+    IDXGIFactory *factory = 0;
+    if (SUCCEEDED(w->swapchain->GetParent(IID_PPV_ARGS(&factory)))) {
+        factory->MakeWindowAssociation(w->hwnd, DXGI_MWA_NO_ALT_ENTER);
+        factory->Release();
+    }
+    w->presented = 0;
+    return 1;
+}
+
+// A new device for one removed or reset. Some drivers (VirtualBox's on
+// Windows 7) make a hardware device whose first Present already fails,
+// so one lost before it ever showed a frame gives way to WARP for good.
+// The DX11 backend's shutdown destroys every viewport's platform data,
+// the main window's too, so both backends go round.
+static void resetdevice(W32Gui *w)
+{
+    if (!w->presented) {
+        w->warp = 1;
+    }
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    dropdevice(w);
+    if (!makedevices(w)) {
+        MessageBoxW(w->hwnd, L"Could not create a Direct3D 11 device.",
+                    L"Prospero", MB_ICONERROR);
+        ExitProcess(2);
+    }
+    ImGui_ImplWin32_Init(w->hwnd);
+    ImGui_ImplDX11_Init(w->device, w->context);
+    w->hooks.force(w->hooks.gui);
+}
+
 static int makewindow(W32Gui *w, unsigned short const *title, int const *geom);
 
 extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
@@ -801,19 +878,11 @@ static int makewindow(W32Gui *w, unsigned short const *title, int const *geom)
     DragAcceptFiles(w->hwnd, TRUE);
     float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(w->hwnd);
 
-    // Hardware, else WARP: a VM or a remote session may have no GPU.
-    if (!makedevice(w, D3D_DRIVER_TYPE_HARDWARE) &&
-            !makedevice(w, D3D_DRIVER_TYPE_WARP)) {
+    if (!makedevices(w)) {
         DestroyWindow(w->hwnd);
         w->hwnd = 0;
         return 0;
     }
-    IDXGIFactory *factory = 0;
-    if (SUCCEEDED(w->swapchain->GetParent(IID_PPV_ARGS(&factory)))) {
-        factory->MakeWindowAssociation(w->hwnd, DXGI_MWA_NO_ALT_ENTER);
-        factory->Release();
-    }
-    makertv(w);
     RECT cr;
     GetClientRect(w->hwnd, &cr);
     w->width  = cr.right;
@@ -839,14 +908,7 @@ extern "C" void w32gui_shed(void *p)
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
-    if (w->rtv)       w->rtv->Release();
-    if (w->swapchain) w->swapchain->Release();
-    if (w->context)   w->context->Release();
-    if (w->device)    w->device->Release();
-    w->rtv       = 0;
-    w->swapchain = 0;
-    w->context   = 0;
-    w->device    = 0;
+    dropdevice(w);
     DestroyWindow(w->hwnd);
     w->hwnd     = 0;
     w->occluded = 0;
@@ -1113,6 +1175,10 @@ extern "C" void w32gui_present(void *p, int present, unsigned clear)
         // Nothing shows: rest until painted or activated again.
         w->occluded = 1;
         w->hooks.minimized(w->hooks.gui, 1);
+    } else if (FAILED(r)) {
+        resetdevice(w);
+    } else {
+        w->presented = 1;
     }
 }
 
@@ -1189,7 +1255,8 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         static WORD const vks[] = {
             VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
             VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0', 'F', 'G', 'T',
-            'R', VK_UP, VK_DOWN, 'V', 'B', '2', VK_OEM_COMMA,
+            'R', VK_UP, VK_DOWN, 'V', 'B', '2', VK_OEM_COMMA, 'S', VK_OEM_3,
+            VK_BACK, VK_LEFT, 'D', 'K',
         };
         BYTE state[256];
         GetKeyboardState(state);
@@ -1300,6 +1367,67 @@ extern "C" void w32gui_flash(void *p, int how)
 }
 
 // The foreground window is ours, and not minimized.
+extern "C" unsigned w32gui_keycp(void *p, int vk, int scan, int shift, int altgr)
+{
+    W32Gui *w  = (W32Gui *)p;
+    HKL     kl = GetKeyboardLayout(w && w->hwnd ? GetWindowThreadProcessId(w->hwnd, 0) : 0);
+    vk   = vk   ? vk   : (int)MapVirtualKeyExW((UINT)scan, MAPVK_VSC_TO_VK, kl);
+    scan = scan ? scan : (int)MapVirtualKeyExW((UINT)vk, MAPVK_VK_TO_VSC, kl);
+    if (!vk || !scan) {
+        return 0;
+    }
+    BYTE state[256] = {};
+    if (shift) {
+        state[VK_SHIFT] = state[VK_LSHIFT] = 0x80;
+    }
+    if (altgr) {
+        state[VK_CONTROL] = state[VK_LCONTROL] = 0x80;
+        state[VK_MENU]    = state[VK_RMENU]    = 0x80;
+    }
+    // Flag 4 leaves the keyboard's state, a pending dead key, untouched
+    // (Windows 10 1607 and later)
+    WCHAR    buf[8] = {};
+    int      n      = ToUnicodeEx((UINT)vk, (UINT)scan, state, buf, 8, 4, kl);
+    unsigned c      = buf[0];
+    if (n==2 && c>=0xd800 && c<=0xdbff && buf[1]>=0xdc00 && buf[1]<=0xdfff) {
+        c = 0x10000 + ((c - 0xd800)<<10) + (buf[1] - 0xdc00u);
+    } else if (n == 2) {
+        // A dead key left pending, as the chord's own translation leaves
+        // a dead key's: it comes out first, the key's character last.
+        c = buf[1];
+    }
+    if ((n!=1 && n!=-1 && n!=2) || (c>=0xd800 && c<=0xdfff)) {
+        return 0;
+    }
+    return c>=0x20 && c!=0x7f ? c : 0;
+}
+
+extern "C" int w32gui_altgr(void)
+{
+    return GetKeyState(VK_RMENU)<0 && GetKeyState(VK_LCONTROL)<0;
+}
+
+// A pending dead key goes with a key it can't combine with, the decimal
+// point, typed into the state until nothing is left pending; then any
+// input method composition is cancelled.
+extern "C" void w32gui_imereset(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (!w || !w->hwnd) {
+        return;
+    }
+    HKL   kl    = GetKeyboardLayout(GetWindowThreadProcessId(w->hwnd, 0));
+    UINT  scan  = MapVirtualKeyExW(VK_DECIMAL, MAPVK_VK_TO_VSC, kl);
+    BYTE  state[256] = {};
+    WCHAR buf[8];
+    for (int i = 0; i<4 && ToUnicodeEx(VK_DECIMAL, scan, state, buf, 8, 0, kl)<0; i++) {}
+    HIMC imc = ImmGetContext(w->hwnd);
+    if (imc) {
+        ImmNotifyIME(imc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+        ImmReleaseContext(w->hwnd, imc);
+    }
+}
+
 extern "C" int w32gui_focused(void *p)
 {
     W32Gui *w  = (W32Gui *)p;
@@ -1916,6 +2044,52 @@ static void os_guiflash(Os *os, i32 how)
 static b32 os_guifocused(Os *os)
 {
     return os->gui && w32gui_focused(os->gui);
+}
+
+// A text key's character under the layout. ImGui's backend names letter
+// and digit keys, Space, Comma and Period by their virtual keys, which
+// follow the layout, and the others by position (scan code), so these do
+// too: on AZERTY, VK_OEM_COMMA is the , key at scan 0x32.
+static u32 os_guikeycp(Os *os, i32 key, b32 shift)
+{
+    i32 vk   = 0;
+    i32 scan = 0;
+    if (key>=ImGuiKey_A && key<=ImGuiKey_Z) {
+        vk = 'A' + (key - ImGuiKey_A);
+    } else if (key>=ImGuiKey_0 && key<=ImGuiKey_9) {
+        vk = '0' + (key - ImGuiKey_0);
+    } else {
+        switch (key) {
+        case ImGuiKey_Minus:        scan = 0x0c; break;
+        case ImGuiKey_Equal:        scan = 0x0d; break;
+        case ImGuiKey_LeftBracket:  scan = 0x1a; break;
+        case ImGuiKey_RightBracket: scan = 0x1b; break;
+        case ImGuiKey_Semicolon:    scan = 0x27; break;
+        case ImGuiKey_Apostrophe:   scan = 0x28; break;
+        case ImGuiKey_GraveAccent:  scan = 0x29; break;
+        case ImGuiKey_Backslash:    scan = 0x2b; break;
+        case ImGuiKey_Comma:        vk   = 0xbc; break;  // VK_OEM_COMMA
+        case ImGuiKey_Period:       vk   = 0xbe; break;  // VK_OEM_PERIOD
+        case ImGuiKey_Slash:        scan = 0x35; break;
+        case ImGuiKey_Space:        vk   = 0x20; break;  // VK_SPACE
+        case ImGuiKey_Oem102:       scan = 0x56; break;
+        default:                    return 0;
+        }
+    }
+    return os->gui ? w32gui_keycp(os->gui, vk, scan, shift, w32gui_altgr()) : 0;
+}
+
+static void os_guiimereset(Os *os)
+{
+    if (os->gui) {
+        w32gui_imereset(os->gui);
+    }
+}
+
+// AltGr is Right Alt with a Ctrl that Windows adds, so ImGui sees Ctrl+Alt
+static b32 os_guialtgr(Os *)
+{
+    return w32gui_altgr();
 }
 
 static Str os_guitoastprep(Os *, Arena *)

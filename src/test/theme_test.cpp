@@ -75,7 +75,8 @@ static void test_theme(Test *t)
         P(text, rowpress), P(dim, rowpress), P(ok, rowpress),
         P(bad, rowpress), P(amber, rowpress), P(active, rowpress),
         P(paneltext, rowhover), P(paneltext, btn), P(paneltext, btnhover),
-        P(paneltext, btnpress), P(paneltext, title),
+        P(paneltext, btnpress), P(paneltext, btnon), P(paneltext, btnonhover),
+        P(paneldim, rowhover), P(termfg, termbg), P(paneltext, title),
         #undef P
     };
     struct { Palette *pal; Str name; } pals[] = {
@@ -99,6 +100,35 @@ static void test_theme(Test *t)
                 print(&b, "AA");
             }
             expect(t, concat(&a, name, pairs[i].name), finish(&b), "AA");
+        }
+        // A toggle that is on stands out from one that is off (no fill, on
+        // panel), from a plain button, and from one off under the mouse
+        {
+            u32 offs[] = {pal->panel, pal->btn, pal->rowhover};
+            for (iz i = 0; i < countof(offs); i++) {
+                f64 r1 = contrast(pal->btnon, offs[i]);
+                f64 r2 = contrast(pal->btnonhover, offs[i]);
+                f64 r  = r1<r2 ? r1 : r2;
+                Buf b(&a, 16);
+                if (r < 1.5) {
+                    printfloat(&b, r, 2);
+                } else {
+                    print(&b, "apart");
+                }
+                expect(t, concat(&a, concat(&a, name, "btnon against "), istr(&a, i)),
+                       finish(&b), "apart");
+            }
+        }
+        // A terminal's selection stands out from its background
+        {
+            f64 r = contrast(pal->sel, pal->termbg);
+            Buf b(&a, 16);
+            if (r < 1.5) {
+                printfloat(&b, r, 2);
+            } else {
+                print(&b, "apart");
+            }
+            expect(t, concat(&a, name, "sel against termbg"), finish(&b), "apart");
         }
         for (i32 i = HL_PLAIN+1; i < HL_COUNT; i++) {
             f64 r = contrast(pal->hl[i], pal->codebg);

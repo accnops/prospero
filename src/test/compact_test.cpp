@@ -131,7 +131,7 @@ static void test_compact(Test *t)
         ModelConf mc = {};
         mc.name     = "m";
         mc.llamacpp = 1;
-        Str     body = encodesummary(a, tmp, &mc, "old", "[user]\nhi\n\n", 300, {});
+        Str     body = encodesummary(a, tmp, &mc, "old", "[user]\nhi\n\n", 300, {}, 0);
         JsonDoc d    = jsonparse(a, body);
         expect(t, "summary request parses", istr(a, d.ok), "1");
         expect(t, "summary no tools",
@@ -146,18 +146,57 @@ static void test_compact(Test *t)
         expect(t, "summary previous",
                istr(a, find(user, "<previous-summary>\nold\n</previous-summary>") > 0), "1");
         expect(t, "summary conversation",
-               istr(a, endswith(user, "<conversation>\n[user]\nhi\n\n</conversation>\n")), "1");
+               istr(a, find(user, "<conversation>\n[user]\nhi\n\n</conversation>\n") > 0), "1");
+        // and the task again after it, last, where a long conversation
+        // can't bury it
+        expect(t, "summary restated",
+               istr(a, endswith(user, "</conversation>\n\nWrite the summary of "
+                    "the conversation above now, in the sections given before "
+                    "it, under 300 words.\n")), "1");
         expect(t, "summary llama.cpp", istr(a, find(body, "\"reasoning_control\":true") > 0), "1");
         expect(t, "summary no focus", istr(a, find(user, "<focus>")), "-1");
 
         // A focus from the user: a paragraph before the conversation
-        Str focused = summaryprompt(a, {}, "[user]\nhi\n\n", 300, "the parser's API");
+        Str focused = summaryprompt(a, {}, "[user]\nhi\n\n", 300, "the parser's API", 0);
         iz  at      = find(focused, "<focus>\nthe parser's API\n</focus>\n");
         expect(t, "summary focus", istr(a, at>0 && at<find(focused, "<conversation>")), "1");
         expect(t, "summary focus asks", istr(a, find(focused, "more detail about") > 0), "1");
-        Str an = ansummary(a, tmp, &mc, {}, "[user]\nhi\n\n", 300, "the parser's API");
+        // and again after it, last, where a long conversation can't bury it
+        expect(t, "summary focus restated",
+               istr(a, endswith(focused, "</conversation>\n\nWrite the summary of "
+                    "the conversation above now, in the sections given before "
+                    "it, under 300 words, keeping more detail about the user's "
+                    "focus:\n\n<focus>\nthe parser's API\n</focus>\n")), "1");
+        Str an = ansummary(a, tmp, &mc, {}, "[user]\nhi\n\n", 300, "the parser's API", 0);
         expect(t, "summary focus anthropic", istr(a, find(an, "\\u003cfocus>") > 0 ||
                find(an, "<focus>") > 0), "1");
+
+        // Asked again after a summary too long: its size, before the task
+        Str again = summaryprompt(a, {}, "[user]\nhi\n\n", 200, {}, 16843);
+        expect(t, "summary again",
+               istr(a, endswith(again, "</conversation>\n\nYour last summary of "
+                    "it was about 16843 tokens, over the 16384 a summary may "
+                    "have, so it was not used. Write a shorter one: keep the "
+                    "sections, and leave out what the agent does not need, "
+                    "such as copies of messages.\n\nWrite the summary of the "
+                    "conversation above now, in the sections given before it, "
+                    "under 200 words.\n")), "1");
+        expect(t, "summary not again", istr(a, find(focused, "Your last summary")), "-1");
+    }
+
+    // A summary has its Goal section, or the summarizer wrote something
+    // else, as a copy of the conversation (issue #17)
+    {
+        expect(t, "hasgoal", istr(a, hasgoal("## Goal\nG\n\n## Next steps\nN")), "1");
+        expect(t, "hasgoal after a preamble",
+               istr(a, hasgoal("Here it is.\n\n# Goals\nG")), "1");
+        expect(t, "hasgoal bold", istr(a, hasgoal("**Goal:** G")), "1");
+        expect(t, "hasgoal any case", istr(a, hasgoal("  ### GOAL\nG")), "1");
+        expect(t, "hasgoal none",
+               istr(a, hasgoal("user: hi\n\nuser: my goal is x\n\nassistant: ok")), "0");
+        expect(t, "hasgoal not a heading", istr(a, hasgoal("Goal: G")), "0");
+        expect(t, "hasgoal short heading", istr(a, hasgoal("##\n# Go\n**")), "0");
+        expect(t, "hasgoal empty", istr(a, hasgoal("")), "0");
     }
 
     // A compaction asked for: the tokens it would summarize, all but the

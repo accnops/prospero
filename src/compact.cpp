@@ -9,13 +9,19 @@
 // 1. Prune: tool results past the newest 40k tokens of tool output are
 //    replaced by a line saying where the full output is, if that saves
 //    20k tokens or more, but never a result under 50 tokens. No model
-//    is involved, and often this is enough.
+//    is involved. It is enough only if it leaves the prompt at 70% of
+//    the threshold or less (COMPACT_PRUNETO): a prune that leaves less
+//    room is followed by a summary, else a long turn whose context is
+//    mostly reasoning and calls' arguments, which pruning cannot touch,
+//    prunes a little less each time and never summarizes.
 // 2. Summarize: the older messages go to the compactor, a model asked
 //    for text only, which writes a summary in fixed sections; a later
 //    compaction updates the previous summary. The newest 20k tokens
 //    stay verbatim, cut at a message that is not a tool result, so that
-//    a call keeps its result. The summary, capped at 16384 tokens, ends
-//    with the files the calls read and wrote, kept by the harness.
+//    a call keeps its result. The summary ends with the files the calls
+//    read and wrote, kept by the harness. One over 16384 tokens, or
+//    without its Goal section, fails the compaction: cut short, it would
+//    lose its last sections, and the history it stands for with them.
 //
 // The transcript then becomes [system][a checkpoint user message with
 // the summary][the messages kept]. This is the one deliberate break of
@@ -30,6 +36,8 @@ enum : i64 {
     COMPACT_PROTECT  = 40000,     // newest tool output never pruned
     COMPACT_MINSAVE  = 20000,     // tokens a prune must save
     COMPACT_MINPRUNE = 50,        // smaller results are never pruned
+    COMPACT_PRUNETO  = 70,        // percent of the threshold a prune must
+                                  // reach to be enough
     COMPACT_SUMMAX   = 16384,     // tokens of a summary, at most
     COMPACT_FILES    = 40,        // files listed of each kind
     COMPACT_TOOLIN   = 3 << 10,   // bytes of a tool result summarized
@@ -77,6 +85,9 @@ static i64 msgbytes(Msg *m)
         MsgFile *f = &m->files[i];
         n += 128 + (f->bytes<READ_BYTES ? f->bytes : (i64)READ_BYTES) +
              8*(f->lines<READ_LINES ? f->lines : (i64)READ_LINES);
+    }
+    for (iz i = 0; i < m->sessions.len; i++) {
+        n += 128 + m->sessions[i].title.len;  // its line (sessrefstext)
     }
     return n;
 }
@@ -302,8 +313,10 @@ static Str const compactsections =
 
 // The summarizer's prompt: the previous summary to update (if any),
 // then the conversation (transcript). A focus, from a user asking for
-// the compaction, is what to keep in more detail.
-static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus)
+// the compaction, is what to keep in more detail. over is the size in
+// tokens of the summary before, which was too long, 0 if none.
+static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus,
+                         i64 over)
 {
     Buf u(a, convo.len + prev.len + focus.len + 4096);
     print(&u, "Summarize the conversation below for the agent that will "
@@ -335,14 +348,61 @@ static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus)
     print(&u, "\n<conversation>\n");
     print(&u, convo);
     print(&u, "</conversation>\n");
+    // Restated last: after a long conversation, what came first is what
+    // a model most easily loses, and it may copy the conversation out
+    if (over) {
+        print(&u, "\nYour last summary of it was about ");
+        print(&u, over);
+        print(&u, " tokens, over the ");
+        print(&u, (i64)COMPACT_SUMMAX);
+        print(&u, " a summary may have, so it was not used. Write a shorter "
+                  "one: keep the sections, and leave out what the agent does "
+                  "not need, such as copies of messages.\n");
+    }
+    print(&u, "\nWrite the summary of the conversation above now, in the "
+              "sections given before it, under ");
+    print(&u, words);
+    print(&u, " words");
+    if (focus.len) {
+        print(&u, ", keeping more detail about the user's focus:\n\n"
+                  "<focus>\n");
+        print(&u, focus);
+        print(&u, "\n</focus>\n");
+    } else {
+        print(&u, ".\n");
+    }
     return finish(&u);
+}
+
+// Whether a summary has its Goal section, the first of those asked for:
+// a heading of "#"s, or a line in bold, that begins with "Goal". Its
+// absence means the summarizer wrote something else, as when it copies
+// the conversation out instead.
+static b32 hasgoal(Str summary)
+{
+    for (Str rest = summary; rest.len;) {
+        Cut c    = cut(rest, '\n');
+        Str line = trim(c.head);
+        rest = c.tail;
+        iz  n    = 0;
+        if (startswith(line, "**")) {
+            n = 2;
+        } else {
+            while (n<line.len && line[n]=='#') n++;
+        }
+        Str name = trim(cuthead(line, n));
+        if (n && name.len>=4 && equalfold(takehead(name, 4), "goal")) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // The summarizer's request: no tools offered, text only.
 static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                         Str convo, i64 words, Str focus)
+                         Str convo, i64 words, Str focus, i64 over)
 {
-    Str     u = summaryprompt(&scratch, prev, convo, words, focus);
+    Str     u = summaryprompt(&scratch, prev, convo, words, focus, over);
     Buf     b(a, u.len + 1024);
     JsonOut w = {&b};
     putobject(&w);
@@ -380,9 +440,13 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
         putkey(&w, mc->extras[i].key);
         putraw(&w, mc->extras[i].json);
     }
-    if (mc->kwargs.len) {
+    if (mc->effkey.len) {
+        putkey(&w, mc->effkey);
+        putraw(&w, mc->effjson);
+    }
+    if (mc->chatkw.len) {
         putkey(&w, "chat_template_kwargs");
-        putraw(&w, mc->kwargs);
+        putraw(&w, mc->chatkw);
     }
     putend(&w);
     return finish(&b);
@@ -390,16 +454,31 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
 
 // The same request for Anthropic's Messages API (anthropic.cpp).
 static Str ansummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                     Str convo, i64 words, Str focus)
+                     Str convo, i64 words, Str focus, i64 over)
 {
     Msg m = {};
     m.role = ROLE_USER;
-    m.text = summaryprompt(&scratch, prev, convo, words, focus);
+    m.text = summaryprompt(&scratch, prev, convo, words, focus, over);
     ChatReq r = {};
     r.mc      = mc;
     r.system  = compactsystem;
     r.history = {&m, 1, 1};
     return anencode(a, scratch, &r);
+}
+
+// The same request for the Responses API (responses.cpp), for ChatGPT's
+// backend if codex.
+static Str rssummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
+                     Str convo, i64 words, Str focus, i64 over, b32 codex)
+{
+    Msg m = {};
+    m.role = ROLE_USER;
+    m.text = summaryprompt(&scratch, prev, convo, words, focus, over);
+    ChatReq r = {};
+    r.mc      = mc;
+    r.system  = compactsystem;
+    r.history = {&m, 1, 1};
+    return rsencode(a, scratch, &r, codex);
 }
 
 // The user message that stands for the compacted messages.

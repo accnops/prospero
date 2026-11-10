@@ -72,7 +72,18 @@ a file changed and one new: the session bar shows the branch, cut in
 its middle, and a click on it the Changes pane, which lists both, with
 no frames while idle; a file
 made while the window is away shows once it is back, and another
-click hides the pane. Without git it is skipped.
+click hides the pane. Without git it is skipped. The terminal mode's
+shell is bash without rc files where there is one (dash, Ubuntu's sh,
+edits no lines), else sh, and on Windows busybox's sh: Ctrl+` opens the Terminal pane, then a probe
+echo, a cat -v key round trip, a resize, less and vim, no frames once
+output stops, a forced 300x80 grid past 64K vertices (an imgui
+assertion fails the run), the shell's exit, and a quit that hangs up
+the next shell, which a HUP trap writes down (on Windows, which busybox's
+sh traps no hang-up in, its pid is gone). Before that it connects a
+remote host "r" over ssh to this computer (as hosttask does) and opens
+a tab for a session there: its shell runs in the remote's folder, goes
+busy and idle, says Reconnecting while the link is dropped and shows
+what it printed meanwhile once it's back, and quitting hangs it up too.
 
 Every checklist starts as a first run, its state directory fresh: the
 window at its first size, and Help in front, then View → Layout → Standard. The
@@ -485,7 +496,11 @@ class Local:
 
     def __init__(self, args):
         self.args = args
-        self.root = tempfile.mkdtemp(prefix="prospero-gui-")
+        # Resolved, as macOS's /var is a link to /private/var: the session's
+        # folder is the real path, so the paths dropped and attached must
+        # be too, as a user's are, or a check comparing them passes by
+        # missing (a mention's attachments once dropped every attachment)
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="prospero-gui-"))
         self.prospero = os.path.abspath(args.prospero)
         # The system's temporary directory for what this starts, as the
         # sessions' scratch directories go there
@@ -1076,6 +1091,15 @@ def barelaunch(host):
     return problems, lines
 
 
+def hungupfile(host, trapfile, pidfile):
+    """Whether a terminal's shell was hung up: its HUP trap's file, or on
+    Windows, where busybox's sh runs no trap for it, its pid gone."""
+    if os.name != "nt":
+        return bool(host.read(host.path("work", trapfile)))
+    found = P.parse(host.read(host.path("work", pidfile)) or "")
+    return bool(found) and not alive(found[0])
+
+
 def background(args, host, guiargs, guicwd):
     """--mode background: the first window keeps its turn running in the
     background and goes, its process keeping the state directory's
@@ -1138,6 +1162,11 @@ def background(args, host, guiargs, guicwd):
             problems.append("the turn did not end in the background")
         else:
             print("the turn ended in the background", flush=True)
+        # The window's terminal tab went with it, its shell hung up
+        if not waitfor(lambda: hungupfile(host, "hup-bg.txt", "bg.pid"), 5, 0.1):
+            problems.append("going to the background did not hang up the terminal's shell")
+        else:
+            print("going to the background hung up the terminal's shell", flush=True)
         # Launched again: the shed window comes back, and this one goes
         status, lines = host.run(guiargs, 60, guicwd, tag="[2] ")
         problems += handoffproblems(status, lines, "the second launch")
@@ -1436,7 +1465,7 @@ class Far:
     host started here for the test. Either way, in directories of its own
     that go at the end."""
 
-    def __init__(self, args, host, url, model, nonce, ask=3, thin=False):
+    def __init__(self, args, host, url, model, nonce, ask=3, thin=False, extra=""):
         self.args = args
         self.host = host
         self.local = not args.ssh
@@ -1457,6 +1486,7 @@ class Far:
                                    f"[model fake:far:{nonce}]\ncontext = 100000\n"
         if thin:
             cfg = "# No endpoint: a thin host\n[host]\nidle_exit = 5\n"
+        cfg += extra
         if self.local:
             host.mkdir(self.work)
             host.mkdir(self.state)
@@ -1533,7 +1563,7 @@ class Far:
     def env(self):
         if not self.local:
             return {}
-        elif self.args.mode in ("hosttask", "thin"):
+        elif self.args.mode in ("hosttask", "thin", "terminal"):
             return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
         elif self.windows:
             return {"PROSPERO_TEST_SSH": self.ssh}
@@ -1699,7 +1729,8 @@ def main():
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
                              "compose", "sessions", "plan", "launch", "firstrun",
-                             "mcp", "hosttask", "changes", "thin", "containers"])
+                             "mcp", "hosttask", "changes", "thin", "containers",
+                             "terminal"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1786,6 +1817,8 @@ def main():
         host.mkdir(host.path("work", ".claude", "skills", "zzcheck"))
         host.write(host.path("work", ".claude", "skills", "zzcheck", "SKILL.md"),
                    "---\ndescription: A skill of the checklist's\n---\nCheck.\n")
+        # A binary file for a mention whose contents cannot come
+        host.write(host.path("work", "zbinary.dat"), "\x7fELF\x00\x01binary\n")
         before = config(curl, model, extra=composeconfig(editor, nonce))
     elif args.mode == "plan":
         # The agent plans (fake_provider's sc_plan); a model to switch to
@@ -1816,8 +1849,16 @@ def main():
         with fake_provider.STATE.lock:
             fake_provider.STATE.served[f"{nonce}-team.ini"] = (
                 f"[mcp web]\nurl = http://127.0.0.1:{mcpport}/mcp\n")
+        # And an endpoint of kind chatgpt, signed in to at the fake's
+        # issuer, which the window's stand-in browser visits too
+        os.environ["PROSPERO_TEST_CHATGPT_AUTH"] = f"{curl}/chatgpt"
+        # And one of kind copilot, signed in to at the fake's GitHub
+        os.environ["PROSPERO_TEST_COPILOT_AUTH"] = f"{curl}/copilot-gh"
         before = (f"include = {curl}/fake/serve/{nonce}-team.ini\n" +
-                  config(curl, model, 60, "\n[mcp web]\ntrust = yes\n"))
+                  config(curl, model, 60, "\n[mcp web]\ntrust = yes\n"
+                         f"\n[endpoint gpt]\nkind = chatgpt\n"
+                         f"url = {curl}/chatgpt/backend-api/codex/responses\n"
+                         f"\n[endpoint cop]\nkind = copilot\nurl = {curl}/copilot\n"))
     elif args.mode == "sessions":
         # A model and a shell to switch to; a remote listed always,
         # never reached, and one listed only while connected
@@ -1847,6 +1888,17 @@ def main():
     elif args.mode == "changes":
         gitrepo(work)
         before = config(curl, model)
+    elif args.mode in ("terminal", "background"):
+        # bash without the user's rc files, for its line editing (Ubuntu's
+        # /bin/sh, dash, has none), with a known prompt; else a plain sh
+        shell = "/bin/bash --norc --noprofile" if os.path.exists("/bin/bash") else "/bin/sh"
+        if os.name == "nt":
+            # busybox's sh from w64devkit, with its vim, less, seq and tr
+            shell = shword(shutil.which("sh").replace("\\", "/"))
+        termcfg = f"\n[terminal]\nshell = {shell}\nscrollback = 100\n"
+        before = config(curl, model) + termcfg
+        os.environ["PS1"] = "tty$ "
+        os.environ["HISTFILE"] = ""  # not the user's history
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         if not args.host:
@@ -1874,6 +1926,11 @@ def main():
         far = Far(args, host, curl, model, nonce, ask=60)
         before += far.hostsection()
         os.environ["HOSTTASK_WORK"] = far.work
+    elif args.mode == "terminal":
+        # r, a host here through the fake ssh, started with this
+        # environment (PS1), runs the same shell for its sessions' tabs
+        far = Far(args, host, curl, model, nonce, extra=termcfg)
+        before += far.hostsection().replace("[remote far]", "[remote r]")
     elif args.mode == "thin":
         # r has no endpoint: it runs on this window's models
         far = Far(args, host, curl, model, nonce, thin=True)
@@ -1892,6 +1949,8 @@ def main():
     if args.mode == "drive" and not args.fake:
         holder = host.sessions(ini, state, work)
     if args.mode == "sessions":
+        # A folder to fork a session into
+        host.mkdir(host.path("work", "moved"))
         # A subagent whose parent is gone, as a container's transcript
         # kept after its parent was deleted: a root, to trash as one. A
         # session run here, its first record then naming a parent
@@ -1927,7 +1986,11 @@ def main():
     if far:
         guiargs += ["--rcwd", far.work]
     if args.mode == "containers":
-        guiargs += ["--rcwd", work]
+        # Typed with a leading ~, which must be this computer's home
+        rcwd = work
+        if not args.host and not args.ssh and os.name != "nt":
+            rcwd = "~/" + os.path.relpath(work, os.path.expanduser("~"))
+        guiargs += ["--rcwd", rcwd]
     if args.mode == "firstrun":
         guiargs += ["--display", "1280x720"]  # too small: maximized
     if args.subprocess:
@@ -2002,8 +2065,24 @@ def main():
             problems.append(f"the call, with its token: {calls}")
         else:
             print("mcp: signed in through the stand-in browser, the call sent its token")
+        with fake_provider.STATE.lock:
+            cg = [e.get("grant_type") for e in fake_provider.STATE.cg["log"]
+                  if e.get("_oauth") == "/chatgpt/oauth/token"]
+        if cg != ["authorization_code"]:
+            problems.append(f"ChatGPT's token requests: {cg}")
+        else:
+            print("chatgpt: signed in through the stand-in browser")
+        with fake_provider.STATE.lock:
+            cp = [e.get("_poll") or e.get("_device") for e in fake_provider.STATE.cp["log"]
+                  if "_poll" in e or "_device" in e]
+            approved = len(fake_provider.STATE.cp["approved"])
+        if not cp or cp[0] != "/copilot-gh/login/device/code" or approved != 1:
+            problems.append(f"Copilot's device flow: {cp}, {approved} approved")
+        else:
+            print(f"copilot: signed in by the device flow, polled {len(cp) - 1} times")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
-                     "firstrun", "mcp", "hosttask", "changes", "thin", "containers"):
+                     "firstrun", "mcp", "hosttask", "changes", "thin", "containers",
+                     "terminal"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
@@ -2013,6 +2092,9 @@ def main():
                 problems.append("checklist: " + s.strip())
         if "STALE" in out:
             problems.append("stale frames reported")
+    if "imgui assertion failed" in out:
+        problems.append("an ImGui assertion failed: " +
+                        [l for l in lines if "imgui assertion failed" in l][0].strip())
     if args.mode == "settings":
         after = host.read(ini) or ""
         # Enter saved "!", and leaving by Tab the rest; what was typed in the
@@ -2022,20 +2104,23 @@ def main():
         if "[ui]\ntheme = light\n" not in after:
             problems.append("the theme was not saved as light under [ui]")
         # The edits, in order: the long value, the theme, notify, the roots, the
-        # deleted endpoint with its comment, the new model and remote
+        # deleted endpoint with its comment, the new model, remote and endpoint
         want = before.replace(f"prompt = {LONG_PROMPT}\n", f"prompt = {LONG_PROMPT}! Left by Tab, then.\n")
         want = want.replace("temp = ask\n", "temp = ask\nroots = ~/a; ~/b\n")
         want = want.replace(SETTINGS_GONE + "\n", "")
         want += ("\n[ui]\ntheme = light\nnotify = allow\n"
                  "\n[model fresh]\nreasoning = reasoning_content\n"
-                 "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n")
+                 "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n"
+                 "\n[endpoint gpt]\nkind = anthropic\nurl = http://gpt.example/v1\n"
+                 "\n[endpoint oa]\nkind = copilot\n"
+                 "url = https://api.githubcopilot.com\n")
         if after != want:
             diff = difflib.unified_diff(want.splitlines(), after.splitlines(),
                                         "expected", "saved", lineterm="", n=1)
             problems.append("the configuration is not the edits alone:\n" + "\n".join(diff))
         else:
             print("configuration: the long value, the theme, notify, the roots, a section "
-                  "deleted and two added, nothing else")
+                  "deleted and four added, nothing else")
         if host.read(host.path("team.ini")) != "# Shared\n[model shared]\ntemperature = 0.1\n":
             problems.append("the included file changed")
         if args.shots and not args.host:
@@ -2043,6 +2128,74 @@ def main():
                          "settings-narrowest"):
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
+    if args.mode == "terminal":
+        # The shell's HUP trap, as quitting (or the Trash) hung it up, or
+        # on Windows, where busybox's sh runs no trap for it, the shell gone
+        def hungup(where, trapfile, pidfile):
+            if os.name != "nt":
+                return os.path.exists(os.path.join(where, trapfile))
+            try:
+                pid = int(open(os.path.join(where, pidfile)).read())
+            except (OSError, ValueError):
+                return False
+            return not alive(pid)
+        # The remote host's shell, through its host, which quitting left
+        for where, trapfile, pidfile, what in (
+                (work, "hup-trash.txt", "trash.pid", "the Trash"),
+                (work, "hup.txt", "shell.pid", "quitting"),
+                (far.work, "hup-remote.txt", "remote.pid", "quitting, on the remote,")):
+            deadline = time.monotonic() + 5
+            while not hungup(where, trapfile, pidfile) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not hungup(where, trapfile, pidfile):
+                problems.append(f"{what} did not hang up the terminal's shell")
+            else:
+                print(f"terminal: {what} hung up the shell")
+        # A tab's Kill ended the stray that ignored SIGHUP; its Close
+        # left one, ended here, by a pid checked as ours
+        def stray(pidfile):
+            try:
+                found = P.parse(open(os.path.join(work, pidfile)).read())
+            except OSError:
+                return None
+            return found[0] if found else None
+        pid = stray("kill.pid")
+        deadline = time.monotonic() + 5
+        while pid and alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not pid:
+            problems.append("no kill.pid")
+        elif alive(pid):
+            problems.append("a tab's Kill left its shell's child running")
+        else:
+            print("terminal: a tab's Kill ended its shell's child")
+        # On Windows closing the pseudoconsole ends its console programs,
+        # as closing a console window does: there is no SIGHUP to ignore
+        pid = stray("close.pid")
+        if not pid:
+            problems.append("no close.pid")
+        elif os.name == "nt":
+            deadline = time.monotonic() + 5
+            while alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if alive(pid) and ours(pid, host.root):
+                problems.append("a tab's Close left its console's program running")
+                P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
+            else:
+                print("terminal: a tab's Close ended its console's program")
+        elif not alive(pid) or not ours(pid, host.root):
+            problems.append("a tab's Close ended a child ignoring SIGHUP")
+        else:
+            print("terminal: a child ignoring SIGHUP outlived a tab's Close")
+            P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
+        problems += far.close(args.keep)
+    if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
+        for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
+                     "terminal-reconnecting",
+                     "terminal-ended", "terminal-tabs", "terminal-quit",
+                     "terminal-selected", "terminal-paste"):
+            if not os.path.exists(os.path.join(args.shots, name + ".png")):
+                problems.append(f"no {name}.png")
     if args.mode == "changes" and args.shots:
         for name in ("changes-branch", "changes"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):

@@ -68,6 +68,23 @@ static void testcfgschema(Test *t)
         {"endpoint", "idle_timeout", "0", CFG_BAD, 0},
         {"endpoint", "idle_timeout", "-1", CFG_BAD, 0},
         {"endpoint", "idle_timeout", "1e7", CFG_BAD, 0},
+        {"guard", "ask_timeout", "0", CFG_OK, 0},           // no deadline
+        {"guard", "question_timeout", "0", CFG_OK, 0},
+        {"desktop", "ask_timeout", "0", CFG_OK, 0},
+        {"guard", "ask_timeout", "-1", CFG_BAD, 0},
+        {"guard", "ask_timeout", "1e7", CFG_BAD, 0},
+        {"mcp", "timeout", "0", CFG_BAD, 0},                // only the asks'
+        {"model", "effort_as", "reasoning_effort", CFG_OK, 0},
+        {"model", "effort_as", "reasoning.effort", CFG_OK, 0},
+        {"model", "effort_as", "template.reasoning_effort", CFG_OK, 0},
+        {"model", "effort_as", "none", CFG_OK, 0},
+        {"model", "effort_as", "template.", CFG_BAD, 0},
+        {"model", "effort_as", "effort", CFG_BAD, 0},
+        {"model", "effort_map", "high:xhigh none:off", CFG_OK, 0},
+        {"model", "effort_map", "low:25  high:100", CFG_OK, 0},
+        {"model", "effort_map", "huge:max", CFG_BAD, 0},
+        {"model", "effort_map", "high", CFG_BAD, 0},
+        {"model", "effort_map", "high:", CFG_BAD, 0},
         {"endpoint", "idle_timeout", " 30 ", CFG_OK, 0},
         {"endpoint", "idle_timeout", "30s", CFG_BAD, 0},
         {"endpoint", "slow_retry", "60 120, 0.5", CFG_OK, 0},
@@ -79,6 +96,9 @@ static void testcfgschema(Test *t)
         {"endpoint", "key", "env:A-B", CFG_BAD, 0},
         {"endpoint", "key", "sk-123", CFG_ODD, 0},
         {"endpoint", "key", "sk-123", CFG_BAD, 1},
+        {"endpoint", "integration_id", "some-chat", CFG_OK, 1},
+        {"endpoint", "integration_id", "a b", CFG_BAD, 0},
+        {"endpoint", "integration_id", "a\r\nX-Evil: 1", CFG_BAD, 0},
         {"model", "context", "32768", CFG_OK, 0},
         {"model", "context", "32k", CFG_BAD, 0},
         {"model", "temperature", "0.7", CFG_OK, 0},
@@ -436,8 +456,8 @@ static void testcfgvalidate(Test *t)
         "web_search, web_fetch, desktop, *, default\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, shell, instructions, "
-        "skills, memory, worktree, sessions, ui, desktop, web, host, remote, "
-        "container or mcp\n"
+        "skills, memory, worktree, sessions, ui, terminal, desktop, web, host, "
+        "remote, container or mcp\n"
         "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -856,7 +876,7 @@ static void testcfgdelete(Test *t)
     tmp = v.scratch;
     r   = cfgdelete(c, &tmp, "guard", "");
     expect(t, "del.guard", istr(&a, r.ok), "1");
-    expect(t, "del.guard.value", cfgget(c, "guard", "", "ask_timeout", 0), "30");
+    expect(t, "del.guard.value", cfgget(c, "guard", "", "ask_timeout", 0), "60");
     expect(t, "del.text", cfgfile(v.os, "/d/h.ini"),
            "# My settings\ninclude = team.ini\n");
     expect(t, "del.team", cfgfile(v.os, "/d/team.ini"), team);
@@ -1002,9 +1022,11 @@ static void testcfgjson(Test *t)
     expect(t, "json.settings", finish(&b),
         "//endpoint=*\n"
         "//model=*\n"
-        "endpoint/team/url=https://t/@/c/team.ini:2\n"
         "endpoint/team/kind=openai*\n"
+        "endpoint/team/url=https://t/@/c/team.ini:2\n"
         "endpoint/team/key=(hidden)@/c/team.ini:3!\n"
+        "endpoint/team/client_id=*\n"
+        "endpoint/team/integration_id=*\n"
         "endpoint/team/connect_timeout=15*\n"
         "endpoint/team/first_byte_timeout=300*\n"
         "endpoint/team/idle_timeout=90*\n"
@@ -1013,9 +1035,11 @@ static void testcfgjson(Test *t)
         "endpoint/team/slow_retry_budget=7200*\n"
         "endpoint/team/max_concurrent=*\n"
         "endpoint/team/max_models=*\n"
-        "endpoint/local/url=http://127.0.0.1:8080/@/c/h.ini:3\n"
         "endpoint/local/kind=openai*\n"
+        "endpoint/local/url=http://127.0.0.1:8080/@/c/h.ini:3\n"
         "endpoint/local/key=env:KEY@/c/h.ini:5\n"
+        "endpoint/local/client_id=*\n"
+        "endpoint/local/integration_id=*\n"
         "endpoint/local/connect_timeout=5*\n"
         "endpoint/local/first_byte_timeout=1800*\n"
         "endpoint/local/idle_timeout=30@/c/h.ini:4\n"
@@ -1036,7 +1060,10 @@ static void testcfgjson(Test *t)
         "model/m/thinking=adaptive*\n"
         "model/m/thinking_display=summarized*\n"
         "model/m/effort=*\n"
+        "model/m/effort_as=reasoning_effort*\n"
+        "model/m/effort_map=*\n"
         "model/m/vision=true*\n"
+        "model/m/pdf=true*\n"
         "model/m/coordinates=pixels*\n"
         "model/m/image_edge=*\n"
         "model/m/image_pixels=*\n"
@@ -1053,7 +1080,7 @@ static void testcfgjson(Test *t)
         "model/m/seed=*\n"
         "model/m/max_tokens=*\n"
         "guard//roots=*\n"
-        "guard//ask_timeout=30*\n"
+        "guard//ask_timeout=60*\n"
         "guard//question_timeout=300*\n"
         "guard//temp=allow*\n"
         "tools//job_timeout=1800*\n"
@@ -1071,6 +1098,8 @@ static void testcfgjson(Test *t)
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "skills//enabled=true*\n"
         "skills//paths=*\n"
+        "skills//hidden=*\n"
+        "skills//disabled=*\n"
         "memory//enabled=true*\n"
         "memory//path=*\n"
         "worktree//branch_prefix=prospero/*\n"
@@ -1083,7 +1112,11 @@ static void testcfgjson(Test *t)
         "ui//fonts=auto*\n"
         "ui//editor=*\n"
         "ui//terminal=*\n"
+        "ui//mentions=true*\n"
         "ui//notify=allow done*\n"
+        "terminal//shell=*\n"
+        "terminal//scrollback=10000*\n"
+        "terminal//copy_on_select=false*\n"
         "desktop//offer=all*\n"
         "desktop//ask=true*\n"
         "desktop//ask_timeout=60*\n"
@@ -1111,7 +1144,7 @@ static void testcfgjson(Test *t)
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),
            istr(&a, countof(cfgschema)));
-    Json *ft = jsonat(schema, 6);
+    Json *ft = jsonat(schema, cfgkey("endpoint", "first_byte_timeout") - cfgschema);
     expect(t, "json.schema.key", jsonstr(jsonget(ft, "key")),
            "first_byte_timeout");
     expect(t, "json.schema.type", jsonstr(jsonget(ft, "type")), "seconds");
@@ -2401,8 +2434,51 @@ static void testcfgcreds(Test *t)
     cfgfree(c);
 }
 
+// Where [model] effort goes on OpenAI chat (cfgeffort): a field and its
+// value, or into chat_template_kwargs, each "key=json|kwargs"
+static void testcfgeffort(Test *t)
+{
+    Arena a = t->perm;
+    static struct { Str name, effort, as, map, kwargs, want; } cases[] = {
+        {"unset",        "",     "",                 "",          "", "=|"},
+        {"default",      "high", "",                 "",          "", "reasoning_effort=\"high\"|"},
+        {"top",          "max",  "reasoning_effort", "",          "", "reasoning_effort=\"max\"|"},
+        {"openrouter",   "low",  "reasoning.effort", "",          "",
+         "reasoning={\"effort\":\"low\"}|"},
+        {"none",         "high", "none",             "",          "", "=|"},
+        {"tmpl alone",   "high", "template.reasoning_effort", "", "",
+         "=|{\"reasoning_effort\":\"high\"}"},
+        {"tmpl added",   "low",  "template.effort",  "",          "{\"thinking\":true}",
+         "=|{\"thinking\":true,\"effort\":\"low\"}"},
+        {"tmpl wins",    "low",  "template.reasoning_effort", "",
+         "{\"reasoning_effort\":25}", "=|{\"reasoning_effort\":25}"},
+        {"top yields",   "low",  "",                 "",          "{\"reasoning_effort\":\"max\"}",
+         "=|{\"reasoning_effort\":\"max\"}"},
+        {"top beside",   "low",  "",                 "",          "{\"thinking\":true}",
+         "reasoning_effort=\"low\"|{\"thinking\":true}"},
+        {"mapped",       "high", "",                 "low:low high:xhigh", "",
+         "reasoning_effort=\"xhigh\"|"},
+        {"unmapped",     "medium", "",               "high:xhigh", "",
+         "reasoning_effort=\"medium\"|"},
+        {"numbers",      "high", "template.reasoning_effort", "low:25 high:100",
+         "{\"thinking\":true}", "=|{\"thinking\":true,\"reasoning_effort\":100}"},
+        {"booleans",     "none", "template.enable_thinking", "none:false low:true", "",
+         "=|{\"enable_thinking\":false}"},
+        {"bad as",       "high", "effort",           "",          "", "=|"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Arena     b = a;
+        CfgEffort e = cfgeffort(&b, cases[i].effort, cases[i].as, cases[i].map,
+                                cases[i].kwargs);
+        Str got = concat(&b, concat(&b, e.key, "="), concat(&b, e.json, "|"));
+        got = concat(&b, got, e.kwargs);
+        expect(t, concat(&b, "effort ", cases[i].name), got, cases[i].want);
+    }
+}
+
 static void test_config(Test *t)
 {
+    testcfgeffort(t);
     testcfgwsl(t);
     testcfgsha256(t);
     testcfgurls(t);
