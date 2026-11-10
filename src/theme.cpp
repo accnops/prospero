@@ -229,7 +229,8 @@ static Palette themelight = {
 // blue (#83a598) for links and running states, while code keeps it;
 // gray (#928374) for comments. Rows selected and under the mouse take
 // bg1 and bg0_s, as
-// bg2 is too light for the accents on it, and dim text fg3. ImGui's own
+// bg2 is too light for the accents on it, and dim text fg3. Buttons
+// rest on bg1, so that one toggled on, in faded blue, stands apart. ImGui's own
 // blue accents give way to bg2 for title bars and tabs, yellow for the
 // rest.
 static Palette themegruvbox = {
@@ -242,11 +243,11 @@ static Palette themegruvbox = {
     .selrow    = rgb( 60,  56,  54),  // bg1
     .rowhover  = rgb( 50,  48,  47),  // bg0_s
     .rowpress  = rgb( 60,  56,  54),  // bg1
-    .btn       = rgb( 80,  73,  69),  // bg2
-    .btnhover  = rgb(102,  92,  84),  // bg3
-    .btnpress  = rgb( 60,  56,  54),  // bg1
+    .btn       = rgb( 60,  56,  54),  // bg1
+    .btnhover  = rgb( 80,  73,  69),  // bg2
+    .btnpress  = rgb(102,  92,  84),  // bg3
     .btnon     = rgb(  7, 102, 120),  // faded blue
-    .btnonhover= rgb(  5,  90, 106),  // faded blue, darker
+    .btnonhover= rgb(  6,  92, 108),  // faded blue, darker
     .bar       = rgb(  7, 102, 120),  // faded blue
     .title     = rgb( 80,  73,  69),  // bg2
     .accent    = rgb(250, 189,  47),  // yellow
